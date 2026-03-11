@@ -439,4 +439,121 @@ function Helpers.FindFirstOptionItem(root, maxDepth)
     return nil
 end
 
+-- ---------------------------------------------------------------------------
+-- Find the selected ListBoxItem in the tree (Lua equivalent of the C++
+-- FindSelectedTabInTree).  Returns the first ListBoxItem-type element
+-- whose IsSelected property is true.
+-- ---------------------------------------------------------------------------
+
+local function FindSelectedTabLua(element, depth)
+    if not element or depth <= 0 then return nil end
+    local okT, typeName = pcall(function() return element.Type end)
+    if okT and type(typeName) == "string" then
+        if typeName:find("ListBoxItem") or typeName:find("ListItem") then
+            local okSel, isSel = pcall(element.GetProperty, element, "IsSelected")
+            if okSel and isSel == true then
+                return element
+            end
+        end
+    end
+    local okC, count = pcall(function() return element.VisualChildrenCount end)
+    if okC and type(count) == "number" then
+        for i = 1, count do
+            local okCh, child = pcall(element.VisualChild, element, i)
+            if okCh and child then
+                local found = FindSelectedTabLua(child, depth - 1)
+                if found then return found end
+            end
+        end
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Gather text scoped to the tab's content area.
+--
+-- Instead of walking from root (which picks up the main menu, footer,
+-- version text, and stale content from other tabs), this finds the
+-- selected tab's carousel, walks up to the container holding both the
+-- carousel and the content panel, and gathers text only from there.
+--
+-- Tree structure (typical):
+--   Container (Grid/Panel)
+--     ├── Carousel (ListBox with tab ListBoxItems)
+--     └── ContentArea (the tab's body text, buttons, etc.)
+--
+-- We find: tab → walk up to carousel (ListBox parent) → walk up to
+-- container (carousel's parent, skipping wrappers like Border).
+-- ---------------------------------------------------------------------------
+
+function Helpers.GatherTabContentText(root)
+    local tab = FindSelectedTabLua(root, 20)
+    if not tab then
+        Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: no selected tab found")
+        return {}
+    end
+
+    -- Walk up from tab to find its carousel parent (ListBox/ItemsControl)
+    local carousel = nil
+    local cur = tab
+    for i = 1, 6 do
+        local okP, parent = pcall(function() return cur.Parent end)
+        if not okP or not parent or not Helpers._IsElementValid(parent) then break end
+        local okT, typeName = pcall(function() return parent.Type end)
+        if okT and type(typeName) == "string" then
+            if typeName:find("ListBox") or typeName:find("ItemsControl")
+                or typeName:find("Selector") or typeName:find("LSList") then
+                carousel = parent
+                break
+            end
+        end
+        cur = parent
+    end
+
+    if not carousel then
+        Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: no carousel parent found")
+        return {}
+    end
+
+    -- Walk up from carousel to find the container that holds BOTH the
+    -- tab strip AND the content area.  The first Grid/Panel above the
+    -- carousel is typically just the tab strip wrapper — we need to go
+    -- past it to the outer container.  Strategy: find the SECOND
+    -- Grid/Panel in the ancestor chain (skip the first one).
+    local container = nil
+    local panelCount = 0
+    cur = carousel
+    for i = 1, 6 do
+        local okP, parent = pcall(function() return cur.Parent end)
+        if not okP or not parent or not Helpers._IsElementValid(parent) then break end
+        local okT, typeName = pcall(function() return parent.Type end)
+        if okT and type(typeName) == "string" then
+            if typeName:find("Grid") or typeName:find("Panel")
+                or typeName:find("StackPanel") or typeName:find("DockPanel") then
+                panelCount = panelCount + 1
+                if panelCount >= 2 then
+                    container = parent
+                    break
+                end
+            end
+        end
+        cur = parent
+    end
+    -- If only one panel found, use it anyway (better than nothing)
+    if not container and panelCount == 1 then
+        container = cur
+    end
+
+    if not container then
+        Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: no container found")
+        return {}
+    end
+
+    local okCT, containerType = pcall(function() return container.Type end)
+    Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: scoped to "
+        .. ((okCT and type(containerType) == "string") and containerType or "?"))
+
+    return Helpers.GatherTextBlockTexts(container, 20)
+end
+
 Ext.Utils.Print("[AccessibilityHelpers.lua] Loaded.")
