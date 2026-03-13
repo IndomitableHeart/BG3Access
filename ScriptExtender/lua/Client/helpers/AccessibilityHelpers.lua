@@ -42,24 +42,86 @@ end
 
 function Helpers.GatherTextBlockTexts(element, maxDepth)
     if not element or maxDepth <= 0 then return {} end
+
+    -- Skip elements that are not actually visible on screen.
+    -- IsVisible is a computed boolean that accounts for parent Collapsed/Hidden
+    -- state (a TextBlock inside a Collapsed panel has Visibility="Visible"
+    -- locally, but IsVisible=false).  This prevents text from panels belonging
+    -- to other tabs (e.g. CrossplayDisabledWarning on the LAN tab, or
+    -- MainList column headers on the Cross-Play tab).
+    -- IsVisible is a computed boolean that accounts for ancestor visibility.
+    -- A TextBlock inside a Collapsed parent has IsVisible=false even though
+    -- its own local Visibility is "Visible".  The BG3SE bridge returns this
+    -- as a boolean (confirmed via diagnostic logging).
+    local okIsVis, isVis = pcall(element.GetProperty, element, "IsVisible")
+    if okIsVis and type(isVis) == "boolean" and isVis == false then
+        return {}
+    end
+
     local texts = {}
 
     local okT, typeName = pcall(function() return element.Type end)
+    if okT and type(typeName) == "string" then
+        -- Skip interactive list containers — these hold repeating items
+        -- (lobby entries, settings rows, etc.) that should be navigated
+        -- individually via focus, not dumped wholesale in a fallback.
+        if typeName == "ListView" or typeName == "ListBox"
+            or typeName == "DataGrid" then
+            return {}
+        end
+    end
+
     if okT and type(typeName) == "string" and typeName:find("TextBlock") then
-        -- Try GetProperty("Text") first (works for non-bound values)
+        -- Try GetProperty("Text") first (works for local/non-bound values)
         local okV, text = pcall(element.GetProperty, element, "Text")
-        if okV and type(text) == "string" and text ~= "" then
+        if okV and type(text) == "string" and text ~= ""
+            and not text:find("%[ForceUpdate%]") then
             table.insert(texts, Helpers.GetTranslatedStringIfHandle(text))
-        else
-            -- Fallback: ToString() calls Noesis TextBlock::ToString() override
-            -- which returns the rendered text content (resolves data bindings).
-            local okS, str = pcall(element.ToString, element)
-            if okS and type(str) == "string" and str ~= "" then
-                -- Filter out the type name itself — ToString on non-TextBlock
-                -- returns just the type name, which isn't useful text.
-                if not str:find("TextBlock") then
-                    table.insert(texts, Helpers.GetTranslatedStringIfHandle(str))
+        end
+
+        -- Try Inlines collection — formatter-populated text lives here as
+        -- Run objects.  Collections use array-style access: #col, col[i].
+        if #texts == 0 then
+            local okInl, inlines = pcall(element.GetProperty, element, "Inlines")
+            if okInl and inlines then
+                local okLen, inlLen = pcall(function() return #inlines end)
+                if okLen and type(inlLen) == "number" and inlLen > 0 then
+                    local parts = {}
+                    for i = 1, inlLen do
+                        local okI, inline = pcall(function() return inlines[i] end)
+                        if okI and inline then
+                            local okIT, iType = pcall(function() return inline.Type end)
+                            iType = (okIT and type(iType) == "string") and iType or ""
+                            if iType:find("Run") then
+                                local okRT, runText = pcall(inline.GetProperty, inline, "Text")
+                                if okRT and type(runText) == "string" and runText ~= ""
+                                    and not runText:find("%[ForceUpdate%]") then
+                                    table.insert(parts, runText)
+                                end
+                            elseif iType:find("LineBreak") then
+                                -- Sentence boundary — insert space
+                                table.insert(parts, " ")
+                            end
+                        end
+                    end
+                    if #parts > 0 then
+                        local joined = table.concat(parts, "")
+                        -- Collapse multiple spaces
+                        joined = joined:gsub("  +", " "):gsub("^ ", ""):gsub(" $", "")
+                        if joined ~= "" then
+                            table.insert(texts, Helpers.GetTranslatedStringIfHandle(joined))
+                        end
+                    end
                 end
+            end
+        end
+
+        -- Last resort: ToString() which may return rendered text content.
+        if #texts == 0 then
+            local okS, str = pcall(element.ToString, element)
+            if okS and type(str) == "string" and str ~= ""
+                and not str:find("TextBlock") and not str:find("%[ForceUpdate%]") then
+                table.insert(texts, Helpers.GetTranslatedStringIfHandle(str))
             end
         end
     else
@@ -69,6 +131,115 @@ function Helpers.GatherTextBlockTexts(element, maxDepth)
                 local okCh, child = pcall(element.VisualChild, element, i)
                 if okCh and child then
                     local childTexts = Helpers.GatherTextBlockTexts(child, maxDepth - 1)
+                    for _, t in ipairs(childTexts) do
+                        table.insert(texts, t)
+                    end
+                end
+            end
+        end
+    end
+
+    return texts
+end
+
+-- ---------------------------------------------------------------------------
+-- Logical tree walking -- gather TextBlock text from authored elements.
+--
+-- Page-level TextBlocks (CrossPlayWarningTitle, etc.) appear in the logical
+-- tree.  Only template-internal TextBlocks are visual-tree-only.  This is
+-- dramatically more efficient than visual tree walking (~80% fewer nodes)
+-- because the logical tree omits Borders, Images, Rectangles, etc.
+--
+-- IMPORTANT: Do NOT recurse into TextBlock's logical children -- those are
+-- Inline objects (Run, LineBreak) which the three-step extraction already
+-- handles.  Also guard against non-element types (ls.VMInputEvent,
+-- ls.VMTickBoxSetting, Boxed<String>, etc.) that appear as logical children
+-- of ItemsControl and throw errors on GetProperty("Name").
+-- ---------------------------------------------------------------------------
+
+function Helpers.GatherLogicalTextBlockTexts(element, maxDepth)
+    if not element or maxDepth <= 0 then return {} end
+
+    -- Guard: non-element types in logical tree (ViewModels, boxed values)
+    -- have no Type property or throw on property access.
+    local okT, typeName = pcall(function() return element.Type end)
+    if not okT or type(typeName) ~= "string" then return {} end
+
+    -- Skip invisible elements (same as visual tree version).
+    local okIsVis, isVis = pcall(element.GetProperty, element, "IsVisible")
+    if okIsVis and type(isVis) == "boolean" and isVis == false then
+        return {}
+    end
+
+    local texts = {}
+
+    -- Skip interactive list containers.
+    if typeName == "ListView" or typeName == "ListBox"
+        or typeName == "DataGrid" then
+        return {}
+    end
+
+    if typeName:find("TextBlock") then
+        -- Three-step extraction (same logic as GatherTextBlockTexts).
+        -- Step 1: GetProperty("Text")
+        local okV, text = pcall(element.GetProperty, element, "Text")
+        if okV and type(text) == "string" and text ~= ""
+            and not text:find("%[ForceUpdate%]") then
+            table.insert(texts, Helpers.GetTranslatedStringIfHandle(text))
+        end
+
+        -- Step 2: Inlines collection
+        if #texts == 0 then
+            local okInl, inlines = pcall(element.GetProperty, element, "Inlines")
+            if okInl and inlines then
+                local okLen, inlLen = pcall(function() return #inlines end)
+                if okLen and type(inlLen) == "number" and inlLen > 0 then
+                    local parts = {}
+                    for i = 1, inlLen do
+                        local okI, inline = pcall(function() return inlines[i] end)
+                        if okI and inline then
+                            local okIT, iType = pcall(function() return inline.Type end)
+                            iType = (okIT and type(iType) == "string") and iType or ""
+                            if iType:find("Run") then
+                                local okRT, runText = pcall(inline.GetProperty, inline, "Text")
+                                if okRT and type(runText) == "string" and runText ~= ""
+                                    and not runText:find("%[ForceUpdate%]") then
+                                    table.insert(parts, runText)
+                                end
+                            elseif iType:find("LineBreak") then
+                                table.insert(parts, " ")
+                            end
+                        end
+                    end
+                    if #parts > 0 then
+                        local joined = table.concat(parts, "")
+                        joined = joined:gsub("  +", " "):gsub("^ ", ""):gsub(" $", "")
+                        if joined ~= "" then
+                            table.insert(texts, Helpers.GetTranslatedStringIfHandle(joined))
+                        end
+                    end
+                end
+            end
+        end
+
+        -- Step 3: ToString()
+        if #texts == 0 then
+            local okS, str = pcall(element.ToString, element)
+            if okS and type(str) == "string" and str ~= ""
+                and not str:find("TextBlock") and not str:find("%[ForceUpdate%]") then
+                table.insert(texts, Helpers.GetTranslatedStringIfHandle(str))
+            end
+        end
+
+        -- Do NOT recurse into TextBlock children (Inlines are logical children).
+    else
+        -- Recurse into logical children.
+        local okC, count = pcall(function() return element.ChildrenCount end)
+        if okC and type(count) == "number" then
+            for i = 1, count do
+                local okCh, child = pcall(element.Child, element, i)
+                if okCh and child then
+                    local childTexts = Helpers.GatherLogicalTextBlockTexts(child, maxDepth - 1)
                     for _, t in ipairs(childTexts) do
                         table.insert(texts, t)
                     end
@@ -208,8 +379,36 @@ end
 -- ---------------------------------------------------------------------------
 function Helpers.ReadDataContextText(dc)
     if not dc or type(dc) ~= "userdata" then return nil end
-    local name = TryRead(dc, "Text")
+
+    -- Try reading "Text" from dc as a ViewModel (normal path).
+    -- Wrapped in pcall because dc might be an ls.LocaString, not a ViewModel.
+    local name = nil
+    local ok, val = pcall(function() return TryRead(dc, "Text") end)
+    if ok and val and type(val) == "string" then
+        name = val
+    end
+
+    -- If dc has no "Text" property, it might BE the localization handle itself.
+    -- ls.LocaString is userdata, not a Lua string, so we tostring() it to get
+    -- the handle (e.g. "h5c6f6ec7g160ag..."), then translate.
+    if not name then
+        local okStr, strVal = pcall(tostring, dc)
+        if okStr and type(strVal) == "string" and strVal ~= "" then
+            local translated = Helpers.GetTranslatedStringIfHandle(strVal)
+            if translated and translated ~= strVal then
+                name = translated
+            elseif strVal:match("^h%x") then
+                -- Looks like an unresolved loca handle, return it anyway
+                name = strVal
+            end
+        end
+    end
+
     if not name or type(name) ~= "string" then return nil end
+
+    -- Filter binding placeholders
+    if name:find("%[ForceUpdate%]") then return nil end
+
     local value = ReadGenericValue(dc)
     return FormatNameValue(name, value)
 end
@@ -222,7 +421,12 @@ end
 -- ---------------------------------------------------------------------------
 function Helpers.ReadDataContextValue(dc)
     if not dc or type(dc) ~= "userdata" then return nil end
-    return ReadGenericValue(dc)
+    local ok, val = pcall(ReadGenericValue, dc)
+    if ok and val then
+        if type(val) == "string" and val:find("%[ForceUpdate%]") then return nil end
+        return val
+    end
+    return nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -245,12 +449,10 @@ function Helpers.ExtractTextFromElement(element)
     -----------------------------------------------------------------------
     local okDC, dc = pcall(element.GetProperty, element, "DataContext")
     if okDC and dc and type(dc) == "userdata" then
-        local dcName = TryRead(dc, "Text")
-        if dcName and type(dcName) == "string" then
-            local dcValue = ReadGenericValue(dc)
-            local result = FormatNameValue(dcName, dcValue)
-            Ext.Utils.Print("[BG3Access]   -> DataContext: " .. result)
-            return result
+        local dcText = Helpers.ReadDataContextText(dc)
+        if dcText then
+            Ext.Utils.Print("[BG3Access]   -> DataContext: " .. dcText)
+            return dcText
         end
     end
 
@@ -384,62 +586,6 @@ function Helpers.ExtractTabName(element)
 end
 
 -- ---------------------------------------------------------------------------
--- Find the first REAL option item in the UI tree.  Used to auto-speak the
--- first option after a tab switch.  Walks depth-first from `root`.
---
--- A real option is a ContentPresenter whose DataContext has:
---   - "Text" property (the option name, e.g. "Show Tutorials")
---   - "Value" OR "SelectedItem" property (the current setting)
--- This filters out section headers like "General" which only have "Text".
--- ---------------------------------------------------------------------------
-
-function Helpers.FindFirstOptionItem(root, maxDepth)
-    maxDepth = maxDepth or 20
-    if not Helpers._IsElementValid(root) or maxDepth <= 0 then return nil end
-
-    local okT, typeName = pcall(function() return root.Type end)
-    typeName = (okT and type(typeName) == "string") and typeName or "?"
-
-    -- ContentPresenter with DataContext that has "Text" AND a value property
-    if typeName == "ContentPresenter" then
-        local okDC, dc = pcall(root.GetProperty, root, "DataContext")
-        if okDC and dc and type(dc) == "userdata" then
-            local hasText = false
-            local okH = pcall(function() hasText = Ext.UI.HasProperty(dc, "Text") end)
-            if okH and hasText then
-                local okTxt, txt = pcall(dc.GetProperty, dc, "Text")
-                if okTxt and type(txt) == "string" and txt ~= "" then
-                    -- Must also have a value property to be a real option
-                    -- (not just a section header like "General").
-                    local hasValue = false
-                    pcall(function() hasValue = Ext.UI.HasProperty(dc, "Value") end)
-                    if not hasValue then
-                        pcall(function() hasValue = Ext.UI.HasProperty(dc, "SelectedItem") end)
-                    end
-                    if hasValue then
-                        return root
-                    end
-                end
-            end
-        end
-    end
-
-    -- Recurse into children
-    local okC, count = pcall(function() return root.VisualChildrenCount end)
-    if okC and type(count) == "number" then
-        for i = 1, count do
-            local okCh, child = pcall(root.VisualChild, root, i)
-            if okCh and child then
-                local found = Helpers.FindFirstOptionItem(child, maxDepth - 1)
-                if found then return found end
-            end
-        end
-    end
-
-    return nil
-end
-
--- ---------------------------------------------------------------------------
 -- Find the selected ListBoxItem in the tree (Lua equivalent of the C++
 -- FindSelectedTabInTree).  Returns the first ListBoxItem-type element
 -- whose IsSelected property is true.
@@ -470,90 +616,240 @@ local function FindSelectedTabLua(element, depth)
 end
 
 -- ---------------------------------------------------------------------------
+-- Walk up the parent chain to the widget root (the top-level element
+-- whose Parent is nil).  This is typically a Grid named 'Root', ~5 hops
+-- from any focused element.  Find() works from this element because it
+-- shares a NameScope with all authored x:Name elements in the widget.
+--
+-- NOTE: Ext.UI.GetRoot() returns the APPLICATION root, which is ABOVE
+-- the widget NameScope boundary — Find() from there returns nil for
+-- widget-level names.  Always use this helper instead.
+-- ---------------------------------------------------------------------------
+local function GetWidgetRoot(element)
+    local cur = element
+    for i = 1, 30 do
+        local okP, parent = pcall(function() return cur.Parent end)
+        if not okP or not parent then
+            return cur
+        end
+        cur = parent
+    end
+    return cur
+end
+
+-- ---------------------------------------------------------------------------
+-- Find the first REAL option item in the UI tree.  Used to auto-speak the
+-- first option after a tab switch.
+--
+-- Optimized path: finds the selected tab -> walks up to widget root ->
+-- uses Find("Options") to locate the ItemsControl directly -> walks only
+-- its small visual subtree (~90% fewer nodes than full DFS from app root).
+--
+-- Falls back to full DFS if Find("Options") fails (non-Options menu).
+--
+-- A real option is a ContentPresenter whose DataContext has:
+--   - "Text" property (the option name, e.g. "Show Tutorials")
+--   - "Value" OR "SelectedItem" property (the current setting)
+-- This filters out section headers like "General" which only have "Text".
+-- ---------------------------------------------------------------------------
+
+-- Inner recursive search for a ContentPresenter with the right DataContext.
+-- Walks VISUAL tree because ItemsControl's logical children are ViewModels,
+-- not ContentPresenters (those are generated in the visual tree under
+-- ScrollViewer -> ItemsPresenter -> StackPanel).
+local function FindFirstOptionDFS(elem, maxDepth)
+    if not elem or maxDepth <= 0 then return nil end
+
+    local okT, typeName = pcall(function() return elem.Type end)
+    typeName = (okT and type(typeName) == "string") and typeName or "?"
+
+    if typeName == "ContentPresenter" then
+        local okDC, dc = pcall(elem.GetProperty, elem, "DataContext")
+        if okDC and dc and type(dc) == "userdata" then
+            local hasText = false
+            local okH = pcall(function() hasText = Ext.UI.HasProperty(dc, "Text") end)
+            if okH and hasText then
+                local okTxt, txt = pcall(dc.GetProperty, dc, "Text")
+                if okTxt and type(txt) == "string" and txt ~= "" then
+                    -- Must also have a value property to be a real option
+                    -- (not just a section header like "General").
+                    local hasValue = false
+                    pcall(function() hasValue = Ext.UI.HasProperty(dc, "Value") end)
+                    if not hasValue then
+                        pcall(function() hasValue = Ext.UI.HasProperty(dc, "SelectedItem") end)
+                    end
+                    if hasValue then
+                        return elem
+                    end
+                end
+            end
+        end
+    end
+
+    local okC, count = pcall(function() return elem.VisualChildrenCount end)
+    if okC and type(count) == "number" then
+        for i = 1, count do
+            local okCh, child = pcall(elem.VisualChild, elem, i)
+            if okCh and child then
+                local found = FindFirstOptionDFS(child, maxDepth - 1)
+                if found then return found end
+            end
+        end
+    end
+
+    return nil
+end
+
+function Helpers.FindFirstOptionItem(root, maxDepth)
+    maxDepth = maxDepth or 20
+    if not Helpers._IsElementValid(root) then return nil end
+
+    -- Optimized path: use Find("Options") from widget root to narrow the search.
+    -- root is typically Ext.UI.GetRoot() (app root), so we first need to get
+    -- inside the widget via FindSelectedTabLua, then walk up to widget root.
+    local tab = FindSelectedTabLua(root, 20)
+    if tab then
+        local widgetRoot = GetWidgetRoot(tab)
+        if widgetRoot then
+            local okF, optionsCtrl = pcall(widgetRoot.Find, widgetRoot, "Options")
+            if okF and optionsCtrl then
+                Ext.Utils.Print("[BG3Access]   -> FindFirstOptionItem: using Find('Options') shortcut")
+                return FindFirstOptionDFS(optionsCtrl, maxDepth)
+            end
+        end
+    end
+
+    -- Fallback: full DFS from root (handles non-Options menus).
+    Ext.Utils.Print("[BG3Access]   -> FindFirstOptionItem: falling back to full DFS")
+    return FindFirstOptionDFS(root, maxDepth)
+end
+
+-- ---------------------------------------------------------------------------
 -- Gather text scoped to the tab's content area.
 --
--- Instead of walking from root (which picks up the main menu, footer,
--- version text, and stale content from other tabs), this finds the
--- selected tab's carousel, walks up to the container holding both the
--- carousel and the content panel, and gathers text only from there.
+-- Uses Find() from the widget root to locate the carousel by name
+-- ("HeaderCarouselList"), then walks up to the shared parent that holds
+-- both the carousel and content as sibling branches.  Gathers text from
+-- all sibling branches EXCEPT the one containing the carousel.
 --
--- Tree structure (typical):
---   Container (Grid/Panel)
---     ├── Carousel (ListBox with tab ListBoxItems)
---     └── ContentArea (the tab's body text, buttons, etc.)
+-- Uses the LOGICAL tree for sibling walking and text gathering (~80%
+-- fewer nodes than visual tree).  Page-level TextBlocks appear in the
+-- logical tree; only template-internal ones are visual-tree-only.
 --
--- We find: tab → walk up to carousel (ListBox parent) → walk up to
--- container (carousel's parent, skipping wrappers like Border).
+-- Tree structure (both Options and Multiplayer menus):
+--   SharedParent (Grid/Panel)
+--     +-- CarouselBranch (contains HeaderCarouselList)
+--     +-- ContentBranch  (tab body text, buttons, etc.)
+--     +-- ...            (optional footer/other branches)
 -- ---------------------------------------------------------------------------
 
 function Helpers.GatherTabContentText(root)
+    -- Step 1: Find the selected tab by walking DOWN the visual tree.
+    -- We need an element INSIDE the widget so we can walk UP to the
+    -- widget root (where Find() works).  Ext.UI.GetRoot() returns the
+    -- APPLICATION root which is ABOVE the widget NameScope boundary.
     local tab = FindSelectedTabLua(root, 20)
     if not tab then
         Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: no selected tab found")
         return {}
     end
 
-    -- Walk up from tab to find its carousel parent (ListBox/ItemsControl)
-    local carousel = nil
-    local cur = tab
-    for i = 1, 6 do
-        local okP, parent = pcall(function() return cur.Parent end)
-        if not okP or not parent or not Helpers._IsElementValid(parent) then break end
-        local okT, typeName = pcall(function() return parent.Type end)
-        if okT and type(typeName) == "string" then
-            if typeName:find("ListBox") or typeName:find("ItemsControl")
-                or typeName:find("Selector") or typeName:find("LSList") then
-                carousel = parent
-                break
-            end
-        end
-        cur = parent
-    end
-
-    if not carousel then
-        Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: no carousel parent found")
+    -- Step 2: Walk up from the tab to the widget root.
+    local widgetRoot = GetWidgetRoot(tab)
+    if not widgetRoot then
+        Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: no widget root")
         return {}
     end
 
-    -- Walk up from carousel to find the container that holds BOTH the
-    -- tab strip AND the content area.  The first Grid/Panel above the
-    -- carousel is typically just the tab strip wrapper — we need to go
-    -- past it to the outer container.  Strategy: find the SECOND
-    -- Grid/Panel in the ancestor chain (skip the first one).
-    local container = nil
-    local panelCount = 0
-    cur = carousel
-    for i = 1, 6 do
+    -- Step 3: Find the carousel by name -- both Options and Multiplayer
+    -- menus use "HeaderCarouselList" as the ListBox containing tab items.
+    local okF, carousel = pcall(widgetRoot.Find, widgetRoot, "HeaderCarouselList")
+    if not okF or not carousel then
+        Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: Find('HeaderCarouselList') failed")
+        return {}
+    end
+
+    -- Step 4: Build ancestor set from carousel upward so we can identify
+    -- which logical child of any candidate shared parent contains the
+    -- carousel branch.
+    local ancestors = {}
+    local cur = carousel
+    for i = 1, 12 do
+        ancestors[tostring(cur)] = true
         local okP, parent = pcall(function() return cur.Parent end)
         if not okP or not parent or not Helpers._IsElementValid(parent) then break end
+        cur = parent
+        ancestors[tostring(cur)] = true
+    end
+
+    -- Step 5: Walk up from carousel, trying each Grid/Panel with 2+
+    -- logical children as a candidate shared parent.  Gather text from
+    -- all sibling branches except the carousel's.  Stop as soon as we
+    -- get text (avoids picking up footer/version strings from higher
+    -- levels).
+    cur = carousel
+    for level = 1, 8 do
+        local okP, parent = pcall(function() return cur.Parent end)
+        if not okP or not parent or not Helpers._IsElementValid(parent) then break end
+
+        local isContainer = false
         local okT, typeName = pcall(function() return parent.Type end)
         if okT and type(typeName) == "string" then
             if typeName:find("Grid") or typeName:find("Panel")
                 or typeName:find("StackPanel") or typeName:find("DockPanel") then
-                panelCount = panelCount + 1
-                if panelCount >= 2 then
-                    container = parent
-                    break
-                end
+                isContainer = true
             end
         end
+
+        if isContainer then
+            -- Use logical children (ChildrenCount/Child) instead of
+            -- visual children.  The logical tree has the authored
+            -- structure without template expansion.
+            local okCC, childCount = pcall(function() return parent.ChildrenCount end)
+            if okCC and type(childCount) == "number" and childCount >= 2 then
+                -- Find which direct logical child branch contains the carousel.
+                local carouselBranchIndex = nil
+                for i = 1, childCount do
+                    local okCh, child = pcall(parent.Child, parent, i)
+                    if okCh and child and ancestors[tostring(child)] then
+                        carouselBranchIndex = i
+                        break
+                    end
+                end
+
+                Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: level="
+                    .. tostring(level) .. " parent="
+                    .. ((okT and type(typeName) == "string") and typeName or "?")
+                    .. " logicalChildren=" .. tostring(childCount)
+                    .. " carouselBranch=" .. tostring(carouselBranchIndex))
+
+                -- Gather text from all logical children EXCEPT the carousel branch.
+                -- Uses GatherLogicalTextBlockTexts for efficient logical tree walk.
+                local allTexts = {}
+                for i = 1, childCount do
+                    if i ~= carouselBranchIndex then
+                        local okCh, child = pcall(parent.Child, parent, i)
+                        if okCh and child then
+                            local childTexts = Helpers.GatherLogicalTextBlockTexts(child, 20)
+                            for _, t in ipairs(childTexts) do
+                                table.insert(allTexts, t)
+                            end
+                        end
+                    end
+                end
+
+                if #allTexts > 0 then
+                    return allTexts
+                end
+                -- No text at this level -- keep walking up.
+            end
+        end
+
         cur = parent
     end
-    -- If only one panel found, use it anyway (better than nothing)
-    if not container and panelCount == 1 then
-        container = cur
-    end
 
-    if not container then
-        Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: no container found")
-        return {}
-    end
-
-    local okCT, containerType = pcall(function() return container.Type end)
-    Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: scoped to "
-        .. ((okCT and type(containerType) == "string") and containerType or "?"))
-
-    return Helpers.GatherTextBlockTexts(container, 20)
+    Ext.Utils.Print("[BG3Access]   -> GatherTabContentText: no text found at any level")
+    return {}
 end
 
 Ext.Utils.Print("[AccessibilityHelpers.lua] Loaded.")

@@ -36,6 +36,8 @@ local lastSpokenTab       = nil   -- tab NAME (not elemId) of last spoken tab
 local pendingOptionRetry  = 0     -- retry counter for FindFirstOptionItem after tab switch
 local pendingOptionDelay  = 0     -- settle frames before retrying (lets stale content clear)
 local tabHintSpoken       = false -- true after we've spoken the navigation hint this visit
+local spokenDuringTabDet  = false -- true if a non-option element was spoken during tab detection
+local deferredButtonText  = nil   -- text of button that got focus during tab detection (spoken after body text)
 
 -- ---------------------------------------------------------------------------
 -- Get a stable identity string for an element (object refs expire each tick).
@@ -186,62 +188,65 @@ local function HandleFocusChange(element)
 
         -- Same tab as last spoken?
         if tabName and tabName == lastSpokenTab then
-            -- Phase 1: Settle delay — let stale content from the previous tab clear.
+            -- Phase 1: Settle delay -- let stale content from the previous tab clear.
             -- The content area takes 2-3 frames to rebuild after a tab switch.
             if pendingOptionDelay > 0 then
                 pendingOptionDelay = pendingOptionDelay - 1
                 Ext.Utils.Print("[BG3Access]   -> WAIT for content (" .. pendingOptionDelay .. " frames left)")
                 Ext.UI.ForceGlobalFocusUpdate()
-            -- Phase 2: Real retries — search for the first option.
+            -- Phase 2: Real retries -- check if this tab has options or body text.
+            -- We do NOT speak the first option (user must press d-pad down to
+            -- enter the options list, which triggers a real focus change).
+            -- This retry loop only determines tab TYPE so we can read body text
+            -- for non-option tabs (e.g. Cross-Play informational text).
             elseif pendingOptionRetry > 0 then
                 pendingOptionRetry = pendingOptionRetry - 1
-                Ext.Utils.Print("[BG3Access]   -> RETRY FindFirstOptionItem (" .. pendingOptionRetry .. " retries left)")
+                Ext.Utils.Print("[BG3Access]   -> RETRY tab type detection (" .. pendingOptionRetry .. " retries left)")
                 local root = Ext.UI.GetRoot()
                 if root then
                     local firstOption = Helpers.FindFirstOptionItem(root)
                     if firstOption then
-                        -- Extra safety: reject if text matches what was spoken before tab switch.
-                        local text = Helpers.ExtractTextFromElement(firstOption)
-                        if text and text ~= lastSpokenFullText then
-                            pendingOptionRetry = 0
-                            pendingOptionDelay = 0
-                            Ext.Utils.Print("[BG3Access]   -> RETRY found NEW option: " .. text)
-                            SpeakFocused(firstOption, false)
-                            -- On first tab entry, speak a navigation hint so the
-                            -- player knows how to interact with the options menu.
-                            if not tabHintSpoken then
-                                tabHintSpoken = true
-                                Ext.Tolk.Speak("Use LB and RB to switch tabs. Pressing down once will enter the options list, subsequent presses move through options. Left and right change values.", false)
-                            end
-                        elseif pendingOptionRetry > 0 then
-                            Ext.Utils.Print("[BG3Access]   -> RETRY found STALE option (" .. tostring(text) .. "), retrying")
-                            Ext.UI.ForceGlobalFocusUpdate()
-                        else
-                            Ext.Utils.Print("[BG3Access]   -> RETRY exhausted, content still stale")
+                        -- This is an options tab -- stop retrying silently.
+                        -- The user will press d-pad down to navigate options,
+                        -- which the focus monitor picks up naturally.
+                        pendingOptionRetry = 0
+                        pendingOptionDelay = 0
+                        deferredButtonText = nil
+                        Ext.Utils.Print("[BG3Access]   -> Tab has options, waiting for user navigation")
+
+                        -- Speak navigation hint once per Options visit.
+                        -- Only here (not on tab name) because this confirms
+                        -- we're in a menu with actual options, not multiplayer.
+                        if not tabHintSpoken then
+                            tabHintSpoken = true
+                            Ext.Tolk.Speak("Press down to enter the options list, then navigate with up and down. Left and right change values.", false)
                         end
                     elseif pendingOptionRetry > 0 then
                         Ext.UI.ForceGlobalFocusUpdate()
                     else
-                        -- No option items found — this tab has informational
+                        -- No option items found -- this tab has informational
                         -- text instead of settings (e.g. Cross-Play description).
                         -- Fall back to reading visible text, scoped to the tab's
                         -- content area (not root) to avoid main menu/footer junk.
+                        -- GatherTextBlockTexts skips ListView/ListBox containers
+                        -- so interactive lists (lobbies) won't be dumped.
                         Ext.Utils.Print("[BG3Access]   -> RETRY exhausted, falling back to scoped text")
+                        spokenDuringTabDet = false
                         local texts = Helpers.GatherTabContentText(root)
                         if #texts > 0 then
                             local seen = {}
                             local filtered = {}
                             for _, t in ipairs(texts) do
                                 -- Skip binding placeholders like [ForceUpdate]
-                                if t:find("^%[") then goto skip end
-                                -- Skip very short strings (tab labels, "0", etc.)
-                                if #t < 4 then goto skip end
-                                -- Skip the tab name we already spoke
-                                if t == lastSpokenTab then goto skip end
-                                -- Skip text already spoken (e.g. button that got focus)
-                                if lastSpokenFullText and lastSpokenFullText:find(t, 1, true) then goto skip end
+                                if t:find("%[ForceUpdate%]") then goto skip end
+                                -- Skip very short strings ("0", etc.)
+                                if #t < 3 then goto skip end
                                 -- Skip duplicates
                                 if seen[t] then goto skip end
+                                -- Skip text matching the tab name (already spoken)
+                                if lastSpokenTab and t == lastSpokenTab then goto skip end
+                                -- Skip text matching the deferred button (spoken separately after)
+                                if deferredButtonText and t == deferredButtonText then goto skip end
                                 seen[t] = true
                                 table.insert(filtered, t)
                                 ::skip::
@@ -252,6 +257,16 @@ local function HandleFocusChange(element)
                                 Ext.Utils.Print("[BG3Access]   -> FALLBACK text: " .. fullText)
                                 Ext.Tolk.Speak(fullText, false)
                             end
+                        end
+
+                        -- Now speak the deferred button text (if a button got
+                        -- focus during tab detection).  Body text first, then
+                        -- the focused button, so the user hears context before
+                        -- the actionable element.
+                        if deferredButtonText then
+                            Ext.Utils.Print("[BG3Access]   -> Deferred button: " .. deferredButtonText)
+                            Ext.Tolk.Speak(deferredButtonText, false)
+                            deferredButtonText = nil
                         end
                     end
                 end
@@ -264,6 +279,8 @@ local function HandleFocusChange(element)
         -- New tab detected
         lastSpokenTab = tabName
         lastSpokenName = nil  -- Reset element dedup so first option isn't skipped
+        spokenDuringTabDet = false  -- Reset for the new tab
+        deferredButtonText = nil  -- Clear any deferred button from previous tab
 
         if tabName then
             Ext.Tolk.Speak(tabName, true)
@@ -271,12 +288,12 @@ local function HandleFocusChange(element)
 
         -- Wait 3 frames for stale content to clear, then 5 real retries.
         -- The content area takes 2-3 frames to rebuild after a tab switch.
-        -- During the settle delay, we don't call FindFirstOptionItem at all
-        -- to avoid picking up leftover content from the previous tab.
+        -- The retries determine whether this tab has options (silently stop)
+        -- or informational text (read it aloud as fallback).
         pendingOptionDelay = 3
         pendingOptionRetry = 5
         Ext.UI.ForceGlobalFocusUpdate()
-        Ext.Utils.Print("[BG3Access]   -> Scheduling first option detection (delay=" .. pendingOptionDelay .. " retries=" .. pendingOptionRetry .. ")")
+        Ext.Utils.Print("[BG3Access]   -> Scheduling tab type detection (delay=" .. pendingOptionDelay .. " retries=" .. pendingOptionRetry .. ")")
         return
     end
 
@@ -284,19 +301,33 @@ local function HandleFocusChange(element)
     --
     -- If we're in the middle of tab detection (retries/delay pending),
     -- a content-area button may get focus (e.g. "Enable Cross-Play").
-    -- Speak it but DON'T cancel the tab context — let retries finish
-    -- so the fallback can still read informational body text.
+    -- Defer speaking it until AFTER body text reads (so the user hears
+    -- context before the actionable element).  Set up INPC subscription
+    -- via SpeakFocused but suppress the actual speech output.
     if pendingOptionRetry > 0 or pendingOptionDelay > 0 then
         if elemId ~= lastSpokenName then
-            Ext.Utils.Print("[BG3Access]   -> Speak during tab detection (retries preserved)")
-            SpeakFocused(element)
+            local text = Helpers.ExtractTextFromElement(element)
+            if text and text ~= "" then
+                Ext.Utils.Print("[BG3Access]   -> Deferring button during tab detection: " .. text)
+                deferredButtonText = text
+                lastSpokenName = GetElementId(element)
+                lastSpokenFullText = text
+            end
+            spokenDuringTabDet = true
         end
+        -- Keep the forced-update chain alive so the C++ monitor
+        -- continues firing callbacks.  Without this, the monitor
+        -- stops (focused and selected are both stable, forced is
+        -- not re-armed) and the remaining retries never execute.
+        Ext.UI.ForceGlobalFocusUpdate()
         return
     end
 
     -- Normal path — no active tab detection.
     lastSpokenTab = nil  -- Reset tab context (fixes re-entry into Options)
-    tabHintSpoken = false  -- Reset hint so it speaks again on next Options entry
+    -- NOTE: tabHintSpoken is NOT reset here — it resets on GameStateChanged
+    -- so the hint speaks once per Options visit, not every time a button
+    -- within Options gets focus (e.g. after enabling Cross-Play).
     if elemId == lastSpokenName then
         -- Same structural identity — but might be a different element with
         -- the same type and Name (e.g., multiplayer lobby entries all named
@@ -342,6 +373,8 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     pendingOptionRetry = 0
     pendingOptionDelay = 0
     tabHintSpoken = false
+    spokenDuringTabDet = false
+    deferredButtonText = nil
     SetupGlobalFocusMonitor()
 end)
 
