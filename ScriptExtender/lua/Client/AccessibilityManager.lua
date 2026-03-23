@@ -49,6 +49,7 @@ local lastSpokenFullText  = nil   -- full assembled text of last speech
 local lastSpokenTab       = nil   -- tab NAME (not elemId) of last spoken tab
 local lastSpokenTitle     = nil   -- screen title last spoken (suppress repeats on same screen)
 local tabHintSpoken       = false -- true after we've spoken the navigation hint this visit
+local suppressSnapshots   = false -- true during game state transitions (loading, etc.)
 local lastWidgetRootStr   = nil   -- widgetRootId string of the last widget root (dialog detection)
 local seenWidgetRoots     = {}   -- set of widget root strings we've visited
 local currentWidgetDCType = nil   -- dcType of the current menu's widget (e.g. "gui::DCOptions")
@@ -201,13 +202,6 @@ local function SubscribeControllerInput(dcProps)
 end
 
 -- ---------------------------------------------------------------------------
--- Debounce timing constants (milliseconds).
--- ---------------------------------------------------------------------------
-local DEBOUNCE = {
-    TAB   = 150,  -- Tab switches: waits for NameScope + widget events
-    ITEM  = 50,   -- D-pad navigation: near-instant
-    VALUE = 10,   -- INPC value changes: immediate
-}
 
 -- ---------------------------------------------------------------------------
 -- Per-menu navigation hints.  Keyed by widget DC type.
@@ -231,166 +225,49 @@ local MENU_HINTS = {
 local DEFAULT_HINT = "Use bumpers to switch tabs, press down for content."
 
 -- ---------------------------------------------------------------------------
--- SpeechAggregator: context-slot debounce model for speech output.
+-- Speech output: fill slots, speak immediately.
 --
--- Named slots hold text fragments that are assembled into one speech call
--- when the debounce timer fires.  Slot order is fixed:
---   title -> hint -> tabName -> body -> itemName -> itemValue -> itemDesc
---
--- Two context levels:
---   NewTabContext()  -- full reset, TAB debounce (150ms)
---   NewItemContext() -- clears item slots only, ITEM debounce (50ms)
+-- Slot order is fixed.  Non-nil slots are joined with ". " and spoken.
+-- No timers, no debounce, no deferred assembly.
+-- Every snapshot that reaches Lua is the result of user action (the C++
+-- settle window filters out Noesis rebuild noise), so always interrupt.
 -- ---------------------------------------------------------------------------
-local SpeechAggregator = {
-    slots = {},
-    debounceMs = DEBOUNCE.ITEM,
-    debounceTimerId = nil,
-    safetyTimerId = nil,
-    epoch = 0,
-    tabFlushPending = false,
-    recentTabFlush = false,
-    recentTabFlushTimerId = nil,
-}
-
 local SLOT_ORDER = { "title", "hint", "tabName", "body", "itemName", "itemValue", "itemDesc" }
 
-function SpeechAggregator:SetSlot(name, value)
-    self.slots[name] = value
-    self:ResetDebounce()
-end
+local screenEntryJustSpoke = false  -- true for ONE snapshot after screen entry
 
-function SpeechAggregator:SetSlotQuiet(name, value)
-    self.slots[name] = value
-end
-
-function SpeechAggregator:ClearSlot(name)
-    self.slots[name] = nil
-end
-
-function SpeechAggregator:ResetDebounce()
-    self.epoch = self.epoch + 1
-    local capturedEpoch = self.epoch
-    if self.debounceTimerId then
-        pcall(Ext.Timer.Cancel, self.debounceTimerId)
-    end
-    self.debounceTimerId = Ext.Timer.WaitFor(self.debounceMs, function()
-        if capturedEpoch == self.epoch then
-            self:Flush()
-        end
-    end)
-end
-
-function SpeechAggregator:Flush()
-    self.debounceTimerId = nil
-    if self.safetyTimerId then
-        pcall(Ext.Timer.Cancel, self.safetyTimerId)
-        self.safetyTimerId = nil
-    end
+local function SpeakSlots(slots, isScreenEntry)
     local parts = {}
     for _, slotName in ipairs(SLOT_ORDER) do
-        local value = self.slots[slotName]
+        local value = slots[slotName]
         if value and value ~= "" then
-            table.insert(parts, value)
+            table.insert(parts, (value:gsub("[%.%s]+$", "")))
         end
     end
-    if #parts == 0 then
-        Log.Debug("Aggregator: FLUSH (empty, nothing to speak)")
-        self.tabFlushPending = false
-        return
-    end
-    -- Strip trailing periods/spaces from each slot before joining to
-    -- avoid double periods (e.g. "content.. Online").
-    for i, part in ipairs(parts) do
-        parts[i] = part:gsub("[%.%s]+$", "")
-    end
+    if #parts == 0 then return end
     local assembled = H.StripMarkupTags(table.concat(parts, ". "))
-    Log.Info("Aggregator: FLUSH -> " .. assembled)
-    Ext.Tolk.Speak(assembled, true)
+    if not assembled or assembled == "" then return end
+    -- Screen entry always interrupts (user navigated to new screen).
+    -- The NEXT speak after screen entry does NOT interrupt (auto-focus).
+    -- Everything else interrupts (user d-pad, value change, etc.).
+    local interrupt = true
+    if screenEntryJustSpoke and not isScreenEntry then
+        interrupt = false
+        screenEntryJustSpoke = false
+    end
+    if isScreenEntry then
+        screenEntryJustSpoke = true
+    end
+    Log.Info("SPEAK" .. (interrupt and "" or " (append)") .. ": " .. assembled)
+    Ext.Tolk.Speak(assembled, interrupt)
     lastSpokenFullText = assembled
-    -- Track recent tab flush to suppress immediate INPC after tab speech.
-    if self.tabFlushPending then
-        self.recentTabFlush = true
-        if self.recentTabFlushTimerId then
-            pcall(Ext.Timer.Cancel, self.recentTabFlushTimerId)
-        end
-        self.recentTabFlushTimerId = Ext.Timer.WaitFor(300, function()
-            self.recentTabFlush = false
-            self.recentTabFlushTimerId = nil
-        end)
-    end
-    self.tabFlushPending = false
-    self.slots = {}
-end
-
-function SpeechAggregator:NewTabContext()
-    -- Full reset: new tab selected, all previous context is stale.
-    self:Cancel()
-    self.slots = {}
-    self.debounceMs = DEBOUNCE.TAB
-    self.tabFlushPending = true
-    -- Safety timer: if no WidgetDCChanged or TabNamedTexts arrives within
-    -- 500ms, flush whatever we have so tabs don't go permanently silent.
-    local capturedEpoch = self.epoch
-    self.safetyTimerId = Ext.Timer.WaitFor(500, function()
-        if capturedEpoch == self.epoch and self.tabFlushPending then
-            Log.Info("Aggregator: Safety timer fired, flushing pending tab")
-            self:Flush()
-        end
-    end)
-    Log.Debug("Aggregator: NewTabContext")
-end
-
-function SpeechAggregator:NewItemContext()
-    -- Partial reset: d-pad within a tab, clear only item slots.
-    self.slots["itemName"] = nil
-    self.slots["itemValue"] = nil
-    self.slots["itemDesc"] = nil
-    self.debounceMs = DEBOUNCE.ITEM
-    Log.Debug("Aggregator: NewItemContext")
-end
-
-function SpeechAggregator:SpeakImmediate(text)
-    -- Immediate speech for INPC value changes and overlays.
-    -- Cancels any pending debounce, speaks now.
-    if not text or text == "" then return end
-    self:Cancel()
-    self.slots = {}
-    self.tabFlushPending = false
-    local cleaned = H.StripMarkupTags(text)
-    Log.Info("Aggregator: IMMEDIATE -> " .. cleaned)
-    Ext.Tolk.Speak(cleaned, true)
-    lastSpokenFullText = cleaned
-end
-
-function SpeechAggregator:Cancel()
-    self.epoch = self.epoch + 1
-    if self.debounceTimerId then
-        pcall(Ext.Timer.Cancel, self.debounceTimerId)
-        self.debounceTimerId = nil
-    end
-    if self.safetyTimerId then
-        pcall(Ext.Timer.Cancel, self.safetyTimerId)
-        self.safetyTimerId = nil
-    end
-end
-
-function SpeechAggregator:Reset()
-    self:Cancel()
-    self.slots = {}
-    self.debounceMs = DEBOUNCE.ITEM
-    self.tabFlushPending = false
-    self.recentTabFlush = false
-    if self.recentTabFlushTimerId then
-        pcall(Ext.Timer.Cancel, self.recentTabFlushTimerId)
-        self.recentTabFlushTimerId = nil
-    end
 end
 
 -- ---------------------------------------------------------------------------
 -- HandleTickSnapshot: single-pass snapshot processor.
 --
 -- ONE snapshot per tick from C++, ONE pass through this function.
--- Fills SpeechAggregator slots directly from ALL available data.
+-- Fills slots from snapshot data and speaks immediately.
 -- No deferred assembly, no multi-handler dispatch.
 --
 -- Processing order:
@@ -451,6 +328,7 @@ local function ExtractFromWidgetData(widgetData)
 end
 
 local function HandleTickSnapshot(snapshot)
+    if suppressSnapshots then return end
     local focusedElement = snapshot.focusedElement
     if not focusedElement then return end
 
@@ -483,7 +361,6 @@ local function HandleTickSnapshot(snapshot)
 
     -- =================================================================
     -- Housekeeping: widget root tracking, DC type, controller mode.
-    -- Runs on every snapshot with structural changes, before speech.
     -- =================================================================
     local widgetRootId = focusedElement.widgetRootId or ""
     if widgetRootId ~= "" and widgetRootId ~= lastWidgetRootStr then
@@ -497,11 +374,9 @@ local function HandleTickSnapshot(snapshot)
             lastSpokenTab = nil
             lastSpokenTitle = nil
             tabHintSpoken = false
-            SpeechAggregator:Cancel()
-            SpeechAggregator.slots = {}
-            SpeechAggregator.tabFlushPending = false
         end
         currentWidgetDCType = nil
+        screenEntryJustSpoke = false
     end
 
     if snapshot.widgetAdded and snapshot.widgetData and snapshot.widgetData.dcType then
@@ -518,31 +393,13 @@ local function HandleTickSnapshot(snapshot)
     end
 
     -- =================================================================
-    -- Classify the snapshot: what kind of change is this?
-    -- Exactly one path runs. Priority order:
-    --   1. Inline carousel value
-    --   2. Tab/screen change (selectionChanged + isTab)
-    --   3. Overlay/dialog (widgetAdded, no tab context)
-    --   4. Item navigation (focusChanged, not tab)
-    --   5. Value-only change (valueChanged, nothing else)
+    -- Classify: what kind of change is this?
     -- =================================================================
+    local elemId = focusedElement.elemId or ""
+    local hasCarousel = snapshot.inlineCarouselChanged
+        and snapshot.inlineCarouselValue
+        and snapshot.inlineCarouselValue ~= ""
 
-    -- ----- 1. Inline carousel (face shape, skin colour, etc.) -----
-    if snapshot.inlineCarouselChanged and snapshot.inlineCarouselValue then
-        local carouselValue = snapshot.inlineCarouselValue
-        if carouselValue ~= lastSpokenFullText then
-            lastSpokenFullText = carouselValue
-            Log.Info("CAROUSEL: " .. carouselValue)
-            SpeechAggregator:SpeakImmediate(carouselValue)
-        end
-        return
-    end
-
-    -- ----- 2. Screen/page entry -----
-    -- Triggers: tab switch (selectionChanged), new widget (widgetAdded),
-    -- or selection change with non-tab focus (Cross-Play, difficulty).
-    -- All three mean the same thing: we entered a new space. Announce it.
-    -- One unified path fills all 5 slots from ALL available snapshot data.
     local isScreenEntry = false
     if snapshot.selectionChanged then
         isScreenEntry = true
@@ -550,37 +407,84 @@ local function HandleTickSnapshot(snapshot)
         isScreenEntry = true
     end
 
+    local isItemNav = snapshot.focusChanged
+        and not focusedElement.isTab and not isScreenEntry
+    local isCarouselOnly = hasCarousel and not snapshot.focusChanged
+    local isValueOnly = not isScreenEntry and not isItemNav
+        and not isCarouselOnly and snapshot.valueChanged
+
+    -- Nothing to do?
+    if not isScreenEntry and not isItemNav
+        and not isCarouselOnly and not isValueOnly then
+        return
+    end
+
+    -- =================================================================
+    -- Standalone carousel or value: speak immediately, no slots needed.
+    -- =================================================================
+    if isCarouselOnly then
+        local carouselValue = snapshot.inlineCarouselValue
+        if carouselValue ~= lastSpokenFullText then
+            lastSpokenFullText = carouselValue
+            Log.Info("CAROUSEL: " .. carouselValue)
+            Ext.Tolk.Speak(carouselValue, true)
+        end
+        return
+    end
+
+    if isValueOnly then
+        local valueText = H.FormatDCValue(focusedElement.dcProps)
+        if valueText and valueText ~= "" and valueText ~= lastSpokenFullText then
+            lastSpokenFullText = valueText
+            Log.Info("VALUE: " .. valueText)
+            Ext.Tolk.Speak(valueText, true)
+        end
+        return
+    end
+
+    -- =================================================================
+    -- Screen entry or item navigation: fill slots, speak.
+    -- =================================================================
+    local slots = {}
+    local tabName = nil
+    local ccItemName = nil
+    local normalTab = ""
+    local screenTitle = nil
+
+    -- ----- Screen entry: fill title, hint, tabName, body -----
     if isScreenEntry then
-        -- Special case: unnamed ListBoxItem tabs (appearance carousel).
-        local tabName = focusedElement.isTab and focusedElement.tabName or nil
-        if tabName and tabName:find("^ListBoxItem:") then
-            if SpeechAggregator.tabFlushPending then
-                Log.Debug("SKIP appearance tab (side-effect): " .. tabName)
-                return
+        -- Derive tab name.
+        if focusedElement.isTab then
+            tabName = focusedElement.tabName
+        end
+        if not tabName and snapshot.selectionChanged then
+            local sectionLabel = H.GetSectionLabel(focusedElement)
+            if sectionLabel then
+                tabName = sectionLabel
+                ccItemName = H.ExtractTextFromData(focusedElement, nil, false)
             end
-            local itemLabel = focusedElement.elemName and H.GetBodyTypeName(focusedElement.elemName)
+        end
+        normalTab = tabName and H.NormalizeForCompare(tabName) or ""
+
+        -- Appearance carousel (unnamed ListBoxItem).
+        if tabName and tabName:find("^ListBoxItem:") then
+            local itemLabel = focusedElement.elemName
+                and H.GetBodyTypeName(focusedElement.elemName)
             if not itemLabel then
                 itemLabel = tabName:match("^ListBoxItem:%s*(.+)$") or tabName
             end
-            Log.Info("Appearance carousel item: " .. itemLabel)
-            SpeechAggregator:NewItemContext()
-            SpeechAggregator:SetSlot("itemName", itemLabel)
-            lastSpokenName = focusedElement.elemId
+            -- Treat as simple item, not screen entry.
+            slots["itemName"] = itemLabel
+            lastSpokenName = elemId
+            lastSpokenFullText = itemLabel
+            Log.Info("ITEM: appearance  name=" .. itemLabel)
+            SpeakSlots(slots)
             return
         end
 
-        -- Skip duplicate screen entries.
-        -- For tabs: skip if same tab name as before.
-        -- For non-tab entries (difficulty, overlays): skip if we already
-        -- spoke this screen (no tab name change possible, so check
-        -- whether we recently flushed via tabFlushPending).
+        -- Dedup: skip if same tab.
         if tabName and tabName == lastSpokenTab then
             Log.Debug("SKIP screen entry (same tab): " .. tabName)
-            return
-        end
-        if not tabName and not snapshot.widgetAdded
-            and SpeechAggregator.recentTabFlush then
-            Log.Debug("SKIP screen entry (duplicate, no tab, recent flush)")
             return
         end
 
@@ -588,15 +492,10 @@ local function HandleTickSnapshot(snapshot)
             .. " sel=" .. tostring(snapshot.selectionChanged)
             .. " widget=" .. tostring(snapshot.widgetAdded))
 
-        SpeechAggregator:NewTabContext()
-        local isFirstTab = (lastSpokenTab == nil)
-        if tabName then
-            lastSpokenTab = tabName
-        end
+        if tabName then lastSpokenTab = tabName end
         lastSpokenName = nil
 
-        -- Gather ALL data from ALL sources in the snapshot.
-        -- Merge namedTexts from focusedElement and widgetData.
+        -- Gather all data sources.
         local allNamedTexts = {}
         if focusedElement.namedTexts then
             for elementName, elementText in pairs(focusedElement.namedTexts) do
@@ -613,15 +512,10 @@ local function HandleTickSnapshot(snapshot)
         local nsTitle, nsBodyParts = ExtractFromNamedTexts(allNamedTexts)
         local widgetTitle, widgetBody = ExtractFromWidgetData(snapshot.widgetData)
 
-        local dcBody = nil  -- reserved for general screen text, not focused item data
-
-        local statusText = H.ExtractStatusText(focusedElement.dcProps)
-        local normalTab = tabName and H.NormalizeForCompare(tabName) or ""
-
-        -- Slot 1: Title
-        local screenTitle = nsTitle
-        if not screenTitle then screenTitle = widgetTitle end
-        if screenTitle and normalTab ~= "" and H.NormalizeForCompare(screenTitle) == normalTab then
+        -- Title.
+        screenTitle = nsTitle or widgetTitle
+        if screenTitle and normalTab ~= ""
+            and H.NormalizeForCompare(screenTitle) == normalTab then
             screenTitle = nil
         end
         if screenTitle and screenTitle == lastSpokenTitle then
@@ -629,18 +523,11 @@ local function HandleTickSnapshot(snapshot)
         end
         if screenTitle then
             lastSpokenTitle = screenTitle
-            Log.Info("  title: " .. screenTitle)
-            SpeechAggregator:SetSlotQuiet("title", screenTitle)
+            slots["title"] = screenTitle
         end
 
-        local sectionLabel = H.GetSectionLabel(focusedElement)
-        if sectionLabel then
-            SpeechAggregator:SetSlotQuiet("title", sectionLabel)
-            Log.Info("  CC section: " .. sectionLabel)
-        end
-
-        -- Slot 2: Hint (once per menu visit)
-        if isFirstTab and not tabHintSpoken then
+        -- Hint (once per menu visit).
+        if not tabHintSpoken then
             tabHintSpoken = true
             local menuType = currentWidgetDCType
             if not menuType or MENU_HINTS[menuType] == nil then
@@ -650,32 +537,26 @@ local function HandleTickSnapshot(snapshot)
             end
             local menuHint = menuType and MENU_HINTS[menuType]
             if menuHint then
-                Log.Info("  hint: " .. menuHint)
-                SpeechAggregator:SetSlotQuiet("hint", menuHint)
-            elseif menuHint == false then
-                Log.Debug("  hint suppressed for " .. tostring(menuType))
-            elseif menuType == nil then
-                Log.Info("  hint: " .. DEFAULT_HINT)
-                SpeechAggregator:SetSlotQuiet("hint", DEFAULT_HINT)
+                slots["hint"] = menuHint
+            elseif menuHint ~= false and menuType == nil then
+                slots["hint"] = DEFAULT_HINT
             end
         end
 
-        -- Slot 3: Tab name (suppress if title contains it)
+        -- Tab name (suppress if title contains it).
         if tabName then
             local showTabName = true
-            if screenTitle then
-                if H.NormalizeForCompare(screenTitle):find(normalTab, 1, true) then
-                    showTabName = false
-                end
+            if screenTitle and H.NormalizeForCompare(screenTitle):find(normalTab, 1, true) then
+                showTabName = false
             end
             if showTabName then
-                SpeechAggregator:SetSlotQuiet("tabName", tabName)
+                slots["tabName"] = tabName
             end
         end
 
-        -- Slot 4: Body
+        -- Body.
         local bodyAssembled = nil
-        if #nsBodyParts > 0 then
+        if nsBodyParts and #nsBodyParts > 0 then
             bodyAssembled = table.concat(nsBodyParts, ". ")
         end
         if not bodyAssembled and controllerHintText then
@@ -684,121 +565,85 @@ local function HandleTickSnapshot(snapshot)
         if not bodyAssembled and widgetBody then
             bodyAssembled = widgetBody
         end
-        if not bodyAssembled and dcBody then
-            bodyAssembled = dcBody
-        end
+        local statusText = H.ExtractStatusText(focusedElement.dcProps)
         if statusText then
             bodyAssembled = bodyAssembled
                 and (bodyAssembled .. ". " .. statusText) or statusText
         end
         if bodyAssembled then
-            local bodyPreview = #bodyAssembled > 80
-                and bodyAssembled:sub(1, 80) .. "..." or bodyAssembled
-            Log.Info("  body: " .. bodyPreview)
-            SpeechAggregator:SetSlotQuiet("body", bodyAssembled)
+            slots["body"] = bodyAssembled
         end
-
-        -- Slots 5-7: Auto-focused item (name, value, description)
-        if snapshot.focusChanged and not focusedElement.isTab then
-            local itemName, itemValue, itemDesc = H.FormatDCTextSplit(focusedElement.dcProps)
-            if not itemName or itemName == "" then
-                itemName = H.ExtractTextFromData(focusedElement, tabName, true)
-                itemValue = nil
-                itemDesc = nil
-            end
-            if itemName and itemName ~= "" then
-                local normalItem = H.NormalizeForCompare(itemName)
-                local isDuplicate = (normalTab ~= "" and normalItem == normalTab)
-                    or (screenTitle and normalItem == H.NormalizeForCompare(screenTitle))
-                if not isDuplicate then
-                    Log.Debug("  auto-focus item: " .. itemName)
-                    SpeechAggregator:SetSlotQuiet("itemName", itemName)
-                    if itemValue then
-                        SpeechAggregator:SetSlotQuiet("itemValue", itemValue)
-                    end
-                    if itemDesc then
-                        SpeechAggregator:SetSlotQuiet("itemDesc", itemDesc)
-                    end
-                    lastSpokenName = focusedElement.elemId
-                    lastSpokenFullText = itemName
-                end
-            end
-        end
-
-        SpeechAggregator:ResetDebounce()
-        return
-    end
-
-    -- ----- 4. Item navigation (focus changed, not a tab) -----
-    if snapshot.focusChanged and not focusedElement.isTab then
-        local elemId = focusedElement.elemId or ""
-
-        -- If tab assembly is still pending, add item quietly.
-        if SpeechAggregator.tabFlushPending then
-            local text = H.ExtractTextFromData(focusedElement, lastSpokenTab, true)
-            if text and text ~= "" then
-                local normalTab = lastSpokenTab and H.NormalizeForCompare(lastSpokenTab) or ""
-                if H.NormalizeForCompare(text) ~= normalTab then
-                    Log.Debug("  auto-focus (pending tab): " .. text)
-                    SpeechAggregator:SetSlotQuiet("itemName", text)
-                    lastSpokenName = elemId
-                    lastSpokenFullText = text
-                end
-            end
-            return
-        end
-
-        -- Dedup: skip if same element with same text.
-        if elemId == lastSpokenName then
+    else
+        -- Item navigation: dedup check.
+        if elemId == lastSpokenName and not hasCarousel then
             local text = H.ExtractTextFromData(focusedElement, lastSpokenTab, false)
             if not text or text == lastSpokenFullText then
                 Log.Debug("DEDUP SKIP: " .. tostring(elemId))
                 return
             end
         end
+    end
 
-        -- Try split extraction first (name + description as separate slots).
-        local itemName, itemValue, itemDesc = H.FormatDCTextSplit(focusedElement.dcProps)
-        if not itemName or itemName == "" then
-            -- Fall back to full text extraction for non-DC elements.
-            itemName = H.ExtractTextFromData(focusedElement, lastSpokenTab, false)
-            itemValue = nil
-            itemDesc = nil
-        end
-        if not itemName or itemName == "" then
-            lastSpokenName = elemId
-            return
-        end
+    -- ----- Item slots (both screen entry and item navigation) -----
+    local itemName = nil
+    local itemValue = nil
+    local itemDesc = nil
 
+    -- CC: section label is tab, selected item is itemName.
+    if ccItemName then
+        itemName = ccItemName
+        if focusedElement.dcProps and tabName then
+            local godTitle, godBody = H.ExtractContextualGodObjectText(
+                focusedElement.dcProps, tabName)
+            if godBody and godBody ~= "" then
+                itemDesc = godBody
+            end
+        end
+    end
+
+    -- Regular element.
+    if not itemName then
+        local splitName, splitValue, splitDesc = H.FormatDCTextSplit(focusedElement.dcProps)
+        if not splitName or splitName == "" then
+            splitName = H.ExtractTextFromData(focusedElement, lastSpokenTab, isScreenEntry)
+            splitValue = nil
+            splitDesc = nil
+        end
+        if splitName and splitName ~= "" then
+            local normalItem = H.NormalizeForCompare(splitName)
+            local isDuplicate = (normalTab ~= "" and normalItem == normalTab)
+                or (screenTitle and normalItem == H.NormalizeForCompare(screenTitle))
+            if not isDuplicate then
+                itemName = splitName
+                itemValue = splitValue
+                if splitDesc then itemDesc = splitDesc end
+            end
+        end
+    end
+
+    -- Inline carousel value.
+    if hasCarousel then
+        itemValue = snapshot.inlineCarouselValue
+    end
+
+    if itemName then
+        slots["itemName"] = itemName
         lastSpokenName = elemId
         lastSpokenFullText = itemName
         Log.Info("ITEM: " .. tostring(focusedElement.elemType)
             .. "  name=" .. itemName
             .. (itemValue and ("  val=" .. itemValue) or "")
-            .. (itemDesc and ("  desc=" .. itemDesc:sub(1, 40)) or ""))
-        SpeechAggregator:NewItemContext()
-        SpeechAggregator:SetSlot("itemName", itemName)
-        if itemValue and itemValue ~= "" then
-            SpeechAggregator:SetSlotQuiet("itemValue", itemValue)
-        end
-        if itemDesc and itemDesc ~= "" then
-            SpeechAggregator:SetSlotQuiet("itemDesc", itemDesc)
-        end
-        return
+            .. (itemDesc and ("  desc=" .. tostring(itemDesc):sub(1, 40)) or ""))
     end
+    if itemValue then slots["itemValue"] = itemValue end
+    if itemDesc then slots["itemDesc"] = itemDesc end
 
-    -- ----- 5. Value-only change (INPC on stable focus) -----
-    if snapshot.valueChanged then
-        local valueText = H.FormatDCValue(focusedElement.dcProps)
-        if not valueText or valueText == "" then
-            valueText = H.FormatDCText(focusedElement.dcProps)
-        end
-        if valueText and valueText ~= "" and valueText ~= lastSpokenFullText then
-            lastSpokenFullText = valueText
-            Log.Info("VALUE: " .. valueText)
-            SpeechAggregator:SpeakImmediate(valueText)
-        end
-    end
+    -- ----- Speak -----
+    -- Screen entry speech (title, hint, body) should not interrupt
+    -- because the auto-focused item may arrive in a follow-up snapshot
+    -- and we don't want the lobby name cutting off "Use bumpers...".
+    -- User-initiated navigation (isItemNav) always interrupts.
+    SpeakSlots(slots, isScreenEntry)
 end
 
 -- ---------------------------------------------------------------------------
@@ -836,6 +681,21 @@ end
 SetupGlobalFocusMonitor()
 
 -- Re-subscribe on game state changes.
+-- Game states where snapshots should be suppressed (loading, transitions).
+local LOADING_STATES = {
+    StartLoading = true,
+    StartServer = true,
+    LoadSession = true,
+    LoadLevel = true,
+    SwapLevel = true,
+    UnloadLevel = true,
+    UnloadSession = true,
+    InitNetwork = true,
+    InitConnection = true,
+    StopLoading = true,
+    Idle = true,
+}
+
 Ext.Events.GameStateChanged:Subscribe(function(e)
     Log.Info("GameStateChanged: " .. tostring(e.FromState) .. " -> " .. tostring(e.ToState))
     UnsubscribeControllerInput()
@@ -844,10 +704,13 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     lastSpokenTab = nil
     lastSpokenTitle = nil
     tabHintSpoken = false
+    screenEntryJustSpoke = false
     lastWidgetRootStr = nil
     seenWidgetRoots = {}
     currentWidgetDCType = nil
-    SpeechAggregator:Reset()
+    -- Suppress snapshots during loading/transitions.
+    local toState = tostring(e.ToState)
+    suppressSnapshots = LOADING_STATES[toState] or false
     SetupGlobalFocusMonitor()
 end)
 
@@ -890,7 +753,7 @@ end)
 -- ---------------------------------------------------------------------------
 -- Startup
 -- ---------------------------------------------------------------------------
-Log.Info("Accessibility ready (GlobalFocusMonitor + SpeechAggregator).")
+Log.Info("Accessibility ready (GlobalFocusMonitor).")
 
 -- State machine probe removed -- C++ GetStateMachine() crashes.
 -- Searching via Lua/Noesis tree instead (see BootstrapClient.lua).
