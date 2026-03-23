@@ -1,4 +1,5 @@
 BG3Access.Shared.RequireFiles("Client/", {
-"Helpers/_Init",
+"AccessibilityLogger",
+"AccessibilityHelpers",
 "AccessibilityManager",
 })

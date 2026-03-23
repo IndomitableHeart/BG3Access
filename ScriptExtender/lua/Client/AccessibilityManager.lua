@@ -2,344 +2,803 @@
 --
 -- Accessibility manager using C++ GlobalFocusMonitor.
 --
+-- ARCHITECTURE: No Noesis objects cross into Lua for focus events.
+-- C++ extracts all element data during Tick() and passes a plain Lua
+-- table (strings, bools, numbers) to the callback.  Lua only processes
+-- primitives for speech formatting and state management.
+--
 -- The C++ monitor runs every frame, tracks focus (Strategies 1+2) and
 -- selection (Strategy 3) INDEPENDENTLY.  Selection changes take priority
 -- (tab switch, option selection); when selection is stable, focus changes
--- drive the callback (d-pad navigation, button focus).  This prevents a
--- non-null selection from permanently suppressing focus detection.
+-- drive the callback (d-pad navigation, button focus).
 --
--- Lua determines element type and handles accordingly:
---   Option item  (has DataContext.Text)  → speak name + value
---   Tab item     (ListBoxItem type)     → speak tab name + first option
---   Button/other                         → speak normally
+-- Focus callback receives a DATA TABLE with:
+--   elemType, elemName, elemId, isTab, isFocusable,
+--   dcType, dcProps, elemText, tabName, widgetRootId
 --
--- Plus INPC on DataContext (C++):
---   Fires when a ViewModel property changes (tickbox toggle, slider
---   adjust, combo selection).  Speaks the new value immediately.
+-- INPC (PropertyChanged) is auto-subscribed by C++ when focus changes.
+-- Fires the same callback with eventType="PropertyChanged" and updated
+-- dcProps.  Lua speaks the value-only part.
+--
+-- Widget-added events (Strategy 4) pass data tables with widget DC
+-- properties and binding metadata.  No Noesis elements cross to Lua.
+--
+-- Widget DC changes (WidgetDCChanged) fire when the widget's ViewModel
+-- updates (e.g., after tab content loads).  Replaces the old WaitFrames
+-- timer with event-driven detection from C++ INPC monitoring.
+--
+-- SPEECH MODEL: Context + Debounce aggregator.
+-- Events update named slots (title, hint, tabName, body, itemName).
+-- A debounce timer fires after the last update and assembles all
+-- non-nil slots into ONE Tolk.Speak call in accessibility order.
+-- No priority interruption, no chain/follow-up queue.
 
 BG3Access = BG3Access or {}
 BG3Access.Client = BG3Access.Client or {}
 
-local Helpers = BG3Access.Helpers
+-- Module references (loaded before this file by _Init.lua).
+local Log = BG3Access.Client.Log
+local H   = BG3Access.Client.Helpers
 
 -- ---------------------------------------------------------------------------
 -- State
---
--- IMPORTANT: Noesis element references expire after the tick they are
--- obtained in.  We NEVER store element references across ticks.  All
--- cross-tick tracking uses identity strings from GetElementId().
 -- ---------------------------------------------------------------------------
 
 local lastSpokenName      = nil   -- identity of last spoken element
-local lastSpokenFullText  = nil   -- full "Name: Value" text of last speech
+local lastSpokenFullText  = nil   -- full assembled text of last speech
 local lastSpokenTab       = nil   -- tab NAME (not elemId) of last spoken tab
-local pendingOptionRetry  = 0     -- retry counter for FindFirstOptionItem after tab switch
-local pendingOptionDelay  = 0     -- settle frames before retrying (lets stale content clear)
+local lastSpokenTitle     = nil   -- screen title last spoken (suppress repeats on same screen)
 local tabHintSpoken       = false -- true after we've spoken the navigation hint this visit
-local spokenDuringTabDet  = false -- true if a non-option element was spoken during tab detection
-local deferredButtonText  = nil   -- text of button that got focus during tab detection (spoken after body text)
+local lastWidgetRootStr   = nil   -- widgetRootId string of the last widget root (dialog detection)
+local seenWidgetRoots     = {}   -- set of widget root strings we've visited
+local currentWidgetDCType = nil   -- dcType of the current menu's widget (e.g. "gui::DCOptions")
+local debugExploreMode    = false -- toggle with L3+R3; speaks raw element info on every focus change
 
 -- ---------------------------------------------------------------------------
--- Get a stable identity string for an element (object refs expire each tick).
+-- Controller bindings interactive mode.
+-- When active on the Controller options tab, pressing a button speaks its
+-- mapped function instead of performing the in-game action.
 -- ---------------------------------------------------------------------------
-local function GetElementId(elem)
-    if not elem then return nil end
-    local okN, name = pcall(elem.GetProperty, elem, "Name")
-    local okT, typeName = pcall(function() return elem.Type end)
-    local n = (okN and type(name) == "string") and name or ""
-    local t = (okT and type(typeName) == "string") and typeName or "?"
+local controllerBindingsData = nil       -- stored DCControllerOptions dcProps
+local controllerInputSubscription = nil  -- subscription ID for ControllerButtonInput
+local controllerAxisSubscription = nil   -- subscription ID for ControllerAxisInput
 
-    -- For ViewModel-driven elements (Options menu ContentPresenters etc.),
-    -- include DataContext.Text to distinguish items with the same type/name.
-    local dcId = ""
-    if n == "" then
-        local okDC, dc = pcall(elem.GetProperty, elem, "DataContext")
-        if okDC and dc and type(dc) == "userdata" then
-            local okDCT, txt = pcall(dc.GetProperty, dc, "Text")
-            if okDCT and type(txt) == "string" then
-                dcId = txt
-            end
-        end
-    end
+-- Map SDL button enum names (from ControllerButtonInput) to DCControllerOptions keys.
+local SDL_BUTTON_TO_DC_KEY = {
+    A = "ButtonA",
+    B = "ButtonB",
+    X = "ButtonX",
+    Y = "ButtonY",
+    LeftShoulder = "LeftBumper",
+    RightShoulder = "RightBumper",
+    DPadUp = "DpadUp",
+    DPadDown = "DpadDown",
+    DPadLeft = "DpadLeft",
+    DPadRight = "DpadRight",
+    Start = "ButtonStart",
+    Back = "ButtonBack",
+    LeftStick = "LeftStick",
+    RightStick = "RightStick",
+}
 
-    return t .. "::" .. n .. "::" .. dcId
+-- Map SDL axis enum names (from ControllerAxisInput) to DCControllerOptions keys.
+local SDL_AXIS_TO_DC_KEY = {
+    TriggerLeft = "LeftTrigger",
+    TriggerRight = "RightTrigger",
+    LeftX = "LeftStick",
+    LeftY = "LeftStick",
+    RightX = "RightStick",
+    RightY = "RightStick",
+}
+
+-- Friendly display names for speech output.
+local BUTTON_DISPLAY_NAMES = {
+    ButtonA = "A", ButtonB = "B", ButtonX = "X", ButtonY = "Y",
+    DpadUp = "D-pad Up", DpadDown = "D-pad Down",
+    DpadLeft = "D-pad Left", DpadRight = "D-pad Right",
+    LeftBumper = "Left Bumper", RightBumper = "Right Bumper",
+    LeftTrigger = "Left Trigger", RightTrigger = "Right Trigger",
+    LeftStick = "Left Stick", RightStick = "Right Stick",
+    ButtonStart = "Start", ButtonBack = "Back",
+}
+
+local function SpeakControllerBinding(dcKey)
+    if not controllerBindingsData then return false end
+    local binding = controllerBindingsData[dcKey]
+    if type(binding) ~= "table" or not binding.Functionality then return false end
+    local displayName = BUTTON_DISPLAY_NAMES[dcKey] or dcKey
+    local functionality = H.CleanControllerFunctionality(binding.Functionality)
+    if not functionality or functionality == "" then return false end
+    local speech = displayName .. ": " .. functionality
+    Log.Info("Controller binding -> " .. speech)
+    Ext.Tolk.Speak(speech, true)
+    return true
 end
 
--- ---------------------------------------------------------------------------
--- Check if an element is an "option item" (has DataContext with "Text").
--- Returns true for options like "Show Tutorials", false for tab items.
--- ---------------------------------------------------------------------------
-local function IsOptionItem(elem)
-    local okDC, dc = pcall(elem.GetProperty, elem, "DataContext")
-    if not okDC or not dc or type(dc) ~= "userdata" then return false end
-    local hasProp = false
-    local okH = pcall(function() hasProp = Ext.UI.HasProperty(dc, "Text") end)
-    if not okH or not hasProp then return false end
-    local okT, txt = pcall(dc.GetProperty, dc, "Text")
-    return okT and type(txt) == "string" and txt ~= ""
+local function UnsubscribeControllerInput()
+    if controllerInputSubscription then
+        Ext.Events.ControllerButtonInput:Unsubscribe(controllerInputSubscription)
+        controllerInputSubscription = nil
+        Log.Info("Unsubscribed controller button input")
+    end
+    if controllerAxisSubscription then
+        Ext.Events.ControllerAxisInput:Unsubscribe(controllerAxisSubscription)
+        controllerAxisSubscription = nil
+        Log.Info("Unsubscribed controller axis input")
+    end
+    controllerBindingsData = nil
 end
 
--- ---------------------------------------------------------------------------
--- Check if an element looks like a tab/carousel item (ListBoxItem type).
--- ---------------------------------------------------------------------------
-local function IsTabItem(elem)
-    local okT, typeName = pcall(function() return elem.Type end)
-    if not okT or type(typeName) ~= "string" then return false end
-    return typeName:find("ListBoxItem") ~= nil
-        or typeName:find("ListItem") ~= nil
-end
+local function SubscribeControllerInput(dcProps)
+    -- Clean up any existing subscription first.
+    UnsubscribeControllerInput()
 
--- ---------------------------------------------------------------------------
--- Speak a focused element.  `focused` MUST be from the current tick.
---
--- `interrupt` (default true): if true, interrupts current speech.
---   Set to false when queuing speech after a tab name announcement.
---
--- Subscribes to INPC on the element's DataContext for value changes.
--- The INPC callback uses Helpers.ReadDataContextText(sender) to read
--- from the ViewModel directly — NOT from the expired element reference.
--- ---------------------------------------------------------------------------
-local function SpeakFocused(focused, interrupt)
-    if interrupt == nil then interrupt = true end
+    controllerBindingsData = dcProps
 
-    lastSpokenName = GetElementId(focused)
+    -- Navigation buttons require a double-press to perform their action.
+    -- First press speaks the binding, second consecutive press passes through.
+    local DOUBLE_PRESS_BUTTONS = {
+        B = true,
+        LeftShoulder = true,
+        RightShoulder = true,
+    }
 
-    -- Unsubscribe from previous ViewModel's property changes.
-    Ext.UI.UnsubscribePropertyChanged()
+    local lastPressedButton = nil  -- tracks last button for double-press detection
 
-    -- Extract and speak text.
-    local text = Helpers.ExtractTextFromElement(focused)
-    lastSpokenFullText = text
-    local okT, typeName = pcall(function() return focused.Type end)
-    typeName = (okT and type(typeName) == "string") and typeName or "?"
-    Ext.Utils.Print("[BG3Access] Focus -> " .. typeName .. "  text=" .. tostring(text))
-
-    if text and text ~= "" then
-        Ext.Tolk.Speak(text, interrupt)
-    end
-    -- If no useful text found, stay silent rather than speaking raw type name.
-
-    -- Subscribe to INPC on the element's DataContext for value changes
-    -- (checkbox toggle, slider adjust, combo selection).
-    -- IMPORTANT: The callback reads from `sender` (the ViewModel), NOT from
-    -- `focused` (which expires after this tick).
-    local okDC, dc = pcall(focused.GetProperty, focused, "DataContext")
-    if okDC and dc and type(dc) == "userdata" then
-        local subOk, subErr = pcall(Ext.UI.SubscribePropertyChanged, dc, function(sender, prop)
-            local pOk, pErr = pcall(function()
-                -- Read the full "Name: Value" string for dedup tracking,
-                -- but only speak the value part (e.g. "On" not "Show Tutorials: On").
-                local newText = Helpers.ReadDataContextText(sender)
-                if newText and newText ~= "" and newText ~= lastSpokenFullText then
-                    lastSpokenFullText = newText
-                    local valueOnly = Helpers.ReadDataContextValue(sender)
-                    local speakText = valueOnly or newText
-                    Ext.Utils.Print("[BG3Access] INPC -> " .. speakText)
-                    Ext.Tolk.Speak(speakText, true)
-                end
-            end)
-            if not pOk then
-                Ext.Utils.Print("[BG3Access] INPC callback error: " .. tostring(pErr))
-            end
-        end)
-        if subOk then
-            Ext.Utils.Print("[BG3Access] INPC subscribed on " .. typeName)
-        end
-    end
-end
-
--- ---------------------------------------------------------------------------
--- Handle a focus or selection change from the C++ monitor.
--- Determines what kind of element it is and handles accordingly.
--- ---------------------------------------------------------------------------
-local function HandleFocusChange(element)
-    if not element then return end
-
-    local elemId = GetElementId(element)
-    local okT, typeName = pcall(function() return element.Type end)
-    typeName = (okT and type(typeName) == "string") and typeName or "?"
-    local isOpt = IsOptionItem(element)
-    local isTab = IsTabItem(element)
-
-    Ext.Utils.Print("[BG3Access] HandleFocusChange: type=" .. typeName
-        .. " isOpt=" .. tostring(isOpt) .. " isTab=" .. tostring(isTab)
-        .. " elemId=" .. tostring(elemId)
-        .. " lastSpokenName=" .. tostring(lastSpokenName)
-        .. " lastSpokenTab=" .. tostring(lastSpokenTab))
-
-    -- Option item (ContentPresenter with DataContext.Text) → speak normally
-    if isOpt then
-        pendingOptionRetry = 0  -- Cancel any pending tab-option retry
-        pendingOptionDelay = 0
-        if elemId == lastSpokenName then
-            Ext.Utils.Print("[BG3Access]   -> SKIP option (same as lastSpokenName)")
-            return
-        end
-        SpeakFocused(element)
-        return
-    end
-
-    -- Tab/carousel item (ListBoxItem type without DataContext.Text)
-    -- NOTE: All ListBoxItems produce identical elemId ("ListBoxItem::::"),
-    -- so we use the extracted tab NAME for dedup instead.
-    if isTab then
-        local tabName = Helpers.ExtractTabName(element)
-        Ext.Utils.Print("[BG3Access]   -> TAB name=" .. tostring(tabName))
-
-        -- Same tab as last spoken?
-        if tabName and tabName == lastSpokenTab then
-            -- Phase 1: Settle delay -- let stale content from the previous tab clear.
-            -- The content area takes 2-3 frames to rebuild after a tab switch.
-            if pendingOptionDelay > 0 then
-                pendingOptionDelay = pendingOptionDelay - 1
-                Ext.Utils.Print("[BG3Access]   -> WAIT for content (" .. pendingOptionDelay .. " frames left)")
-                Ext.UI.ForceGlobalFocusUpdate()
-            -- Phase 2: Real retries -- check if this tab has options or body text.
-            -- We do NOT speak the first option (user must press d-pad down to
-            -- enter the options list, which triggers a real focus change).
-            -- This retry loop only determines tab TYPE so we can read body text
-            -- for non-option tabs (e.g. Cross-Play informational text).
-            elseif pendingOptionRetry > 0 then
-                pendingOptionRetry = pendingOptionRetry - 1
-                Ext.Utils.Print("[BG3Access]   -> RETRY tab type detection (" .. pendingOptionRetry .. " retries left)")
-                local root = Ext.UI.GetRoot()
-                if root then
-                    local firstOption = Helpers.FindFirstOptionItem(root)
-                    if firstOption then
-                        -- This is an options tab -- stop retrying silently.
-                        -- The user will press d-pad down to navigate options,
-                        -- which the focus monitor picks up naturally.
-                        pendingOptionRetry = 0
-                        pendingOptionDelay = 0
-                        deferredButtonText = nil
-                        Ext.Utils.Print("[BG3Access]   -> Tab has options, waiting for user navigation")
-
-                        -- Speak navigation hint once per Options visit.
-                        -- Only here (not on tab name) because this confirms
-                        -- we're in a menu with actual options, not multiplayer.
-                        if not tabHintSpoken then
-                            tabHintSpoken = true
-                            Ext.Tolk.Speak("Press down to enter the options list, then navigate with up and down. Left and right change values.", false)
-                        end
-                    elseif pendingOptionRetry > 0 then
-                        Ext.UI.ForceGlobalFocusUpdate()
-                    else
-                        -- No option items found -- this tab has informational
-                        -- text instead of settings (e.g. Cross-Play description).
-                        -- Fall back to reading visible text, scoped to the tab's
-                        -- content area (not root) to avoid main menu/footer junk.
-                        -- GatherTextBlockTexts skips ListView/ListBox containers
-                        -- so interactive lists (lobbies) won't be dumped.
-                        Ext.Utils.Print("[BG3Access]   -> RETRY exhausted, falling back to scoped text")
-                        spokenDuringTabDet = false
-                        local texts = Helpers.GatherTabContentText(root)
-                        if #texts > 0 then
-                            local seen = {}
-                            local filtered = {}
-                            for _, t in ipairs(texts) do
-                                -- Skip binding placeholders like [ForceUpdate]
-                                if t:find("%[ForceUpdate%]") then goto skip end
-                                -- Skip very short strings ("0", etc.)
-                                if #t < 3 then goto skip end
-                                -- Skip duplicates
-                                if seen[t] then goto skip end
-                                -- Skip text matching the tab name (already spoken)
-                                if lastSpokenTab and t == lastSpokenTab then goto skip end
-                                -- Skip text matching the deferred button (spoken separately after)
-                                if deferredButtonText and t == deferredButtonText then goto skip end
-                                seen[t] = true
-                                table.insert(filtered, t)
-                                ::skip::
-                            end
-                            if #filtered > 0 then
-                                local fullText = table.concat(filtered, ". ")
-                                lastSpokenFullText = fullText
-                                Ext.Utils.Print("[BG3Access]   -> FALLBACK text: " .. fullText)
-                                Ext.Tolk.Speak(fullText, false)
-                            end
-                        end
-
-                        -- Now speak the deferred button text (if a button got
-                        -- focus during tab detection).  Body text first, then
-                        -- the focused button, so the user hears context before
-                        -- the actionable element.
-                        if deferredButtonText then
-                            Ext.Utils.Print("[BG3Access]   -> Deferred button: " .. deferredButtonText)
-                            Ext.Tolk.Speak(deferredButtonText, false)
-                            deferredButtonText = nil
-                        end
-                    end
+    controllerInputSubscription = Ext.Events.ControllerButtonInput:Subscribe(function(event)
+        if not event.Pressed then return end
+        local buttonName = tostring(event.Button)
+        Log.Debug("Controller button: " .. buttonName)
+        local dcKey = SDL_BUTTON_TO_DC_KEY[buttonName]
+        if dcKey then
+            if DOUBLE_PRESS_BUTTONS[buttonName] then
+                if lastPressedButton == buttonName then
+                    -- Second consecutive press: let it through, reset.
+                    Log.Debug("  -> Double press, passing through: " .. buttonName)
+                    lastPressedButton = nil
+                    return
+                else
+                    -- First press: speak binding, block action.
+                    lastPressedButton = buttonName
+                    SpeakControllerBinding(dcKey)
+                    event:PreventAction()
                 end
             else
-                Ext.Utils.Print("[BG3Access]   -> SKIP tab (same name as lastSpokenTab)")
+                -- Non-navigation button: always speak and block.
+                lastPressedButton = buttonName
+                SpeakControllerBinding(dcKey)
+                event:PreventAction()
             end
+        else
+            lastPressedButton = nil
+            Log.Debug("  -> No mapping for button: " .. buttonName)
+        end
+    end)
+    Log.Info("Subscribed controller button input")
+
+    -- Axis subscription for triggers and sticks.
+    -- Only fire on significant deflection (trigger pulled past threshold).
+    local axisSpoken = {}  -- prevent rapid repeats on held axis
+    controllerAxisSubscription = Ext.Events.ControllerAxisInput:Subscribe(function(event)
+        local axisName = tostring(event.Axis)
+        local dcKey = SDL_AXIS_TO_DC_KEY[axisName]
+        if not dcKey then return end
+
+        -- Threshold: axis values are normalized -1.0 to 1.0.
+        -- Fire when deflected past 50%.
+        local AXIS_THRESHOLD = 0.5
+        local value = event.Value or 0
+        local deflected = (value > AXIS_THRESHOLD or value < -AXIS_THRESHOLD)
+
+        if deflected and not axisSpoken[dcKey] then
+            axisSpoken[dcKey] = true
+            SpeakControllerBinding(dcKey)
+        elseif not deflected then
+            axisSpoken[dcKey] = nil
+        end
+    end)
+    Log.Info("Subscribed controller axis input")
+end
+
+-- ---------------------------------------------------------------------------
+-- Debounce timing constants (milliseconds).
+-- ---------------------------------------------------------------------------
+local DEBOUNCE = {
+    TAB   = 150,  -- Tab switches: waits for NameScope + widget events
+    ITEM  = 50,   -- D-pad navigation: near-instant
+    VALUE = 10,   -- INPC value changes: immediate
+}
+
+-- ---------------------------------------------------------------------------
+-- Per-menu navigation hints.  Keyed by widget DC type.
+-- false = no hint for that menu.  Missing key = default hint.
+-- ---------------------------------------------------------------------------
+local MENU_HINTS = {
+    -- Options: standard bumper tab switching + vertical content
+    ["gui::DCOptions"] = "Use bumpers to switch tabs, press down for content.",
+    -- Multiplayer: bumper tab switching (Online, Cross-Play, LAN)
+    ["gui::DCLobbyBrowser"] = "Use bumpers to switch tabs, press down for content.",
+    -- Mod manager: bumper tab switching (Browse, Installed)
+    ["gui::DCModBrowser"] = "Use bumpers to switch tabs, press down for content.",
+    -- Character creation: bumper tab switching (Origin, Race, Class, etc.)
+    ["gui::DCCharacterCreation"] = "Use bumpers to switch tabs.",
+    -- Difficulty selector: d-pad left/right navigation, no bumpers
+    ["gui::DCNewGameSettings"] = false,
+    ["gui::DCDMSettings"] = false,
+    -- VMPreset is the tab item DC type inside the difficulty carousel
+    ["gui::VMPreset"] = false,
+}
+local DEFAULT_HINT = "Use bumpers to switch tabs, press down for content."
+
+-- ---------------------------------------------------------------------------
+-- SpeechAggregator: context-slot debounce model for speech output.
+--
+-- Named slots hold text fragments that are assembled into one speech call
+-- when the debounce timer fires.  Slot order is fixed:
+--   title -> hint -> tabName -> body -> itemName -> itemValue -> itemDesc
+--
+-- Two context levels:
+--   NewTabContext()  -- full reset, TAB debounce (150ms)
+--   NewItemContext() -- clears item slots only, ITEM debounce (50ms)
+-- ---------------------------------------------------------------------------
+local SpeechAggregator = {
+    slots = {},
+    debounceMs = DEBOUNCE.ITEM,
+    debounceTimerId = nil,
+    safetyTimerId = nil,
+    epoch = 0,
+    tabFlushPending = false,
+    recentTabFlush = false,
+    recentTabFlushTimerId = nil,
+}
+
+local SLOT_ORDER = { "title", "hint", "tabName", "body", "itemName", "itemValue", "itemDesc" }
+
+function SpeechAggregator:SetSlot(name, value)
+    self.slots[name] = value
+    self:ResetDebounce()
+end
+
+function SpeechAggregator:SetSlotQuiet(name, value)
+    self.slots[name] = value
+end
+
+function SpeechAggregator:ClearSlot(name)
+    self.slots[name] = nil
+end
+
+function SpeechAggregator:ResetDebounce()
+    self.epoch = self.epoch + 1
+    local capturedEpoch = self.epoch
+    if self.debounceTimerId then
+        pcall(Ext.Timer.Cancel, self.debounceTimerId)
+    end
+    self.debounceTimerId = Ext.Timer.WaitFor(self.debounceMs, function()
+        if capturedEpoch == self.epoch then
+            self:Flush()
+        end
+    end)
+end
+
+function SpeechAggregator:Flush()
+    self.debounceTimerId = nil
+    if self.safetyTimerId then
+        pcall(Ext.Timer.Cancel, self.safetyTimerId)
+        self.safetyTimerId = nil
+    end
+    local parts = {}
+    for _, slotName in ipairs(SLOT_ORDER) do
+        local value = self.slots[slotName]
+        if value and value ~= "" then
+            table.insert(parts, value)
+        end
+    end
+    if #parts == 0 then
+        Log.Debug("Aggregator: FLUSH (empty, nothing to speak)")
+        self.tabFlushPending = false
+        return
+    end
+    -- Strip trailing periods/spaces from each slot before joining to
+    -- avoid double periods (e.g. "content.. Online").
+    for i, part in ipairs(parts) do
+        parts[i] = part:gsub("[%.%s]+$", "")
+    end
+    local assembled = H.StripMarkupTags(table.concat(parts, ". "))
+    Log.Info("Aggregator: FLUSH -> " .. assembled)
+    Ext.Tolk.Speak(assembled, true)
+    lastSpokenFullText = assembled
+    -- Track recent tab flush to suppress immediate INPC after tab speech.
+    if self.tabFlushPending then
+        self.recentTabFlush = true
+        if self.recentTabFlushTimerId then
+            pcall(Ext.Timer.Cancel, self.recentTabFlushTimerId)
+        end
+        self.recentTabFlushTimerId = Ext.Timer.WaitFor(300, function()
+            self.recentTabFlush = false
+            self.recentTabFlushTimerId = nil
+        end)
+    end
+    self.tabFlushPending = false
+    self.slots = {}
+end
+
+function SpeechAggregator:NewTabContext()
+    -- Full reset: new tab selected, all previous context is stale.
+    self:Cancel()
+    self.slots = {}
+    self.debounceMs = DEBOUNCE.TAB
+    self.tabFlushPending = true
+    -- Safety timer: if no WidgetDCChanged or TabNamedTexts arrives within
+    -- 500ms, flush whatever we have so tabs don't go permanently silent.
+    local capturedEpoch = self.epoch
+    self.safetyTimerId = Ext.Timer.WaitFor(500, function()
+        if capturedEpoch == self.epoch and self.tabFlushPending then
+            Log.Info("Aggregator: Safety timer fired, flushing pending tab")
+            self:Flush()
+        end
+    end)
+    Log.Debug("Aggregator: NewTabContext")
+end
+
+function SpeechAggregator:NewItemContext()
+    -- Partial reset: d-pad within a tab, clear only item slots.
+    self.slots["itemName"] = nil
+    self.slots["itemValue"] = nil
+    self.slots["itemDesc"] = nil
+    self.debounceMs = DEBOUNCE.ITEM
+    Log.Debug("Aggregator: NewItemContext")
+end
+
+function SpeechAggregator:SpeakImmediate(text)
+    -- Immediate speech for INPC value changes and overlays.
+    -- Cancels any pending debounce, speaks now.
+    if not text or text == "" then return end
+    self:Cancel()
+    self.slots = {}
+    self.tabFlushPending = false
+    local cleaned = H.StripMarkupTags(text)
+    Log.Info("Aggregator: IMMEDIATE -> " .. cleaned)
+    Ext.Tolk.Speak(cleaned, true)
+    lastSpokenFullText = cleaned
+end
+
+function SpeechAggregator:Cancel()
+    self.epoch = self.epoch + 1
+    if self.debounceTimerId then
+        pcall(Ext.Timer.Cancel, self.debounceTimerId)
+        self.debounceTimerId = nil
+    end
+    if self.safetyTimerId then
+        pcall(Ext.Timer.Cancel, self.safetyTimerId)
+        self.safetyTimerId = nil
+    end
+end
+
+function SpeechAggregator:Reset()
+    self:Cancel()
+    self.slots = {}
+    self.debounceMs = DEBOUNCE.ITEM
+    self.tabFlushPending = false
+    self.recentTabFlush = false
+    if self.recentTabFlushTimerId then
+        pcall(Ext.Timer.Cancel, self.recentTabFlushTimerId)
+        self.recentTabFlushTimerId = nil
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- HandleTickSnapshot: single-pass snapshot processor.
+--
+-- ONE snapshot per tick from C++, ONE pass through this function.
+-- Fills SpeechAggregator slots directly from ALL available data.
+-- No deferred assembly, no multi-handler dispatch.
+--
+-- Processing order:
+--   1. Inline carousel value (immediate)
+--   2. INPC value change on stable focus (immediate)
+--   3. Widget root tracking (new screen detection)
+--   4. Tab switch / screen entry (full slot assembly)
+--   5. Widget added overlay/dialog (immediate)
+--   6. Item focus change (item slot only)
+-- ---------------------------------------------------------------------------
+
+-- Extract title and body from namedTexts table.
+-- Returns (titleText, bodyParts) where bodyParts is an array of strings.
+local function ExtractFromNamedTexts(namedTexts)
+    if not namedTexts then return nil, {} end
+    local titleText = nil
+    local bodyParts = {}
+    for elementName, elementText in pairs(namedTexts) do
+        local nameLower = elementName:lower()
+        if nameLower:find("title") or nameLower:find("header") then
+            if not titleText then
+                titleText = elementText
+            end
+        elseif nameLower:find("body") or nameLower:find("description")
+            or nameLower:find("message") or nameLower:find("warning")
+            or nameLower:find("busy") or nameLower:find("status")
+            or nameLower:find("info") then
+            table.insert(bodyParts, elementText)
+        end
+    end
+    return titleText, bodyParts
+end
+
+-- Extract title and body from widget DC properties and bindings.
+-- Returns (titleText, bodyText).
+local function ExtractFromWidgetData(widgetData)
+    if not widgetData then return nil, nil end
+    local titleText = nil
+    local bodyText = nil
+    if widgetData.dcProps then
+        titleText = widgetData.dcProps.Title or widgetData.dcProps.TitleText
+            or widgetData.dcProps.Header or widgetData.dcProps.TitleProperty
+        bodyText = widgetData.dcProps.Description or widgetData.dcProps.Text
+            or widgetData.dcProps.Message or widgetData.dcProps.BodyText
+            or widgetData.dcProps.TextProperty
+    end
+    if widgetData.bindings then
+        for _, bindingEntry in ipairs(widgetData.bindings) do
+            if not titleText and bindingEntry.path and bindingEntry.path:find("Title") and bindingEntry.value then
+                titleText = bindingEntry.value
+            end
+            if not bodyText and bindingEntry.path and (bindingEntry.path:find("Description") or bindingEntry.path:find("Text") or bindingEntry.path:find("Message")) and bindingEntry.value then
+                bodyText = bindingEntry.value
+            end
+        end
+    end
+    return titleText, bodyText
+end
+
+local function HandleTickSnapshot(snapshot)
+    local focusedElement = snapshot.focusedElement
+    if not focusedElement then return end
+
+    -- =================================================================
+    -- Debug explore mode: speak raw element info, skip all processing.
+    -- =================================================================
+    if debugExploreMode and (snapshot.focusChanged or snapshot.selectionChanged) then
+        local data = focusedElement
+        local parts = {}
+        if data.isTab then
+            local sectionLabel = H.GetSectionLabel(data)
+            table.insert(parts, sectionLabel or "Tab")
+            if data.tabName then table.insert(parts, data.tabName) end
+        else
+            if data.elemType then table.insert(parts, data.elemType) end
+            if data.elemName then table.insert(parts, data.elemName) end
+        end
+        if data.dcType then table.insert(parts, "DC:" .. data.dcType) end
+        if data.isFocusable then table.insert(parts, "focusable") end
+        local text = H.ExtractTextFromData(data, lastSpokenTab, false)
+        if text then table.insert(parts, "text:" .. text) end
+        local speech = H.StripMarkupTags(table.concat(parts, " | "))
+        if speech ~= "" and speech ~= lastSpokenFullText then
+            lastSpokenFullText = speech
+            Log.Info("EXPLORE: " .. speech)
+            Ext.Tolk.Speak(speech, true)
+        end
+        return
+    end
+
+    -- =================================================================
+    -- Housekeeping: widget root tracking, DC type, controller mode.
+    -- Runs on every snapshot with structural changes, before speech.
+    -- =================================================================
+    local widgetRootId = focusedElement.widgetRootId or ""
+    if widgetRootId ~= "" and widgetRootId ~= lastWidgetRootStr then
+        lastWidgetRootStr = widgetRootId
+        Log.Info("Widget root changed to " .. widgetRootId)
+        seenWidgetRoots[widgetRootId] = true
+        if controllerBindingsData then
+            UnsubscribeControllerInput()
+        end
+        if not focusedElement.isTab and not H.IsOptionData(focusedElement) then
+            lastSpokenTab = nil
+            lastSpokenTitle = nil
+            tabHintSpoken = false
+            SpeechAggregator:Cancel()
+            SpeechAggregator.slots = {}
+            SpeechAggregator.tabFlushPending = false
+        end
+        currentWidgetDCType = nil
+    end
+
+    if snapshot.widgetAdded and snapshot.widgetData and snapshot.widgetData.dcType then
+        currentWidgetDCType = snapshot.widgetData.dcType
+    end
+
+    local controllerHintText = nil
+    if snapshot.widgetAdded and snapshot.widgetData
+        and snapshot.widgetData.dcType == "gui::DCControllerOptions"
+        and snapshot.widgetData.dcProps then
+        SubscribeControllerInput(snapshot.widgetData.dcProps)
+        controllerHintText = "Interactive controller mode: While in this tab, press any button or trigger to hear its function. Press LB twice to return to the previous tab, or press RB twice to move to the next tab in the menu. Press B twice to exit to the main menu."
+        Log.Info("Controller bindings interactive mode activated")
+    end
+
+    -- =================================================================
+    -- Classify the snapshot: what kind of change is this?
+    -- Exactly one path runs. Priority order:
+    --   1. Inline carousel value
+    --   2. Tab/screen change (selectionChanged + isTab)
+    --   3. Overlay/dialog (widgetAdded, no tab context)
+    --   4. Item navigation (focusChanged, not tab)
+    --   5. Value-only change (valueChanged, nothing else)
+    -- =================================================================
+
+    -- ----- 1. Inline carousel (face shape, skin colour, etc.) -----
+    if snapshot.inlineCarouselChanged and snapshot.inlineCarouselValue then
+        local carouselValue = snapshot.inlineCarouselValue
+        if carouselValue ~= lastSpokenFullText then
+            lastSpokenFullText = carouselValue
+            Log.Info("CAROUSEL: " .. carouselValue)
+            SpeechAggregator:SpeakImmediate(carouselValue)
+        end
+        return
+    end
+
+    -- ----- 2. Screen/page entry -----
+    -- Triggers: tab switch (selectionChanged), new widget (widgetAdded),
+    -- or selection change with non-tab focus (Cross-Play, difficulty).
+    -- All three mean the same thing: we entered a new space. Announce it.
+    -- One unified path fills all 5 slots from ALL available snapshot data.
+    local isScreenEntry = false
+    if snapshot.selectionChanged then
+        isScreenEntry = true
+    elseif snapshot.widgetAdded and snapshot.widgetData and not lastSpokenTab then
+        isScreenEntry = true
+    end
+
+    if isScreenEntry then
+        -- Special case: unnamed ListBoxItem tabs (appearance carousel).
+        local tabName = focusedElement.isTab and focusedElement.tabName or nil
+        if tabName and tabName:find("^ListBoxItem:") then
+            if SpeechAggregator.tabFlushPending then
+                Log.Debug("SKIP appearance tab (side-effect): " .. tabName)
+                return
+            end
+            local itemLabel = focusedElement.elemName and H.GetBodyTypeName(focusedElement.elemName)
+            if not itemLabel then
+                itemLabel = tabName:match("^ListBoxItem:%s*(.+)$") or tabName
+            end
+            Log.Info("Appearance carousel item: " .. itemLabel)
+            SpeechAggregator:NewItemContext()
+            SpeechAggregator:SetSlot("itemName", itemLabel)
+            lastSpokenName = focusedElement.elemId
             return
         end
 
-        -- New tab detected
-        lastSpokenTab = tabName
-        lastSpokenName = nil  -- Reset element dedup so first option isn't skipped
-        spokenDuringTabDet = false  -- Reset for the new tab
-        deferredButtonText = nil  -- Clear any deferred button from previous tab
+        -- Skip duplicate screen entries.
+        -- For tabs: skip if same tab name as before.
+        -- For non-tab entries (difficulty, overlays): skip if we already
+        -- spoke this screen (no tab name change possible, so check
+        -- whether we recently flushed via tabFlushPending).
+        if tabName and tabName == lastSpokenTab then
+            Log.Debug("SKIP screen entry (same tab): " .. tabName)
+            return
+        end
+        if not tabName and not snapshot.widgetAdded
+            and SpeechAggregator.recentTabFlush then
+            Log.Debug("SKIP screen entry (duplicate, no tab, recent flush)")
+            return
+        end
 
+        Log.Info("SCREEN ENTRY: tab=" .. tostring(tabName)
+            .. " sel=" .. tostring(snapshot.selectionChanged)
+            .. " widget=" .. tostring(snapshot.widgetAdded))
+
+        SpeechAggregator:NewTabContext()
+        local isFirstTab = (lastSpokenTab == nil)
         if tabName then
-            Ext.Tolk.Speak(tabName, true)
+            lastSpokenTab = tabName
         end
+        lastSpokenName = nil
 
-        -- Wait 3 frames for stale content to clear, then 5 real retries.
-        -- The content area takes 2-3 frames to rebuild after a tab switch.
-        -- The retries determine whether this tab has options (silently stop)
-        -- or informational text (read it aloud as fallback).
-        pendingOptionDelay = 3
-        pendingOptionRetry = 5
-        Ext.UI.ForceGlobalFocusUpdate()
-        Ext.Utils.Print("[BG3Access]   -> Scheduling tab type detection (delay=" .. pendingOptionDelay .. " retries=" .. pendingOptionRetry .. ")")
-        return
-    end
-
-    -- Everything else (buttons, etc.)
-    --
-    -- If we're in the middle of tab detection (retries/delay pending),
-    -- a content-area button may get focus (e.g. "Enable Cross-Play").
-    -- Defer speaking it until AFTER body text reads (so the user hears
-    -- context before the actionable element).  Set up INPC subscription
-    -- via SpeakFocused but suppress the actual speech output.
-    if pendingOptionRetry > 0 or pendingOptionDelay > 0 then
-        if elemId ~= lastSpokenName then
-            local text = Helpers.ExtractTextFromElement(element)
-            if text and text ~= "" then
-                Ext.Utils.Print("[BG3Access]   -> Deferring button during tab detection: " .. text)
-                deferredButtonText = text
-                lastSpokenName = GetElementId(element)
-                lastSpokenFullText = text
+        -- Gather ALL data from ALL sources in the snapshot.
+        -- Merge namedTexts from focusedElement and widgetData.
+        local allNamedTexts = {}
+        if focusedElement.namedTexts then
+            for elementName, elementText in pairs(focusedElement.namedTexts) do
+                allNamedTexts[elementName] = elementText
             end
-            spokenDuringTabDet = true
         end
-        -- Keep the forced-update chain alive so the C++ monitor
-        -- continues firing callbacks.  Without this, the monitor
-        -- stops (focused and selected are both stable, forced is
-        -- not re-armed) and the remaining retries never execute.
-        Ext.UI.ForceGlobalFocusUpdate()
+        if snapshot.widgetData and snapshot.widgetData.namedTexts then
+            for elementName, elementText in pairs(snapshot.widgetData.namedTexts) do
+                if not allNamedTexts[elementName] then
+                    allNamedTexts[elementName] = elementText
+                end
+            end
+        end
+        local nsTitle, nsBodyParts = ExtractFromNamedTexts(allNamedTexts)
+        local widgetTitle, widgetBody = ExtractFromWidgetData(snapshot.widgetData)
+
+        local dcBody = nil  -- reserved for general screen text, not focused item data
+
+        local statusText = H.ExtractStatusText(focusedElement.dcProps)
+        local normalTab = tabName and H.NormalizeForCompare(tabName) or ""
+
+        -- Slot 1: Title
+        local screenTitle = nsTitle
+        if not screenTitle then screenTitle = widgetTitle end
+        if screenTitle and normalTab ~= "" and H.NormalizeForCompare(screenTitle) == normalTab then
+            screenTitle = nil
+        end
+        if screenTitle and screenTitle == lastSpokenTitle then
+            screenTitle = nil
+        end
+        if screenTitle then
+            lastSpokenTitle = screenTitle
+            Log.Info("  title: " .. screenTitle)
+            SpeechAggregator:SetSlotQuiet("title", screenTitle)
+        end
+
+        local sectionLabel = H.GetSectionLabel(focusedElement)
+        if sectionLabel then
+            SpeechAggregator:SetSlotQuiet("title", sectionLabel)
+            Log.Info("  CC section: " .. sectionLabel)
+        end
+
+        -- Slot 2: Hint (once per menu visit)
+        if isFirstTab and not tabHintSpoken then
+            tabHintSpoken = true
+            local menuType = currentWidgetDCType
+            if not menuType or MENU_HINTS[menuType] == nil then
+                if focusedElement.dcType and MENU_HINTS[focusedElement.dcType] ~= nil then
+                    menuType = focusedElement.dcType
+                end
+            end
+            local menuHint = menuType and MENU_HINTS[menuType]
+            if menuHint then
+                Log.Info("  hint: " .. menuHint)
+                SpeechAggregator:SetSlotQuiet("hint", menuHint)
+            elseif menuHint == false then
+                Log.Debug("  hint suppressed for " .. tostring(menuType))
+            elseif menuType == nil then
+                Log.Info("  hint: " .. DEFAULT_HINT)
+                SpeechAggregator:SetSlotQuiet("hint", DEFAULT_HINT)
+            end
+        end
+
+        -- Slot 3: Tab name (suppress if title contains it)
+        if tabName then
+            local showTabName = true
+            if screenTitle then
+                if H.NormalizeForCompare(screenTitle):find(normalTab, 1, true) then
+                    showTabName = false
+                end
+            end
+            if showTabName then
+                SpeechAggregator:SetSlotQuiet("tabName", tabName)
+            end
+        end
+
+        -- Slot 4: Body
+        local bodyAssembled = nil
+        if #nsBodyParts > 0 then
+            bodyAssembled = table.concat(nsBodyParts, ". ")
+        end
+        if not bodyAssembled and controllerHintText then
+            bodyAssembled = controllerHintText
+        end
+        if not bodyAssembled and widgetBody then
+            bodyAssembled = widgetBody
+        end
+        if not bodyAssembled and dcBody then
+            bodyAssembled = dcBody
+        end
+        if statusText then
+            bodyAssembled = bodyAssembled
+                and (bodyAssembled .. ". " .. statusText) or statusText
+        end
+        if bodyAssembled then
+            local bodyPreview = #bodyAssembled > 80
+                and bodyAssembled:sub(1, 80) .. "..." or bodyAssembled
+            Log.Info("  body: " .. bodyPreview)
+            SpeechAggregator:SetSlotQuiet("body", bodyAssembled)
+        end
+
+        -- Slots 5-7: Auto-focused item (name, value, description)
+        if snapshot.focusChanged and not focusedElement.isTab then
+            local itemName, itemValue, itemDesc = H.FormatDCTextSplit(focusedElement.dcProps)
+            if not itemName or itemName == "" then
+                itemName = H.ExtractTextFromData(focusedElement, tabName, true)
+                itemValue = nil
+                itemDesc = nil
+            end
+            if itemName and itemName ~= "" then
+                local normalItem = H.NormalizeForCompare(itemName)
+                local isDuplicate = (normalTab ~= "" and normalItem == normalTab)
+                    or (screenTitle and normalItem == H.NormalizeForCompare(screenTitle))
+                if not isDuplicate then
+                    Log.Debug("  auto-focus item: " .. itemName)
+                    SpeechAggregator:SetSlotQuiet("itemName", itemName)
+                    if itemValue then
+                        SpeechAggregator:SetSlotQuiet("itemValue", itemValue)
+                    end
+                    if itemDesc then
+                        SpeechAggregator:SetSlotQuiet("itemDesc", itemDesc)
+                    end
+                    lastSpokenName = focusedElement.elemId
+                    lastSpokenFullText = itemName
+                end
+            end
+        end
+
+        SpeechAggregator:ResetDebounce()
         return
     end
 
-    -- Normal path — no active tab detection.
-    lastSpokenTab = nil  -- Reset tab context (fixes re-entry into Options)
-    -- NOTE: tabHintSpoken is NOT reset here — it resets on GameStateChanged
-    -- so the hint speaks once per Options visit, not every time a button
-    -- within Options gets focus (e.g. after enabling Cross-Play).
-    if elemId == lastSpokenName then
-        -- Same structural identity — but might be a different element with
-        -- the same type and Name (e.g., multiplayer lobby entries all named
-        -- "Bg").  Fall back to text comparison before skipping.
-        local text = Helpers.ExtractTextFromElement(element)
-        if not text or text == lastSpokenFullText then
-            Ext.Utils.Print("[BG3Access]   -> SKIP other (same identity and text)")
+    -- ----- 4. Item navigation (focus changed, not a tab) -----
+    if snapshot.focusChanged and not focusedElement.isTab then
+        local elemId = focusedElement.elemId or ""
+
+        -- If tab assembly is still pending, add item quietly.
+        if SpeechAggregator.tabFlushPending then
+            local text = H.ExtractTextFromData(focusedElement, lastSpokenTab, true)
+            if text and text ~= "" then
+                local normalTab = lastSpokenTab and H.NormalizeForCompare(lastSpokenTab) or ""
+                if H.NormalizeForCompare(text) ~= normalTab then
+                    Log.Debug("  auto-focus (pending tab): " .. text)
+                    SpeechAggregator:SetSlotQuiet("itemName", text)
+                    lastSpokenName = elemId
+                    lastSpokenFullText = text
+                end
+            end
             return
         end
-        Ext.Utils.Print("[BG3Access]   -> Same elemId but different text, speaking")
+
+        -- Dedup: skip if same element with same text.
+        if elemId == lastSpokenName then
+            local text = H.ExtractTextFromData(focusedElement, lastSpokenTab, false)
+            if not text or text == lastSpokenFullText then
+                Log.Debug("DEDUP SKIP: " .. tostring(elemId))
+                return
+            end
+        end
+
+        -- Try split extraction first (name + description as separate slots).
+        local itemName, itemValue, itemDesc = H.FormatDCTextSplit(focusedElement.dcProps)
+        if not itemName or itemName == "" then
+            -- Fall back to full text extraction for non-DC elements.
+            itemName = H.ExtractTextFromData(focusedElement, lastSpokenTab, false)
+            itemValue = nil
+            itemDesc = nil
+        end
+        if not itemName or itemName == "" then
+            lastSpokenName = elemId
+            return
+        end
+
+        lastSpokenName = elemId
+        lastSpokenFullText = itemName
+        Log.Info("ITEM: " .. tostring(focusedElement.elemType)
+            .. "  name=" .. itemName
+            .. (itemValue and ("  val=" .. itemValue) or "")
+            .. (itemDesc and ("  desc=" .. itemDesc:sub(1, 40)) or ""))
+        SpeechAggregator:NewItemContext()
+        SpeechAggregator:SetSlot("itemName", itemName)
+        if itemValue and itemValue ~= "" then
+            SpeechAggregator:SetSlotQuiet("itemValue", itemValue)
+        end
+        if itemDesc and itemDesc ~= "" then
+            SpeechAggregator:SetSlotQuiet("itemDesc", itemDesc)
+        end
+        return
     end
-    SpeakFocused(element)
+
+    -- ----- 5. Value-only change (INPC on stable focus) -----
+    if snapshot.valueChanged then
+        local valueText = H.FormatDCValue(focusedElement.dcProps)
+        if not valueText or valueText == "" then
+            valueText = H.FormatDCText(focusedElement.dcProps)
+        end
+        if valueText and valueText ~= "" and valueText ~= lastSpokenFullText then
+            lastSpokenFullText = valueText
+            Log.Info("VALUE: " .. valueText)
+            SpeechAggregator:SpeakImmediate(valueText)
+        end
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -347,39 +806,91 @@ end
 -- This single callback fires for EVERY focus/selection change in ANY menu.
 -- ---------------------------------------------------------------------------
 local function SetupGlobalFocusMonitor()
-    local ok, result = pcall(Ext.UI.SubscribeGlobalFocusChanged, function(element, prop)
-        local hOk, hErr = pcall(HandleFocusChange, element)
-        if not hOk then
-            Ext.Utils.Print("[BG3Access] ERROR in HandleFocusChange: " .. tostring(hErr))
+    local ok, result = pcall(Ext.UI.SubscribeGlobalFocusChanged, function(first, prop)
+        if type(first) ~= "table" then
+            Log.Warn("unexpected callback arg type: " .. type(first))
+            return
         end
+
+        -- New snapshot system: one table per tick with everything.
+        if prop == "TickSnapshot" then
+            local handlerOk, handlerErr = pcall(HandleTickSnapshot, first)
+            if not handlerOk then
+                Log.Error("in HandleTickSnapshot: " .. tostring(handlerErr))
+            end
+            return
+        end
+
+        -- All legacy event types are now handled by the snapshot system.
+        -- Skip any non-snapshot events that arrive through the old path.
+        return
     end)
     if ok and result then
-        Ext.Utils.Print("[BG3Access] Global focus monitor active")
+        Log.Info("Global focus monitor active")
     else
-        Ext.Utils.Print("[BG3Access] ERROR: could not subscribe global focus: " .. tostring(result))
+        Log.Error("could not subscribe global focus: " .. tostring(result))
     end
 end
 
 -- Try immediately (root may exist already at script load time).
 SetupGlobalFocusMonitor()
 
--- Re-subscribe on game state changes (UI tree rebuilt, focus monitor
--- auto-resets in C++ but we need to reset Lua state and re-subscribe).
+-- Re-subscribe on game state changes.
 Ext.Events.GameStateChanged:Subscribe(function(e)
-    Ext.Utils.Print("[BG3Access] GameStateChanged -> resetting")
+    Log.Info("GameStateChanged: " .. tostring(e.FromState) .. " -> " .. tostring(e.ToState))
+    UnsubscribeControllerInput()
     lastSpokenName = nil
     lastSpokenFullText = nil
     lastSpokenTab = nil
-    pendingOptionRetry = 0
-    pendingOptionDelay = 0
+    lastSpokenTitle = nil
     tabHintSpoken = false
-    spokenDuringTabDet = false
-    deferredButtonText = nil
+    lastWidgetRootStr = nil
+    seenWidgetRoots = {}
+    currentWidgetDCType = nil
+    SpeechAggregator:Reset()
     SetupGlobalFocusMonitor()
+end)
+
+-- ---------------------------------------------------------------------------
+-- Debug explore mode toggle.
+-- Usage: press L3 + R3 (both sticks) simultaneously.
+-- ---------------------------------------------------------------------------
+function BG3Access.Client.ToggleExploreMode()
+    debugExploreMode = not debugExploreMode
+    local state = debugExploreMode and "ON" or "OFF"
+    Log.Info("Explore mode: " .. state)
+    Ext.Tolk.Speak("Explore mode " .. state, true)
+end
+
+-- L3 + R3 combo detection for explore mode toggle.
+local exploreComboState = {
+    leftStickHeld = false,
+    rightStickHeld = false,
+}
+
+Ext.Events.ControllerButtonInput:Subscribe(function(event)
+    local buttonName = tostring(event.Button)
+    -- Log all button presses when explore mode is active.
+    if debugExploreMode and event.Pressed then
+        Log.Debug("INPUT: " .. buttonName)
+    end
+    if buttonName == "LeftStick" then
+        exploreComboState.leftStickHeld = event.Pressed
+        if event.Pressed and exploreComboState.rightStickHeld then
+            BG3Access.Client.ToggleExploreMode()
+        end
+    elseif buttonName == "RightStick" then
+        exploreComboState.rightStickHeld = event.Pressed
+        if event.Pressed and exploreComboState.leftStickHeld then
+            BG3Access.Client.ToggleExploreMode()
+        end
+    end
 end)
 
 -- ---------------------------------------------------------------------------
 -- Startup
 -- ---------------------------------------------------------------------------
-Ext.Utils.Print("[BG3Access] Accessibility ready (GlobalFocusMonitor + INPC).")
-Ext.Tolk.Speak("accessibility ready", false)
+Log.Info("Accessibility ready (GlobalFocusMonitor + SpeechAggregator).")
+
+-- State machine probe removed -- C++ GetStateMachine() crashes.
+-- Searching via Lua/Noesis tree instead (see BootstrapClient.lua).
