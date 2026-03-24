@@ -7,31 +7,9 @@
 -- table (strings, bools, numbers) to the callback.  Lua only processes
 -- primitives for speech formatting and state management.
 --
--- The C++ monitor runs every frame, tracks focus (Strategies 1+2) and
--- selection (Strategy 3) INDEPENDENTLY.  Selection changes take priority
--- (tab switch, option selection); when selection is stable, focus changes
--- drive the callback (d-pad navigation, button focus).
---
--- Focus callback receives a DATA TABLE with:
---   elemType, elemName, elemId, isTab, isFocusable,
---   dcType, dcProps, elemText, tabName, widgetRootId
---
--- INPC (PropertyChanged) is auto-subscribed by C++ when focus changes.
--- Fires the same callback with eventType="PropertyChanged" and updated
--- dcProps.  Lua speaks the value-only part.
---
--- Widget-added events (Strategy 4) pass data tables with widget DC
--- properties and binding metadata.  No Noesis elements cross to Lua.
---
--- Widget DC changes (WidgetDCChanged) fire when the widget's ViewModel
--- updates (e.g., after tab content loads).  Replaces the old WaitFrames
--- timer with event-driven detection from C++ INPC monitoring.
---
--- SPEECH MODEL: Context + Debounce aggregator.
--- Events update named slots (title, hint, tabName, body, itemName).
--- A debounce timer fires after the last update and assembles all
--- non-nil slots into ONE Tolk.Speak call in accessibility order.
--- No priority interruption, no chain/follow-up queue.
+-- CC (Character Creation) snapshots are detected early and delegated to
+-- AccessibilityCC.lua.  This file handles ONLY generic menus: Options,
+-- Difficulty, Multiplayer, Mod Manager, Dialogs, Main Menu, etc.
 
 BG3Access = BG3Access or {}
 BG3Access.Client = BG3Access.Client or {}
@@ -39,60 +17,48 @@ BG3Access.Client = BG3Access.Client or {}
 -- Module references (loaded before this file by _Init.lua).
 local Log = BG3Access.Client.Log
 local H   = BG3Access.Client.Helpers
+local CC  = BG3Access.Client.CC
 
 -- ---------------------------------------------------------------------------
--- State
+-- Shared state (also passed to CC handler via state table).
 -- ---------------------------------------------------------------------------
+local state = {
+    lastSpokenName      = nil,
+    lastSpokenFullText  = nil,
+    lastSpokenTab       = nil,
+    lastSpokenTitle     = nil,
+    tabHintSpoken       = false,
+    screenEntryJustSpoke = false,
+    currentWidgetDCType = nil,
+}
 
-local lastSpokenName      = nil   -- identity of last spoken element
-local lastSpokenFullText  = nil   -- full assembled text of last speech
-local lastSpokenTab       = nil   -- tab NAME (not elemId) of last spoken tab
-local lastSpokenTitle     = nil   -- screen title last spoken (suppress repeats on same screen)
-local tabHintSpoken       = false -- true after we've spoken the navigation hint this visit
-local suppressSnapshots   = false -- true during game state transitions (loading, etc.)
-local lastWidgetRootStr   = nil   -- widgetRootId string of the last widget root (dialog detection)
-local seenWidgetRoots     = {}   -- set of widget root strings we've visited
-local currentWidgetDCType = nil   -- dcType of the current menu's widget (e.g. "gui::DCOptions")
-local debugExploreMode    = false -- toggle with L3+R3; speaks raw element info on every focus change
+local suppressSnapshots   = false
+local lastWidgetRootStr   = nil
+local seenWidgetRoots     = {}
+local debugExploreMode    = false
 
 -- ---------------------------------------------------------------------------
 -- Controller bindings interactive mode.
--- When active on the Controller options tab, pressing a button speaks its
--- mapped function instead of performing the in-game action.
 -- ---------------------------------------------------------------------------
-local controllerBindingsData = nil       -- stored DCControllerOptions dcProps
-local controllerInputSubscription = nil  -- subscription ID for ControllerButtonInput
-local controllerAxisSubscription = nil   -- subscription ID for ControllerAxisInput
+local controllerBindingsData = nil
+local controllerInputSubscription = nil
+local controllerAxisSubscription = nil
 
--- Map SDL button enum names (from ControllerButtonInput) to DCControllerOptions keys.
 local SDL_BUTTON_TO_DC_KEY = {
-    A = "ButtonA",
-    B = "ButtonB",
-    X = "ButtonX",
-    Y = "ButtonY",
-    LeftShoulder = "LeftBumper",
-    RightShoulder = "RightBumper",
-    DPadUp = "DpadUp",
-    DPadDown = "DpadDown",
-    DPadLeft = "DpadLeft",
-    DPadRight = "DpadRight",
-    Start = "ButtonStart",
-    Back = "ButtonBack",
-    LeftStick = "LeftStick",
-    RightStick = "RightStick",
+    A = "ButtonA", B = "ButtonB", X = "ButtonX", Y = "ButtonY",
+    LeftShoulder = "LeftBumper", RightShoulder = "RightBumper",
+    DPadUp = "DpadUp", DPadDown = "DpadDown",
+    DPadLeft = "DpadLeft", DPadRight = "DpadRight",
+    Start = "ButtonStart", Back = "ButtonBack",
+    LeftStick = "LeftStick", RightStick = "RightStick",
 }
 
--- Map SDL axis enum names (from ControllerAxisInput) to DCControllerOptions keys.
 local SDL_AXIS_TO_DC_KEY = {
-    TriggerLeft = "LeftTrigger",
-    TriggerRight = "RightTrigger",
-    LeftX = "LeftStick",
-    LeftY = "LeftStick",
-    RightX = "RightStick",
-    RightY = "RightStick",
+    TriggerLeft = "LeftTrigger", TriggerRight = "RightTrigger",
+    LeftX = "LeftStick", LeftY = "LeftStick",
+    RightX = "RightStick", RightY = "RightStick",
 }
 
--- Friendly display names for speech output.
 local BUTTON_DISPLAY_NAMES = {
     ButtonA = "A", ButtonB = "B", ButtonX = "X", ButtonY = "Y",
     DpadUp = "D-pad Up", DpadDown = "D-pad Down",
@@ -131,20 +97,13 @@ local function UnsubscribeControllerInput()
 end
 
 local function SubscribeControllerInput(dcProps)
-    -- Clean up any existing subscription first.
     UnsubscribeControllerInput()
-
     controllerBindingsData = dcProps
 
-    -- Navigation buttons require a double-press to perform their action.
-    -- First press speaks the binding, second consecutive press passes through.
     local DOUBLE_PRESS_BUTTONS = {
-        B = true,
-        LeftShoulder = true,
-        RightShoulder = true,
+        B = true, LeftShoulder = true, RightShoulder = true,
     }
-
-    local lastPressedButton = nil  -- tracks last button for double-press detection
+    local lastPressedButton = nil
 
     controllerInputSubscription = Ext.Events.ControllerButtonInput:Subscribe(function(event)
         if not event.Pressed then return end
@@ -154,18 +113,15 @@ local function SubscribeControllerInput(dcProps)
         if dcKey then
             if DOUBLE_PRESS_BUTTONS[buttonName] then
                 if lastPressedButton == buttonName then
-                    -- Second consecutive press: let it through, reset.
                     Log.Debug("  -> Double press, passing through: " .. buttonName)
                     lastPressedButton = nil
                     return
                 else
-                    -- First press: speak binding, block action.
                     lastPressedButton = buttonName
                     SpeakControllerBinding(dcKey)
                     event:PreventAction()
                 end
             else
-                -- Non-navigation button: always speak and block.
                 lastPressedButton = buttonName
                 SpeakControllerBinding(dcKey)
                 event:PreventAction()
@@ -177,20 +133,14 @@ local function SubscribeControllerInput(dcProps)
     end)
     Log.Info("Subscribed controller button input")
 
-    -- Axis subscription for triggers and sticks.
-    -- Only fire on significant deflection (trigger pulled past threshold).
-    local axisSpoken = {}  -- prevent rapid repeats on held axis
+    local axisSpoken = {}
     controllerAxisSubscription = Ext.Events.ControllerAxisInput:Subscribe(function(event)
         local axisName = tostring(event.Axis)
         local dcKey = SDL_AXIS_TO_DC_KEY[axisName]
         if not dcKey then return end
-
-        -- Threshold: axis values are normalized -1.0 to 1.0.
-        -- Fire when deflected past 50%.
         local AXIS_THRESHOLD = 0.5
         local value = event.Value or 0
         local deflected = (value > AXIS_THRESHOLD or value < -AXIS_THRESHOLD)
-
         if deflected and not axisSpoken[dcKey] then
             axisSpoken[dcKey] = true
             SpeakControllerBinding(dcKey)
@@ -202,39 +152,23 @@ local function SubscribeControllerInput(dcProps)
 end
 
 -- ---------------------------------------------------------------------------
-
--- ---------------------------------------------------------------------------
 -- Per-menu navigation hints.  Keyed by widget DC type.
--- false = no hint for that menu.  Missing key = default hint.
+-- false = no hint.  Missing key = default hint.
 -- ---------------------------------------------------------------------------
 local MENU_HINTS = {
-    -- Options: standard bumper tab switching + vertical content
-    ["gui::DCOptions"] = "Use bumpers to switch tabs, press down for content.",
-    -- Multiplayer: bumper tab switching (Online, Cross-Play, LAN)
-    ["gui::DCLobbyBrowser"] = "Use bumpers to switch tabs, press down for content.",
-    -- Mod manager: bumper tab switching (Browse, Installed)
-    ["gui::DCModBrowser"] = "Use bumpers to switch tabs, press down for content.",
-    -- Character creation: bumper tab switching (Origin, Race, Class, etc.)
-    ["gui::DCCharacterCreation"] = "Use bumpers to switch tabs.",
-    -- Difficulty selector: d-pad left/right navigation, no bumpers
+    ["gui::DCOptions"]         = "Use bumpers to switch tabs, press down for content.",
+    ["gui::DCLobbyBrowser"]    = "Use bumpers to switch tabs, press down for content.",
+    ["gui::DCModBrowser"]      = "Use bumpers to switch tabs, press down for content.",
     ["gui::DCNewGameSettings"] = false,
-    ["gui::DCDMSettings"] = false,
-    -- VMPreset is the tab item DC type inside the difficulty carousel
-    ["gui::VMPreset"] = false,
+    ["gui::DCDMSettings"]      = false,
+    ["gui::VMPreset"]          = false,
 }
 local DEFAULT_HINT = "Use bumpers to switch tabs, press down for content."
 
 -- ---------------------------------------------------------------------------
 -- Speech output: fill slots, speak immediately.
---
--- Slot order is fixed.  Non-nil slots are joined with ". " and spoken.
--- No timers, no debounce, no deferred assembly.
--- Every snapshot that reaches Lua is the result of user action (the C++
--- settle window filters out Noesis rebuild noise), so always interrupt.
 -- ---------------------------------------------------------------------------
-local SLOT_ORDER = { "title", "hint", "tabName", "body", "itemName", "itemValue", "itemDesc" }
-
-local screenEntryJustSpoke = false  -- true for ONE snapshot after screen entry
+local SLOT_ORDER = { "title", "hint", "tabName", "body", "actions", "itemName", "itemValue", "itemDesc" }
 
 local function SpeakSlots(slots, isScreenEntry)
     local parts = {}
@@ -247,40 +181,33 @@ local function SpeakSlots(slots, isScreenEntry)
     if #parts == 0 then return end
     local assembled = H.StripMarkupTags(table.concat(parts, ". "))
     if not assembled or assembled == "" then return end
-    -- Screen entry always interrupts (user navigated to new screen).
-    -- The NEXT speak after screen entry does NOT interrupt (auto-focus).
-    -- Everything else interrupts (user d-pad, value change, etc.).
+
     local interrupt = true
-    if screenEntryJustSpoke and not isScreenEntry then
+    if state.screenEntryJustSpoke and not isScreenEntry then
         interrupt = false
-        screenEntryJustSpoke = false
+        state.screenEntryJustSpoke = false
+    end
+    -- Visual text (loading tips, splash screen) should always append.
+    -- These arrive from the initial widget scan with no title, tab, hint,
+    -- or item -- just body text.  Appending lets tips queue naturally
+    -- instead of cutting each other off.
+    local isVisualTextOnly = slots["body"] and not slots["title"]
+        and not slots["tabName"] and not slots["hint"]
+        and not slots["itemName"]
+    if isVisualTextOnly then
+        interrupt = false
     end
     if isScreenEntry then
-        screenEntryJustSpoke = true
+        state.screenEntryJustSpoke = true
     end
     Log.Info("SPEAK" .. (interrupt and "" or " (append)") .. ": " .. assembled)
     Ext.Tolk.Speak(assembled, interrupt)
-    lastSpokenFullText = assembled
+    state.lastSpokenFullText = assembled
 end
 
 -- ---------------------------------------------------------------------------
--- HandleTickSnapshot: single-pass snapshot processor.
---
--- ONE snapshot per tick from C++, ONE pass through this function.
--- Fills slots from snapshot data and speaks immediately.
--- No deferred assembly, no multi-handler dispatch.
---
--- Processing order:
---   1. Inline carousel value (immediate)
---   2. INPC value change on stable focus (immediate)
---   3. Widget root tracking (new screen detection)
---   4. Tab switch / screen entry (full slot assembly)
---   5. Widget added overlay/dialog (immediate)
---   6. Item focus change (item slot only)
+-- Named text extraction helpers.
 -- ---------------------------------------------------------------------------
-
--- Extract title and body from namedTexts table.
--- Returns (titleText, bodyParts) where bodyParts is an array of strings.
 local function ExtractFromNamedTexts(namedTexts)
     if not namedTexts then return nil, {} end
     local titleText = nil
@@ -288,23 +215,31 @@ local function ExtractFromNamedTexts(namedTexts)
     for elementName, elementText in pairs(namedTexts) do
         local nameLower = elementName:lower()
         if nameLower:find("title") or nameLower:find("header") then
-            if not titleText then
-                titleText = elementText
-            end
+            if not titleText then titleText = elementText end
         elseif nameLower:find("body") or nameLower:find("description")
             or nameLower:find("message") or nameLower:find("warning")
             or nameLower:find("busy") or nameLower:find("status")
-            or nameLower:find("info") then
-            table.insert(bodyParts, elementText)
+            or nameLower:find("info")
+            or nameLower == "_visualtext" then
+            -- Filter out pure numeric text (e.g., "93%" from loading progress).
+            if nameLower == "_visualtext" and elementText:match("^%d+%%?$") then
+                -- skip progress percentages
+            else
+                table.insert(bodyParts, elementText)
+            end
         end
     end
     return titleText, bodyParts
 end
 
--- Extract title and body from widget DC properties and bindings.
--- Returns (titleText, bodyText).
+-- Standard DCMessageBox button hint.  Noesis Indie SDK crashes when
+-- enumerating the Actions IList collection from C++, so we handle
+-- button hints in Lua based on the dialog DC type.
+-- Standard dialogs use UIAccept (A) for confirm and UICancel (B) for cancel.
+local DIALOG_BUTTON_HINT = "Press A to confirm, or B to cancel"
+
 local function ExtractFromWidgetData(widgetData)
-    if not widgetData then return nil, nil end
+    if not widgetData then return nil, nil, nil end
     local titleText = nil
     local bodyText = nil
     if widgetData.dcProps then
@@ -312,7 +247,7 @@ local function ExtractFromWidgetData(widgetData)
             or widgetData.dcProps.Header or widgetData.dcProps.TitleProperty
         bodyText = widgetData.dcProps.Description or widgetData.dcProps.Text
             or widgetData.dcProps.Message or widgetData.dcProps.BodyText
-            or widgetData.dcProps.TextProperty
+            or widgetData.dcProps.TextProperty or widgetData.dcProps.LobbyMessage
     end
     if widgetData.bindings then
         for _, bindingEntry in ipairs(widgetData.bindings) do
@@ -324,13 +259,37 @@ local function ExtractFromWidgetData(widgetData)
             end
         end
     end
-    return titleText, bodyText
+    -- Append button hint for standard message box dialogs.
+    local actionsText = nil
+    if widgetData.dcType and widgetData.dcType:find("MessageBox") then
+        actionsText = DIALOG_BUTTON_HINT
+    end
+    return titleText, bodyText, actionsText
 end
 
+-- ---------------------------------------------------------------------------
+-- HandleTickSnapshot: generic menu processor.
+-- CC snapshots are dispatched to AccessibilityCC before reaching this code.
+-- ---------------------------------------------------------------------------
 local function HandleTickSnapshot(snapshot)
-    if suppressSnapshots then return end
     local focusedElement = snapshot.focusedElement
     if not focusedElement then return end
+
+    -- During loading states, only allow visual text (tips, splash screen).
+    -- Normal menu processing is suppressed to avoid stale/transient data.
+    if suppressSnapshots then
+        if snapshot.widgetAdded and focusedElement.namedTexts then
+            local visualText = focusedElement.namedTexts["_visualText"]
+            if visualText and visualText ~= ""
+                and not visualText:match("^%d+%%?$")
+                and visualText ~= state.lastSpokenFullText then
+                state.lastSpokenFullText = visualText
+                Log.Info("LOADING TIP: " .. visualText)
+                Ext.Tolk.Speak(visualText, false)
+            end
+        end
+        return
+    end
 
     -- =================================================================
     -- Debug explore mode: speak raw element info, skip all processing.
@@ -339,8 +298,7 @@ local function HandleTickSnapshot(snapshot)
         local data = focusedElement
         local parts = {}
         if data.isTab then
-            local sectionLabel = H.GetSectionLabel(data)
-            table.insert(parts, sectionLabel or "Tab")
+            table.insert(parts, "Tab")
             if data.tabName then table.insert(parts, data.tabName) end
         else
             if data.elemType then table.insert(parts, data.elemType) end
@@ -348,11 +306,26 @@ local function HandleTickSnapshot(snapshot)
         end
         if data.dcType then table.insert(parts, "DC:" .. data.dcType) end
         if data.isFocusable then table.insert(parts, "focusable") end
-        local text = H.ExtractTextFromData(data, lastSpokenTab, false)
+        local text = H.ExtractTextFromData(data, state.lastSpokenTab, false)
         if text then table.insert(parts, "text:" .. text) end
+        Log.Info("EXPLORE sel=" .. tostring(snapshot.selectionChanged)
+            .. " foc=" .. tostring(snapshot.focusChanged)
+            .. " isTab=" .. tostring(data.isTab)
+            .. " postSettle=" .. tostring(snapshot.postSettle)
+            .. " elemId=" .. tostring(data.elemId))
+        if data.dcProps then
+            local propParts = {}
+            for propName, propValue in pairs(data.dcProps) do
+                table.insert(propParts, propName .. "=" .. tostring(propValue))
+            end
+            if #propParts > 0 then
+                table.sort(propParts)
+                Log.Info("EXPLORE dcProps: " .. table.concat(propParts, " | "))
+            end
+        end
         local speech = H.StripMarkupTags(table.concat(parts, " | "))
-        if speech ~= "" and speech ~= lastSpokenFullText then
-            lastSpokenFullText = speech
+        if speech ~= "" and speech ~= state.lastSpokenFullText then
+            state.lastSpokenFullText = speech
             Log.Info("EXPLORE: " .. speech)
             Ext.Tolk.Speak(speech, true)
         end
@@ -366,21 +339,45 @@ local function HandleTickSnapshot(snapshot)
     if widgetRootId ~= "" and widgetRootId ~= lastWidgetRootStr then
         lastWidgetRootStr = widgetRootId
         Log.Info("Widget root changed to " .. widgetRootId)
-        seenWidgetRoots[widgetRootId] = true
         if controllerBindingsData then
             UnsubscribeControllerInput()
         end
-        if not focusedElement.isTab and not H.IsOptionData(focusedElement) then
-            lastSpokenTab = nil
-            lastSpokenTitle = nil
-            tabHintSpoken = false
-        end
-        currentWidgetDCType = nil
-        screenEntryJustSpoke = false
+        state.lastSpokenTab = nil
+        state.lastSpokenTitle = nil
+        state.screenEntryJustSpoke = false
+        -- Save previous DC type to detect menu changes vs tab switches.
+        state.previousWidgetDCType = state.currentWidgetDCType
+        state.currentWidgetDCType = nil
+        seenWidgetRoots[widgetRootId] = true
     end
 
     if snapshot.widgetAdded and snapshot.widgetData and snapshot.widgetData.dcType then
-        currentWidgetDCType = snapshot.widgetData.dcType
+        local newDCType = snapshot.widgetData.dcType
+        -- Reset hint only when entering a genuinely different menu.
+        -- Compare against BOTH currentWidgetDCType (for menus that
+        -- share widget root, like multiplayer tabs) AND previousWidgetDCType
+        -- (for menus that change widget root per tab, like Options).
+        -- "Same family" means exact match OR both contain "Option"
+        -- (gui::DCOptions and gui::DCControllerOptions are one menu).
+        local sameMenuFamily = false
+        local currentDC = state.currentWidgetDCType
+        local previousDC = state.previousWidgetDCType
+        if currentDC and newDCType == currentDC then
+            sameMenuFamily = true
+        elseif previousDC and newDCType == previousDC then
+            sameMenuFamily = true
+        elseif currentDC
+            and currentDC:find("Option") and newDCType:find("Option") then
+            sameMenuFamily = true
+        elseif previousDC
+            and previousDC:find("Option") and newDCType:find("Option") then
+            sameMenuFamily = true
+        end
+        if not sameMenuFamily then
+            state.tabHintSpoken = false
+        end
+        state.currentWidgetDCType = newDCType
+        state.previousWidgetDCType = nil
     end
 
     local controllerHintText = nil
@@ -390,6 +387,14 @@ local function HandleTickSnapshot(snapshot)
         SubscribeControllerInput(snapshot.widgetData.dcProps)
         controllerHintText = "Interactive controller mode: While in this tab, press any button or trigger to hear its function. Press LB twice to return to the previous tab, or press RB twice to move to the next tab in the menu. Press B twice to exit to the main menu."
         Log.Info("Controller bindings interactive mode activated")
+    end
+
+    -- =================================================================
+    -- CC dispatch: delegate to AccessibilityCC and return.
+    -- =================================================================
+    if CC.IsCCSnapshot(snapshot) then
+        CC.HandleCCSnapshot(snapshot, state)
+        return
     end
 
     -- =================================================================
@@ -403,7 +408,9 @@ local function HandleTickSnapshot(snapshot)
     local isScreenEntry = false
     if snapshot.selectionChanged then
         isScreenEntry = true
-    elseif snapshot.widgetAdded and snapshot.widgetData and not lastSpokenTab then
+    elseif snapshot.widgetAdded and snapshot.widgetData and not state.lastSpokenTab then
+        isScreenEntry = true
+    elseif snapshot.focusChanged and focusedElement.isTab then
         isScreenEntry = true
     end
 
@@ -413,19 +420,35 @@ local function HandleTickSnapshot(snapshot)
     local isValueOnly = not isScreenEntry and not isItemNav
         and not isCarouselOnly and snapshot.valueChanged
 
-    -- Nothing to do?
+    -- Widget text update: DC property changed (e.g., "Finding lobbies..."
+    -- -> "No lobbies found") or dialog appeared without focus change.
+    -- Checked BEFORE carousel/value handlers because widgetAdded with
+    -- text takes priority (valueChanged fires on the same tick but reads
+    -- from focusedElement.dcProps which doesn't have the widget text).
+    if not isScreenEntry and not isItemNav and snapshot.widgetAdded and snapshot.widgetData then
+        local _, widgetBody, widgetActions = ExtractFromWidgetData(snapshot.widgetData)
+        local updateText = widgetBody or widgetActions
+        if updateText and updateText ~= ""
+            and updateText ~= state.lastSpokenFullText then
+            state.lastSpokenFullText = updateText
+            Log.Info("WIDGET UPDATE: " .. updateText)
+            Ext.Tolk.Speak(updateText, true)
+            return
+        end
+    end
+
     if not isScreenEntry and not isItemNav
         and not isCarouselOnly and not isValueOnly then
         return
     end
 
     -- =================================================================
-    -- Standalone carousel or value: speak immediately, no slots needed.
+    -- Standalone carousel or value.
     -- =================================================================
     if isCarouselOnly then
         local carouselValue = snapshot.inlineCarouselValue
-        if carouselValue ~= lastSpokenFullText then
-            lastSpokenFullText = carouselValue
+        if carouselValue ~= state.lastSpokenFullText then
+            state.lastSpokenFullText = carouselValue
             Log.Info("CAROUSEL: " .. carouselValue)
             Ext.Tolk.Speak(carouselValue, true)
         end
@@ -434,8 +457,8 @@ local function HandleTickSnapshot(snapshot)
 
     if isValueOnly then
         local valueText = H.FormatDCValue(focusedElement.dcProps)
-        if valueText and valueText ~= "" and valueText ~= lastSpokenFullText then
-            lastSpokenFullText = valueText
+        if valueText and valueText ~= "" and valueText ~= state.lastSpokenFullText then
+            state.lastSpokenFullText = valueText
             Log.Info("VALUE: " .. valueText)
             Ext.Tolk.Speak(valueText, true)
         end
@@ -447,43 +470,27 @@ local function HandleTickSnapshot(snapshot)
     -- =================================================================
     local slots = {}
     local tabName = nil
-    local ccItemName = nil
     local normalTab = ""
     local screenTitle = nil
 
-    -- ----- Screen entry: fill title, hint, tabName, body -----
     if isScreenEntry then
+        -- If widget root changed but no widgetAdded event arrived (e.g.
+        -- returning to main menu), previousWidgetDCType is still set.
+        -- The widgetAdded DC check above handles most cases, but when
+        -- no widgetAdded fires, we need to clear the stale previous DC.
+        -- Do NOT reset hint here -- the widgetAdded path handles that.
+        if state.previousWidgetDCType then
+            state.previousWidgetDCType = nil
+        end
+
         -- Derive tab name.
         if focusedElement.isTab then
             tabName = focusedElement.tabName
         end
-        if not tabName and snapshot.selectionChanged then
-            local sectionLabel = H.GetSectionLabel(focusedElement)
-            if sectionLabel then
-                tabName = sectionLabel
-                ccItemName = H.ExtractTextFromData(focusedElement, nil, false)
-            end
-        end
         normalTab = tabName and H.NormalizeForCompare(tabName) or ""
 
-        -- Appearance carousel (unnamed ListBoxItem).
-        if tabName and tabName:find("^ListBoxItem:") then
-            local itemLabel = focusedElement.elemName
-                and H.GetBodyTypeName(focusedElement.elemName)
-            if not itemLabel then
-                itemLabel = tabName:match("^ListBoxItem:%s*(.+)$") or tabName
-            end
-            -- Treat as simple item, not screen entry.
-            slots["itemName"] = itemLabel
-            lastSpokenName = elemId
-            lastSpokenFullText = itemLabel
-            Log.Info("ITEM: appearance  name=" .. itemLabel)
-            SpeakSlots(slots)
-            return
-        end
-
         -- Dedup: skip if same tab.
-        if tabName and tabName == lastSpokenTab then
+        if tabName and tabName == state.lastSpokenTab then
             Log.Debug("SKIP screen entry (same tab): " .. tabName)
             return
         end
@@ -492,10 +499,12 @@ local function HandleTickSnapshot(snapshot)
             .. " sel=" .. tostring(snapshot.selectionChanged)
             .. " widget=" .. tostring(snapshot.widgetAdded))
 
-        if tabName then lastSpokenTab = tabName end
-        lastSpokenName = nil
+        -- Always update, even when nil, so widgetAdded doesn't re-trigger.
+        -- Use empty string as sentinel for "screen entry processed, no tab name".
+        state.lastSpokenTab = tabName or ""
+        state.lastSpokenName = nil
 
-        -- Gather all data sources.
+        -- Gather data sources.
         local allNamedTexts = {}
         if focusedElement.namedTexts then
             for elementName, elementText in pairs(focusedElement.namedTexts) do
@@ -510,7 +519,7 @@ local function HandleTickSnapshot(snapshot)
             end
         end
         local nsTitle, nsBodyParts = ExtractFromNamedTexts(allNamedTexts)
-        local widgetTitle, widgetBody = ExtractFromWidgetData(snapshot.widgetData)
+        local widgetTitle, widgetBody, widgetActions = ExtractFromWidgetData(snapshot.widgetData)
 
         -- Title.
         screenTitle = nsTitle or widgetTitle
@@ -518,18 +527,18 @@ local function HandleTickSnapshot(snapshot)
             and H.NormalizeForCompare(screenTitle) == normalTab then
             screenTitle = nil
         end
-        if screenTitle and screenTitle == lastSpokenTitle then
+        if screenTitle and screenTitle == state.lastSpokenTitle then
             screenTitle = nil
         end
         if screenTitle then
-            lastSpokenTitle = screenTitle
+            state.lastSpokenTitle = screenTitle
             slots["title"] = screenTitle
         end
 
         -- Hint (once per menu visit).
-        if not tabHintSpoken then
-            tabHintSpoken = true
-            local menuType = currentWidgetDCType
+        if not state.tabHintSpoken then
+            state.tabHintSpoken = true
+            local menuType = state.currentWidgetDCType
             if not menuType or MENU_HINTS[menuType] == nil then
                 if focusedElement.dcType and MENU_HINTS[focusedElement.dcType] ~= nil then
                     menuType = focusedElement.dcType
@@ -573,63 +582,53 @@ local function HandleTickSnapshot(snapshot)
         if bodyAssembled then
             slots["body"] = bodyAssembled
         end
+        -- Dialog button actions (e.g., "A: Yes, B: No").
+        if widgetActions then
+            slots["actions"] = widgetActions
+        end
     else
         -- Item navigation: dedup check.
-        if elemId == lastSpokenName and not hasCarousel then
-            local text = H.ExtractTextFromData(focusedElement, lastSpokenTab, false)
-            if not text or text == lastSpokenFullText then
+        if elemId == state.lastSpokenName and not hasCarousel then
+            local text = H.ExtractTextFromData(focusedElement, state.lastSpokenTab, false)
+            if not text or text == state.lastSpokenFullText then
                 Log.Debug("DEDUP SKIP: " .. tostring(elemId))
                 return
             end
         end
     end
 
-    -- ----- Item slots (both screen entry and item navigation) -----
+    -- ----- Item slots -----
     local itemName = nil
     local itemValue = nil
     local itemDesc = nil
 
-    -- CC: section label is tab, selected item is itemName.
-    if ccItemName then
-        itemName = ccItemName
-        if focusedElement.dcProps and tabName then
-            local godTitle, godBody = H.ExtractContextualGodObjectText(
-                focusedElement.dcProps, tabName)
-            if godBody and godBody ~= "" then
-                itemDesc = godBody
-            end
+    local splitName, splitValue, splitDesc = H.FormatDCTextSplit(focusedElement.dcProps)
+    if not splitName or splitName == "" then
+        splitName = H.ExtractTextFromData(focusedElement, state.lastSpokenTab, isScreenEntry)
+        splitValue = nil
+        splitDesc = nil
+    end
+    if splitName and splitName ~= "" then
+        local normalItem = H.NormalizeForCompare(splitName)
+        local isDuplicate = (normalTab ~= "" and normalItem == normalTab)
+            or (screenTitle and normalItem == H.NormalizeForCompare(screenTitle))
+        if not isDuplicate then
+            itemName = splitName
+            itemValue = splitValue
         end
+        -- Keep description even when name is suppressed as tab duplicate.
+        if splitDesc then itemDesc = splitDesc end
+        if splitValue and not itemValue then itemValue = splitValue end
     end
 
-    -- Regular element.
-    if not itemName then
-        local splitName, splitValue, splitDesc = H.FormatDCTextSplit(focusedElement.dcProps)
-        if not splitName or splitName == "" then
-            splitName = H.ExtractTextFromData(focusedElement, lastSpokenTab, isScreenEntry)
-            splitValue = nil
-            splitDesc = nil
-        end
-        if splitName and splitName ~= "" then
-            local normalItem = H.NormalizeForCompare(splitName)
-            local isDuplicate = (normalTab ~= "" and normalItem == normalTab)
-                or (screenTitle and normalItem == H.NormalizeForCompare(screenTitle))
-            if not isDuplicate then
-                itemName = splitName
-                itemValue = splitValue
-                if splitDesc then itemDesc = splitDesc end
-            end
-        end
-    end
-
-    -- Inline carousel value.
     if hasCarousel then
         itemValue = snapshot.inlineCarouselValue
     end
 
     if itemName then
         slots["itemName"] = itemName
-        lastSpokenName = elemId
-        lastSpokenFullText = itemName
+        state.lastSpokenName = elemId
+        state.lastSpokenFullText = itemName
         Log.Info("ITEM: " .. tostring(focusedElement.elemType)
             .. "  name=" .. itemName
             .. (itemValue and ("  val=" .. itemValue) or "")
@@ -638,17 +637,11 @@ local function HandleTickSnapshot(snapshot)
     if itemValue then slots["itemValue"] = itemValue end
     if itemDesc then slots["itemDesc"] = itemDesc end
 
-    -- ----- Speak -----
-    -- Screen entry speech (title, hint, body) should not interrupt
-    -- because the auto-focused item may arrive in a follow-up snapshot
-    -- and we don't want the lobby name cutting off "Use bumpers...".
-    -- User-initiated navigation (isItemNav) always interrupts.
     SpeakSlots(slots, isScreenEntry)
 end
 
 -- ---------------------------------------------------------------------------
 -- Subscribe to the C++ per-frame GlobalFocusMonitor.
--- This single callback fires for EVERY focus/selection change in ANY menu.
 -- ---------------------------------------------------------------------------
 local function SetupGlobalFocusMonitor()
     local ok, result = pcall(Ext.UI.SubscribeGlobalFocusChanged, function(first, prop)
@@ -656,8 +649,6 @@ local function SetupGlobalFocusMonitor()
             Log.Warn("unexpected callback arg type: " .. type(first))
             return
         end
-
-        -- New snapshot system: one table per tick with everything.
         if prop == "TickSnapshot" then
             local handlerOk, handlerErr = pcall(HandleTickSnapshot, first)
             if not handlerOk then
@@ -665,9 +656,6 @@ local function SetupGlobalFocusMonitor()
             end
             return
         end
-
-        -- All legacy event types are now handled by the snapshot system.
-        -- Skip any non-snapshot events that arrive through the old path.
         return
     end)
     if ok and result then
@@ -677,63 +665,48 @@ local function SetupGlobalFocusMonitor()
     end
 end
 
--- Try immediately (root may exist already at script load time).
 SetupGlobalFocusMonitor()
 
--- Re-subscribe on game state changes.
--- Game states where snapshots should be suppressed (loading, transitions).
+-- Game state transitions.
 local LOADING_STATES = {
-    StartLoading = true,
-    StartServer = true,
-    LoadSession = true,
-    LoadLevel = true,
-    SwapLevel = true,
-    UnloadLevel = true,
-    UnloadSession = true,
-    InitNetwork = true,
-    InitConnection = true,
-    StopLoading = true,
-    Idle = true,
+    StartLoading = true, StartServer = true, LoadSession = true,
+    LoadLevel = true, SwapLevel = true, UnloadLevel = true,
+    UnloadSession = true, InitNetwork = true, InitConnection = true,
+    StopLoading = true, Idle = true,
 }
 
 Ext.Events.GameStateChanged:Subscribe(function(e)
     Log.Info("GameStateChanged: " .. tostring(e.FromState) .. " -> " .. tostring(e.ToState))
     UnsubscribeControllerInput()
-    lastSpokenName = nil
-    lastSpokenFullText = nil
-    lastSpokenTab = nil
-    lastSpokenTitle = nil
-    tabHintSpoken = false
-    screenEntryJustSpoke = false
+    state.lastSpokenName = nil
+    state.lastSpokenFullText = nil
+    state.lastSpokenTab = nil
+    state.lastSpokenTitle = nil
+    state.tabHintSpoken = false
+    state.screenEntryJustSpoke = false
+    state.currentWidgetDCType = nil
+    state.previousWidgetDCType = nil
     lastWidgetRootStr = nil
     seenWidgetRoots = {}
-    currentWidgetDCType = nil
-    -- Suppress snapshots during loading/transitions.
     local toState = tostring(e.ToState)
     suppressSnapshots = LOADING_STATES[toState] or false
     SetupGlobalFocusMonitor()
 end)
 
 -- ---------------------------------------------------------------------------
--- Debug explore mode toggle.
--- Usage: press L3 + R3 (both sticks) simultaneously.
+-- Debug explore mode toggle (L3 + R3).
 -- ---------------------------------------------------------------------------
 function BG3Access.Client.ToggleExploreMode()
     debugExploreMode = not debugExploreMode
-    local state = debugExploreMode and "ON" or "OFF"
-    Log.Info("Explore mode: " .. state)
-    Ext.Tolk.Speak("Explore mode " .. state, true)
+    local modeState = debugExploreMode and "ON" or "OFF"
+    Log.Info("Explore mode: " .. modeState)
+    Ext.Tolk.Speak("Explore mode " .. modeState, true)
 end
 
--- L3 + R3 combo detection for explore mode toggle.
-local exploreComboState = {
-    leftStickHeld = false,
-    rightStickHeld = false,
-}
+local exploreComboState = { leftStickHeld = false, rightStickHeld = false }
 
 Ext.Events.ControllerButtonInput:Subscribe(function(event)
     local buttonName = tostring(event.Button)
-    -- Log all button presses when explore mode is active.
     if debugExploreMode and event.Pressed then
         Log.Debug("INPUT: " .. buttonName)
     end
@@ -754,6 +727,3 @@ end)
 -- Startup
 -- ---------------------------------------------------------------------------
 Log.Info("Accessibility ready (GlobalFocusMonitor).")
-
--- State machine probe removed -- C++ GetStateMachine() crashes.
--- Searching via Lua/Noesis tree instead (see BootstrapClient.lua).
