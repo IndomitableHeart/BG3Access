@@ -60,6 +60,13 @@ local GOD_OBJECT_EXCEPTIONS = {
     -- ["WeirdTabName"] = "SelectedActualPropertyName",
 }
 
+-- Toggle items on the Appearance page whose values come from
+-- god-object properties (not from the element's own DC).
+local CC_TOGGLE_PROPERTIES = {
+    ["Heterochromia"]  = "HeterochromiaEnabled",
+    ["Hide Clothes"]   = "CoverNudity",
+}
+
 -- ============================================================================
 -- CC Helper Functions
 -- ============================================================================
@@ -427,6 +434,16 @@ local function HandleCCSnapshot(snapshot, state)
         if not valueText then
             valueText = H.FormatDCValue(focusedElement.dcProps)
         end
+        -- Toggle items: read from god-object property by item name.
+        if not valueText and focusedElement.dcProps and focusedElement.elemText then
+            local toggleProperty = CC_TOGGLE_PROPERTIES[focusedElement.elemText]
+            if toggleProperty then
+                local toggleValue = focusedElement.dcProps[toggleProperty]
+                if type(toggleValue) == "string" and toggleValue ~= "" then
+                    valueText = toggleValue
+                end
+            end
+        end
         if valueText and valueText ~= "" and valueText ~= state.lastSpokenFullText then
             state.lastSpokenFullText = valueText
             Log.Info("VALUE: " .. valueText)
@@ -454,7 +471,8 @@ local function HandleCCSnapshot(snapshot, state)
             tabName = selectedSectionLabel
             ccItemName = H.ExtractTextFromData(focusedElement, nil, false)
         end
-        if not tabName and selectedTabName then
+        if not tabName and selectedTabName
+            and not selectedTabName:find("^ListBoxItem:") then
             tabName = selectedTabName
             ccItemName = H.ExtractTextFromData(focusedElement, nil, false)
         end
@@ -486,6 +504,7 @@ local function HandleCCSnapshot(snapshot, state)
             .. " widget=" .. tostring(snapshot.widgetAdded))
 
         -- Update lastSpokenTab and lastCCStep.
+        local previousTab = state.lastSpokenTab
         state.lastSpokenTab = tabName
         if currentStep then state.lastCCStep = currentStep end
         state.lastSpokenItemName = nil  -- reset so label speaks on new page
@@ -527,6 +546,19 @@ local function HandleCCSnapshot(snapshot, state)
             if showTabName then
                 slots["tabName"] = tabName
             end
+        end
+
+        -- First CC entry: natural introduction speech.
+        if not previousTab then
+            slots["title"] = "Character Creation"
+            slots["hint"] = "You are on the " .. (tabName or "origin")
+                .. " page. Use bumpers to switch tabs."
+            slots["tabName"] = nil  -- suppress raw tab name
+            state.lastSpokenTitle = "Character Creation"
+            state.tabHintSpoken = true
+            Log.Info("CC SLOTS: first entry, tab=" .. tostring(tabName))
+            SpeakSlots(slots, state, true)
+            return
         end
     else
         -- Item navigation: dedup check.
@@ -603,6 +635,17 @@ local function HandleCCSnapshot(snapshot, state)
     -- Inline carousel value.
     if hasCarousel then
         itemValue = snapshot.inlineCarouselValue
+    end
+
+    -- Toggle items (Heterochromia, Hide Clothes): read value from god-object.
+    if not itemValue and itemName and focusedElement.dcProps then
+        local toggleProperty = CC_TOGGLE_PROPERTIES[itemName]
+        if toggleProperty then
+            local toggleValue = focusedElement.dcProps[toggleProperty]
+            if type(toggleValue) == "string" and toggleValue ~= "" then
+                itemValue = toggleValue
+            end
+        end
     end
 
     -- Cross-element dedup.
