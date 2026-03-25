@@ -33,12 +33,13 @@ local CC_SECTION_LABELS = {
     ["ls.VMSpellReference"]           = "Spell",
 }
 
--- Body type name mapping (XAML x:Name -> display name).
+-- Body type display names.  Keys are lowercase versions of the
+-- BodyTypeAndShape DC property values (Female, Male, FemaleStrong, MaleStrong).
 local BODY_TYPE_NAMES = {
-    female       = "Slim feminine",
-    male         = "Slim masculine",
-    femaleStrong = "Muscular feminine",
-    maleStrong   = "Muscular masculine",
+    ["female"]       = "Slim feminine",
+    ["male"]         = "Slim masculine",
+    ["femalestrong"] = "Muscular feminine",
+    ["malestrong"]   = "Muscular masculine",
 }
 
 -- CC toggle items whose INPC Value=0/1 should be spoken as "On"/"Off".
@@ -185,21 +186,37 @@ local function ExtractOriginContext(data)
     if not elemText or elemText == "" then return nil, nil, nil end
 
     -- Check if elemText matches a known god-object property value.
+    -- Returns "label: value" so the user hears context on every change.
     for _, mapping in ipairs(CC_ORIGIN_PROPERTY_LABELS) do
         local propertyValue = data.dcProps[mapping.property]
         if type(propertyValue) == "string" and propertyValue ~= "" then
             if elemText == propertyValue then
-                return mapping.label .. ": " .. elemText, nil, nil
+                local displayValue = elemText
+                if mapping.property == "BodyTypeAndShape" then
+                    displayValue = BODY_TYPE_NAMES[propertyValue:lower()]
+                        or propertyValue
+                end
+                return mapping.label, displayValue, nil
             end
         end
     end
 
     -- Body type numeric ID: substitute the readable BodyTypeAndShape value.
     if elemText:match("^%d+$") and data.dcProps.BodyTypeAndShape then
-        return "Body Type: " .. data.dcProps.BodyTypeAndShape, nil, nil
+        local rawBodyType = data.dcProps.BodyTypeAndShape
+        local displayName = BODY_TYPE_NAMES[rawBodyType:lower()] or rawBodyType
+        return "Body Type", displayName, nil
     end
 
-    -- Origin name (Custom, Astarion, etc.): match against SelectedOrigin.
+    -- "Origin" meta-option: play as a pre-made origin character.
+    -- The actual description lives at DummyCharacter.Stats.OriginDescription
+    -- (two levels deep, not accessible yet).
+    if H.NormalizeForCompare(elemText) == "origin" then
+        return "Origin", nil,
+            "Play as an existing origin character. Press down to browse characters"
+    end
+
+    -- Origin character name (Custom, Astarion, etc.): match against SelectedOrigin.
     local selectedOrigin = data.dcProps.SelectedOrigin
     if type(selectedOrigin) == "table" then
         local originName = selectedOrigin.Name or selectedOrigin.DisplayName
@@ -326,13 +343,46 @@ local function HandleCCSnapshot(snapshot, state)
     -- Best available section/tab identifier.
     local bestTabLabel = detectedSectionLabel or selectedTabName
 
+    -- CharacterCreationStep: definitive page indicator.
+    -- Read from focused element DC (when it's the god-object) or from
+    -- _ccStep namedText (targeted read from the widget DC by C++).
+    local currentStep = nil
+    if focusedElement.dcType == "gui::DCCharacterCreation"
+        and focusedElement.dcProps
+        and focusedElement.dcProps.CharacterCreationStep then
+        currentStep = focusedElement.dcProps.CharacterCreationStep
+    elseif focusedElement.namedTexts
+        and focusedElement.namedTexts["_ccStep"] then
+        currentStep = focusedElement.namedTexts["_ccStep"]
+    end
+
+    Log.Info("CC CLASSIFY: selSec=" .. tostring(selectedSectionLabel)
+        .. " selTab=" .. tostring(selectedTabName)
+        .. " step=" .. tostring(currentStep)
+        .. " lastTab=" .. tostring(state.lastSpokenTab)
+        .. " lastStep=" .. tostring(state.lastCCStep)
+        .. " sel=" .. tostring(snapshot.selectionChanged)
+        .. " foc=" .. tostring(snapshot.focusChanged))
+
     local isScreenEntry = false
     if snapshot.selectionChanged then
-        -- Same section = in-page cycling (body type, Custom/Origin, etc.).
-        -- Different section or unknown = tab switch.
-        if selectedSectionLabel and selectedSectionLabel == state.lastSpokenTab then
-            Log.Debug("CC same-section selection: " .. selectedSectionLabel)
-        else
+        -- Check known signals for tab switch vs in-page cycling.
+        if selectedSectionLabel then
+            -- Known CC VM type: same section = in-page, different = tab switch.
+            if selectedSectionLabel ~= state.lastSpokenTab then
+                isScreenEntry = true
+            end
+        elseif selectedTabName
+            and selectedTabName ~= state.lastSpokenTab then
+            -- Header carousel tab changed.
+            isScreenEntry = true
+        elseif currentStep and currentStep ~= state.lastCCStep then
+            -- CC step changed (bonus signal when available).
+            isScreenEntry = true
+        elseif not selectedSectionLabel and not selectedTabName then
+            -- No recognized signals at all.  Catches pages like Appearance.
+            -- Body type/identity cycling has selectedSectionLabel="Origin"
+            -- (non-nil) so it never reaches this branch.
             isScreenEntry = true
         end
     elseif snapshot.focusChanged and focusedElement.isTab then
@@ -397,29 +447,32 @@ local function HandleCCSnapshot(snapshot, state)
         if focusedElement.isTab then
             tabName = focusedElement.tabName
         end
-        if not tabName and detectedSectionLabel then
-            tabName = detectedSectionLabel
-            -- When tab comes from section label, the focused element's text
-            -- is the first item (e.g. "Elf" on the Race page).
+        -- Priority: selectedSectionLabel (Race, Subrace, etc.) is most
+        -- reliable.  When nil, prefer selectedTabName ("High Elf Cantrip")
+        -- over focusedSectionLabel ("Spell") for better labels.
+        if not tabName and selectedSectionLabel then
+            tabName = selectedSectionLabel
             ccItemName = H.ExtractTextFromData(focusedElement, nil, false)
         end
         if not tabName and selectedTabName then
             tabName = selectedTabName
+            ccItemName = H.ExtractTextFromData(focusedElement, nil, false)
+        end
+        if not tabName and focusedSectionLabel then
+            tabName = focusedSectionLabel
+            ccItemName = H.ExtractTextFromData(focusedElement, nil, false)
         end
 
-        -- Appearance carousel (unnamed ListBoxItem).
-        if tabName and tabName:find("^ListBoxItem:") then
-            local itemLabel = focusedElement.elemName
-                and GetBodyTypeName(focusedElement.elemName)
-            if not itemLabel then
-                itemLabel = tabName:match("^ListBoxItem:%s*(.+)$") or tabName
-            end
-            slots["itemName"] = itemLabel
-            state.lastSpokenName = elemId
-            state.lastSpokenFullText = itemLabel
-            Log.Info("ITEM: appearance  name=" .. itemLabel)
-            SpeakSlots(slots, state)
-            return
+        -- Appearance page: no CC VM type, no recognized tab name.
+        -- Detect by the Randomise button's element name.
+        if not tabName and focusedElement.elemName
+            and focusedElement.elemName:find("Appearance", 1, true) then
+            tabName = "Appearance"
+        end
+
+        -- Fallback: use CharacterCreationStep when no other tab name found.
+        if not tabName and currentStep then
+            tabName = currentStep
         end
 
         -- Dedup: skip if same tab.
@@ -432,14 +485,16 @@ local function HandleCCSnapshot(snapshot, state)
             .. " sel=" .. tostring(snapshot.selectionChanged)
             .. " widget=" .. tostring(snapshot.widgetAdded))
 
-        -- Update lastSpokenTab.  Clear when entering a screen with no tab
-        -- (e.g. unrecognized page) so the next tab is detected as a change.
+        -- Update lastSpokenTab and lastCCStep.
         state.lastSpokenTab = tabName
+        if currentStep then state.lastCCStep = currentStep end
+        state.lastSpokenItemName = nil  -- reset so label speaks on new page
         state.lastSpokenName = nil
 
         -- ----- Title -----
         local screenTitle = nil
         local effectiveDCType = state.currentWidgetDCType
+            or focusedElement.dcType
             or (snapshot.widgetData and snapshot.widgetData.dcType)
         if effectiveDCType == "gui::DCCharacterCreation" then
             screenTitle = "Character Creation"
@@ -490,6 +545,14 @@ local function HandleCCSnapshot(snapshot, state)
     local itemDesc = nil
 
     -- Path 1: section label found -> ccItemName is the auto-focused item.
+    -- Suppress if it duplicates the tab name (e.g., "spell" == "Spell").
+    if ccItemName and tabName then
+        local normalTab = H.NormalizeForCompare(tabName)
+        local normalItem = H.NormalizeForCompare(ccItemName)
+        if normalItem == normalTab then
+            ccItemName = nil
+        end
+    end
     if ccItemName then
         itemName = ccItemName
         -- Try god-object description (InfoRaceDescription etc.)
@@ -554,7 +617,21 @@ local function HandleCCSnapshot(snapshot, state)
         end
     end
 
+    -- Value-only speech: when cycling values on the same item (e.g.,
+    -- left/right on Body Type), suppress the label and speak only the
+    -- new value.  Mimics Options menu behavior (label on first visit,
+    -- value-only on subsequent changes).
+    if itemName and itemValue and state.lastSpokenItemName
+        and itemName == state.lastSpokenItemName then
+        -- Same label, different value -> speak value only.
+        state.lastSpokenFullText = itemValue
+        Log.Info("VALUE CYCLE: " .. itemValue)
+        Ext.Tolk.Speak(itemValue, true)
+        return
+    end
+
     if itemName then
+        state.lastSpokenItemName = itemName
         slots["itemName"] = itemName
         state.lastSpokenName = elemId
         state.lastSpokenFullText = itemName
