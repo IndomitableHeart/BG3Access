@@ -18,6 +18,7 @@ BG3Access.Client = BG3Access.Client or {}
 local Log = BG3Access.Client.Log
 local H   = BG3Access.Client.Helpers
 local CC  = BG3Access.Client.CC
+local CS  = BG3Access.Client.Cutscene
 
 -- ---------------------------------------------------------------------------
 -- Shared state (also passed to CC handler via state table).
@@ -272,8 +273,24 @@ end
 -- CC snapshots are dispatched to AccessibilityCC before reaching this code.
 -- ---------------------------------------------------------------------------
 local function HandleTickSnapshot(snapshot)
+    -- =================================================================
+    -- Dialog/cutscene widget events: handle BEFORE focus check since
+    -- cutscenes have no focused element.
+    -- =================================================================
+    if snapshot.widgetAdded and snapshot.widgetData
+        and snapshot.widgetData.dcType
+        and CS.IsDialogOrCutscene(snapshot.widgetData.dcType) then
+        CS.HandleDialogWidgetEvent(snapshot.widgetData)
+        -- If no focused element data, nothing else to do (pure cutscene).
+        -- focusedElement is always a table but may have no elemType.
+        if not snapshot.focusedElement
+            or not snapshot.focusedElement.elemType then
+            return
+        end
+    end
+
     local focusedElement = snapshot.focusedElement
-    if not focusedElement then return end
+    if not focusedElement or not focusedElement.elemType then return end
 
     -- During loading states, only allow visual text (tips, splash screen).
     -- Normal menu processing is suppressed to avoid stale/transient data.
@@ -353,6 +370,10 @@ local function HandleTickSnapshot(snapshot)
 
     if snapshot.widgetAdded and snapshot.widgetData and snapshot.widgetData.dcType then
         local newDCType = snapshot.widgetData.dcType
+        -- Reset dialog state when a non-dialog widget appears.
+        if not CS.IsDialogOrCutscene(newDCType) then
+            CS.ResetDialogState()
+        end
         -- Reset hint only when entering a genuinely different menu.
         -- Compare against BOTH currentWidgetDCType (for menus that
         -- share widget root, like multiplayer tabs) AND previousWidgetDCType
@@ -394,6 +415,15 @@ local function HandleTickSnapshot(snapshot)
     -- =================================================================
     if CC.IsCCSnapshot(snapshot) then
         CC.HandleCCSnapshot(snapshot, state)
+        return
+    end
+
+    -- =================================================================
+    -- Dialog answer navigation: when focus changes within an active
+    -- dialog, the cutscene module handles answer speech.
+    -- =================================================================
+    if snapshot.focusChanged and focusedElement
+        and CS.HandleDialogAnswerFocus(focusedElement) then
         return
     end
 
@@ -688,6 +718,8 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     state.previousWidgetDCType = nil
     lastWidgetRootStr = nil
     seenWidgetRoots = {}
+    CS.ResetDialogState()
+    CS.HandleGameStateForAD(tostring(e.FromState), tostring(e.ToState))
     local toState = tostring(e.ToState)
     suppressSnapshots = LOADING_STATES[toState] or false
     SetupGlobalFocusMonitor()

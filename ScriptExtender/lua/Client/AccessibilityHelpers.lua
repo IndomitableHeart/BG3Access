@@ -260,6 +260,20 @@ local function ExtractTextFromData(data, lastSpokenTab, tabFlushPending)
     return CleanElementName(data.elemName)
 end
 
+-- Resolve a LocaString handle to translated text, or return the input as-is.
+local function GetTranslatedStringIfHandle(textOrHandle, logContextStringOptional)
+    if not textOrHandle or type(textOrHandle) ~= "string" or textOrHandle == "" then
+        return textOrHandle
+    end
+    if Ext.Loca and Ext.Loca.GetTranslatedString then
+        local translated = Ext.Loca.GetTranslatedString(textOrHandle)
+        if translated and translated ~= "" and translated ~= textOrHandle then
+            return translated
+        end
+    end
+    return textOrHandle
+end
+
 -- ---------------------------------------------------------------------------
 -- Exports
 -- ---------------------------------------------------------------------------
@@ -274,4 +288,5 @@ BG3Access.Client.Helpers = {
     FormatDCValue                = FormatDCValue,
     ExtractStatusText            = ExtractStatusText,
     ExtractTextFromData          = ExtractTextFromData,
+    GetTranslatedStringIfHandle  = GetTranslatedStringIfHandle,
 }
