@@ -58,6 +58,21 @@ local CC_SECTION_HEADERS = {
     ["spell"]             = true,
 }
 
+-- Detect if a string is a meaningless placeholder like "(x2)" or "(x3)".
+-- These appear briefly before the real data loads in carousel recycling.
+local function IsPlaceholder(text)
+    if type(text) ~= "string" then return false end
+    -- ASCII: "(x2)", "(X3)", etc.
+    if text:find("^%([xX]%d+%)$") then return true end
+    -- Unicode multiplication sign: the × character is multi-byte.
+    -- Check for short strings starting with ( ending with ) containing a digit.
+    if #text <= 8 and text:sub(1, 1) == "(" and text:sub(-1) == ")"
+        and text:find("%d") then
+        return true
+    end
+    return false
+end
+
 -- CC toggle items whose INPC Value=0/1 should be spoken as "On"/"Off".
 local CC_BOOLEAN_TOGGLES = {
     ["Heterochromia"]  = true,
@@ -78,6 +93,13 @@ local CC_ORIGIN_PROPERTY_LABELS = {
 local GOD_OBJECT_KEY_OVERRIDES = {
     ["Subrace"]  = "SubRace",
     ["Subclass"] = "SubClass",
+}
+
+-- Element name overrides: maps elemName to a friendlier display name.
+-- Used for buttons whose raw text is too terse (e.g. "Randomise" ->
+-- "Randomize your appearance").
+local CC_ELEM_NAME_OVERRIDES = {
+    ["newRandomAppearance"] = "Randomize your appearance",
 }
 
 -- Toggle items on the Appearance page whose values come from
@@ -651,10 +673,14 @@ local function GetFeatureDescription(featureName, dcType)
     -- the passive cache has "Rapier Proficiency".  Try variations
     -- to find the real game text before falling back to anything else.
     local singular = featureName:gsub("s$", "")
+    -- Also try removing " Proficiency" suffix (e.g., "Light Armour Proficiency"
+    -- stored as "Light Armour" in the UI).
+    local withoutProf = featureName:gsub(" Proficiency$", "")
     local variations = {
         featureName .. " Proficiency",
         singular .. " Proficiency",
         singular,
+        withoutProf,
     }
     for _, variant in ipairs(variations) do
         local variantDesc = passiveDescriptionCache[variant:lower()]
@@ -833,6 +859,21 @@ local function GetGodObjectDescription(dcProps, tabName, itemName)
         end
     end
 
+    -- 5. Fallback: search ALL StaticData caches for the item name.
+    --    Handles the case where lastMainTab is wrong (e.g. stuck on
+    --    "Skills" after returning to the Race carousel from the
+    --    skills section).  The item name IS in a cache, just not
+    --    the one tabName points to.
+    if itemName and itemName ~= "" then
+        for fallbackTab, fallbackType in pairs(CC_TAB_STATIC_DATA_TYPE) do
+            if fallbackType ~= staticDataType then
+                local fallbackDesc = GetStaticDataDescription(
+                    fallbackType, itemName)
+                if fallbackDesc then return fallbackDesc end
+            end
+        end
+    end
+
     return nil
 end
 
@@ -943,8 +984,8 @@ local function ExtractOriginContext(data)
     -- The actual description lives at DummyCharacter.Stats.OriginDescription
     -- (two levels deep, not accessible yet).
     if H.NormalizeForCompare(elemText) == "origin" then
-        return "Origin", nil,
-            "Play as an existing origin character. Press down to browse characters"
+        return nil, nil,
+            "Play as an existing character from Baldur's Gate 3"
     end
 
     -- Origin character name (Custom, Astarion, etc.): match against SelectedOrigin.
@@ -955,12 +996,254 @@ local function ExtractOriginContext(data)
         if originName and H.NormalizeForCompare(elemText) == H.NormalizeForCompare(originName) then
             local originDesc = selectedOrigin.Description
             if type(originDesc) == "string" and originDesc ~= "" then
+                -- Custom: speak the API description, then action hint.
+                if H.NormalizeForCompare(originName) == "custom" then
+                    local trimmedDesc = originDesc:gsub("[%.%s]+$", "")
+                    return nil, nil,
+                        trimmedDesc .. ". Create a custom character"
+                end
                 return elemText, nil, originDesc
             end
         end
     end
 
     return nil, nil, nil
+end
+
+-- ============================================================================
+-- Unified Item Data Extraction
+-- ============================================================================
+
+-- Extract name, value, and description for the current CC focused element.
+-- This is the SINGLE source of truth for item data.  All code paths
+-- (dedup, isValueOnly, screen entry, item nav) use the same result.
+--
+-- Pipeline (stops at first name hit):
+--   1. Placeholder guard
+--   2. FormatCCDCTextSplit (Skill, Ability, Spell dcProps)
+--   3. ExtractOriginContext (Body Type, Identity, Origin)
+--   4. H.FormatDCText (generic dcProps)
+--   5. H.ExtractTextFromData (visual text / elemText fallback)
+-- Then applies overrides (carousel, toggles, bonus ability, stat labels)
+-- and enriches with API-first descriptions.
+--
+-- Parameters:
+--   focusedElement  - the focused element data table
+--   snapshot        - full snapshot from C++
+--   state           - shared Manager state (lastMainTab, etc.)
+--   tabName         - current tab name (may be nil for item nav)
+--   isScreenEntry   - boolean, passed to H.ExtractTextFromData
+--
+-- Returns: name, value, description (all strings or nil)
+local function GetCCItemData(focusedElement, snapshot, state, tabName,
+                             isScreenEntry)
+    if not focusedElement then return nil, nil, nil end
+
+    local dcProps = focusedElement.dcProps
+    local itemName = nil
+    local itemValue = nil
+    local itemDescription = nil
+
+    -- 1. Placeholder guard: strip placeholder elemText so downstream
+    --    extractors (H.ExtractTextFromData) don't pick it up.
+    local elemText = focusedElement.elemText
+    if elemText and IsPlaceholder(elemText) then
+        Log.Debug("GetCCItemData: strip placeholder elemText: " .. elemText)
+        elemText = nil
+    end
+
+    -- 2. FormatCCDCTextSplit: Skill, Ability, Spell sub-table dcProps.
+    itemName, itemValue, itemDescription = FormatCCDCTextSplit(dcProps)
+
+    -- 3. ExtractOriginContext: Body Type, Identity, Origin character.
+    if not itemName or itemName == "" then
+        itemName, itemValue, itemDescription = ExtractOriginContext(
+            focusedElement)
+    end
+
+    -- If a prior extractor returned description but no name (e.g.
+    -- ExtractOriginContext for "Custom" or "Origin"), the element is
+    -- claimed.  Do NOT fall through to generic extractors which would
+    -- overwrite the description with unrelated text.
+    local elementClaimed = (itemName and itemName ~= "")
+        or (itemDescription and itemDescription ~= "")
+
+    -- 4. H.FormatDCText: generic dcProps formatting.
+    if not elementClaimed then
+        itemName = H.FormatDCText(dcProps)
+        itemValue = nil
+        itemDescription = nil
+        elementClaimed = itemName and itemName ~= ""
+    end
+
+    -- 5. H.ExtractTextFromData: visual text / elemText fallback.
+    --    Pass the effective tab name for context.
+    if not elementClaimed then
+        local effectiveTab = tabName or state.lastSpokenTab
+        itemName = H.ExtractTextFromData(
+            focusedElement, effectiveTab, isScreenEntry)
+        itemValue = nil
+        itemDescription = nil
+    end
+
+    -- If all extractors produced nothing, bail early.
+    -- An element with description but no name (Custom, Origin) is valid.
+    if (not itemName or itemName == "")
+        and (not itemDescription or itemDescription == "") then
+        return nil, nil, nil
+    end
+
+    -- Final placeholder check on the extracted name.
+    if itemName and IsPlaceholder(itemName) then
+        Log.Info("GetCCItemData: suppress placeholder name: " .. itemName)
+        return nil, nil, nil
+    end
+
+    -- Element name overrides: replace terse button text with friendlier labels.
+    if itemName and focusedElement.elemName
+        and CC_ELEM_NAME_OVERRIDES[focusedElement.elemName] then
+        itemName = CC_ELEM_NAME_OVERRIDES[focusedElement.elemName]
+    end
+
+    -- ----------------------------------------------------------------
+    -- 6. Post-extraction overrides (only when itemName is set)
+    -- ----------------------------------------------------------------
+    -- Elements with description-only (Custom, Origin on the origin page)
+    -- skip overrides entirely — they have no name/value to transform.
+
+    if itemName and itemName ~= "" then
+        -- Carousel value: non-numeric carousel values override itemValue.
+        local hasCarousel = snapshot.inlineCarouselChanged
+            and snapshot.inlineCarouselValue
+            and snapshot.inlineCarouselValue ~= ""
+        if hasCarousel then
+            local carouselValue = snapshot.inlineCarouselValue
+            if carouselValue and not carouselValue:match("^%d+$") then
+                itemValue = carouselValue
+            else
+                Log.Debug("GetCCItemData: suppress numeric carousel: "
+                    .. tostring(carouselValue))
+            end
+        end
+
+        -- Toggle properties: read value from god-object property by item name.
+        if not itemValue and dcProps then
+            local toggleProperty = CC_TOGGLE_PROPERTIES[itemName]
+            if toggleProperty then
+                local toggleValue = dcProps[toggleProperty]
+                if type(toggleValue) == "string" and toggleValue ~= "" then
+                    itemValue = toggleValue
+                end
+            end
+        end
+
+        -- Appearance label properties: elemText IS the label, value from god-object.
+        if not itemValue and dcProps then
+            local appearanceMapping = CC_APPEARANCE_LABEL_PROPERTIES[itemName]
+            if appearanceMapping then
+                local rawValue = dcProps[appearanceMapping.property]
+                if type(rawValue) == "string" and rawValue ~= "" then
+                    local displayValue = rawValue
+                    if appearanceMapping.transform then
+                        displayValue = appearanceMapping.transform(rawValue)
+                    end
+                    itemValue = displayValue
+                    Log.Debug("GetCCItemData: appearance label value: "
+                        .. itemName .. " -> " .. displayValue)
+                end
+            end
+        end
+
+        -- Bonus ability: append selected ability name for "+2 Bonus" items.
+        if itemName:find("Bonus", 1, true) and dcProps
+            and dcProps.SelectedBonusAbility then
+            itemName = itemName .. " to " .. dcProps.SelectedBonusAbility
+            Log.Debug("GetCCItemData: bonus ability: " .. itemName)
+        end
+
+        -- Summary stat labels: prepend static label for DC types with no name.
+        if focusedElement.dcType
+            and CC_SUMMARY_STAT_LABELS[focusedElement.dcType] then
+            local staticLabel = CC_SUMMARY_STAT_LABELS[focusedElement.dcType]
+            if staticLabel and staticLabel ~= "" and not itemValue then
+                -- The "name" is actually the value; rewrite as label + value.
+                itemValue = itemName
+                itemName = staticLabel
+            end
+        end
+
+        -- Suppress bare "0" values (selection indices, not game values).
+        if itemValue and itemValue == "0" then
+            Log.Debug("GetCCItemData: suppress bare zero value")
+            itemValue = nil
+        end
+    end
+
+    -- ----------------------------------------------------------------
+    -- 7. Description enrichment (API-first)
+    -- ----------------------------------------------------------------
+    if not itemDescription or itemDescription == "" then
+        itemDescription = nil  -- normalize empty string to nil
+
+        -- Deity detection: if lastMainTab isn't a known StaticData type
+        -- but the tab name IS a deity display name, fix it.
+        local effectiveMainTab = state.lastMainTab
+        if effectiveMainTab
+            and not CC_TAB_STATIC_DATA_TYPE[effectiveMainTab]
+            and GetStaticDataDescription("God", effectiveMainTab) then
+            effectiveMainTab = "Deity"
+        end
+
+        -- A. StaticData API via GetGodObjectDescription (primary).
+        --    Covers Race, Class, Subclass, Background, Deity, Origin, Feat.
+        if not itemDescription
+            and focusedElement.dcType == "gui::DCCharacterCreation"
+            and dcProps and effectiveMainTab then
+            itemDescription = GetGodObjectDescription(
+                dcProps, effectiveMainTab, itemName)
+        end
+
+        -- B. Feature/passive API via GetFeatureDescription.
+        --    Covers race/class features, proficiencies, Darkvision, etc.
+        if not itemDescription and focusedElement.dcType
+            and CC_FEATURE_DC_TYPES[focusedElement.dcType] then
+            local featureSuccess, featureDescription = pcall(
+                GetFeatureDescription, itemName, focusedElement.dcType)
+            if featureSuccess and featureDescription then
+                itemDescription = featureDescription
+                Log.Debug("GetCCItemData: feature desc: " .. itemName
+                    .. " -> " .. tostring(featureDescription):sub(1, 60))
+            end
+        end
+
+        -- C. Spell API via GetSpellDescription.
+        --    Covers spell buttons (Fire Bolt, etc.).
+        if not itemDescription and itemName
+            and focusedElement.elemType
+            and (focusedElement.elemType:find("LSButton", 1, true)
+                or focusedElement.elemType:find("spellButton", 1, true))
+            and itemName ~= "spell" then
+            local spellSuccess, spellDescription = pcall(
+                GetSpellDescription, itemName)
+            if spellSuccess and spellDescription then
+                itemDescription = spellDescription
+                Log.Debug("GetCCItemData: spell desc: " .. itemName
+                    .. " -> " .. tostring(spellDescription):sub(1, 60))
+            end
+        end
+
+        -- D. Last resort: selected element VM .Description property.
+        --    Only if all API lookups missed (Noesis pointer, least reliable).
+        if not itemDescription and snapshot.selectedElement
+            and snapshot.selectedElement.dcProps then
+            local vmDescription = snapshot.selectedElement.dcProps.Description
+            if type(vmDescription) == "string" and vmDescription ~= "" then
+                itemDescription = vmDescription
+            end
+        end
+    end
+
+    return itemName, itemValue, itemDescription
 end
 
 -- Format CC INPC value change.  Converts 0/1 to On/Off for known toggles.
@@ -1249,8 +1532,10 @@ local function HandleCCSnapshot(snapshot, state)
                 isScreenEntry = true
             end
         elseif selectedTabName
+            and not selectedTabName:find("^ListBoxItem:")
             and selectedTabName ~= state.lastSpokenTab then
-            -- Header carousel tab changed.
+            -- Header carousel tab changed (skip raw ListBoxItem indices
+            -- which are body type cycling on the Appearance page).
             isScreenEntry = true
         elseif not selectedSectionLabel and not selectedTabName then
             -- No recognized signals at all.  Catches pages like Appearance.
@@ -1268,6 +1553,19 @@ local function HandleCCSnapshot(snapshot, state)
         and focusedSectionLabel and focusedSectionLabel ~= state.lastSpokenTab then
         isScreenEntry = true
         Log.Info("CC section change detected: " .. tostring(focusedSectionLabel))
+    end
+
+    -- Appearance page detection: selectedTabName is "ListBoxItem: N"
+    -- which gets filtered above, so isScreenEntry is never set.  Detect
+    -- via the focused element's elemName containing "Appearance" or
+    -- "newRandom" (the Randomise button unique to the Appearance page).
+    if not isScreenEntry and snapshot.selectionChanged
+        and focusedElement.elemName
+        and (focusedElement.elemName:find("Appearance", 1, true)
+            or focusedElement.elemName:find("newRandom", 1, true))
+        and state.lastSpokenTab ~= "Appearance" then
+        isScreenEntry = true
+        Log.Info("CC Appearance page detected via elemName")
     end
 
     local isItemNav = snapshot.focusChanged
@@ -1338,6 +1636,8 @@ local function HandleCCSnapshot(snapshot, state)
             Log.Info("NAMING SCREEN: " .. speech)
             Ext.Tolk.Speak(speech, true)
             state.lastSpokenFullText = speech
+            state.lastSpokenName = elemId
+            state.lastSpokenItemName = "Naming"
             return
         end
     end
@@ -1370,6 +1670,7 @@ local function HandleCCSnapshot(snapshot, state)
 
         if carouselValue ~= state.lastSpokenFullText then
             state.lastSpokenFullText = carouselValue
+            state.lastSpokenName = elemId
             state.lastCarouselTick = Ext.Utils.MonotonicTime()
             Log.Info("CAROUSEL: " .. carouselValue)
             Ext.Tolk.Speak(carouselValue, true)
@@ -1389,86 +1690,30 @@ local function HandleCCSnapshot(snapshot, state)
     end
 
     if isValueOnly then
-        -- Try structured extraction first (Skill, Ability, Spell sub-table).
-        local splitName, splitValue, splitDesc = FormatCCDCTextSplit(focusedElement.dcProps)
-
-        -- Toggle items: read from god-object property by item name.
-        if not splitName and focusedElement.dcProps and focusedElement.elemText then
-            local toggleProperty = CC_TOGGLE_PROPERTIES[focusedElement.elemText]
-            if toggleProperty then
-                local toggleValue = focusedElement.dcProps[toggleProperty]
-                if type(toggleValue) == "string" and toggleValue ~= "" then
-                    splitName = toggleValue
-                end
-            end
-        end
-
-        -- Appearance label-based items: when the elemText is a label
-        -- like "Body Type", read the actual value from the god-object.
-        if not splitName and focusedElement.dcProps
-            and focusedElement.elemText then
-            local appearanceMapping = CC_APPEARANCE_LABEL_PROPERTIES[
-                focusedElement.elemText]
-            if appearanceMapping then
-                local rawValue = focusedElement.dcProps[
-                    appearanceMapping.property]
-                if type(rawValue) == "string" and rawValue ~= "" then
-                    local displayValue = rawValue
-                    if appearanceMapping.transform then
-                        displayValue = appearanceMapping.transform(rawValue)
-                    end
-                    splitName = displayValue
-                    Log.Info("APPEARANCE LABEL VALUE: "
-                        .. focusedElement.elemText .. " -> " .. displayValue)
-                end
-            end
-        end
-
-        -- Fallback: elemText changed (subrace cycling, race cycling, etc.).
-        if not splitName and focusedElement.elemText
-            and focusedElement.elemText ~= "" then
-            splitName = focusedElement.elemText
-        end
-
-        -- Ability Bonus cycling: read the selected ability name from the
-        -- C++ post-processed SelectedBonusAbility property.
-        if focusedElement.elemText
-            and focusedElement.elemText:find("Bonus", 1, true)
-            and focusedElement.dcProps
-            and focusedElement.dcProps.SelectedBonusAbility then
-            splitName = focusedElement.dcProps.SelectedBonusAbility
-            Log.Info("BONUS ABILITY: " .. splitName)
-        end
-
-        -- Deity detection for value-only path.
-        if state.lastMainTab
-            and not CC_TAB_STATIC_DATA_TYPE[state.lastMainTab]
-            and GetStaticDataDescription("God", state.lastMainTab) then
-            state.lastMainTab = "Deity"
-        end
-
-        -- God-object description: use lastMainTab to look up the
-        -- correct description via StaticData API, then sub-table
-        -- fallback, then Info scalar properties.
-        if splitName and not splitDesc
-            and focusedElement.dcType == "gui::DCCharacterCreation"
-            and focusedElement.dcProps
-            and state.lastMainTab then
-            local godDescription = GetGodObjectDescription(
-                focusedElement.dcProps, state.lastMainTab, splitName)
-            if godDescription and godDescription ~= "" then
-                splitDesc = godDescription
-            end
-        end
+        -- Unified extraction: GetCCItemData handles all value-only
+        -- extraction (structured, toggles, appearance, bonus ability,
+        -- deity detection, god-object description).
+        local valueName, valueValue, valueDescription = GetCCItemData(
+            focusedElement, snapshot, state, nil, false)
 
         -- Assemble and speak.
         local parts = {}
-        if splitName and splitName ~= "" then table.insert(parts, splitName) end
-        if splitValue and splitValue ~= "" then table.insert(parts, splitValue) end
-        if splitDesc and splitDesc ~= "" then table.insert(parts, splitDesc) end
+        if valueName and valueName ~= "" then
+            table.insert(parts, (valueName:gsub("%s+$", "")))
+        end
+        if valueValue and valueValue ~= "" then
+            table.insert(parts, (valueValue:gsub("%s+$", "")))
+        end
+        if valueDescription and valueDescription ~= "" then
+            table.insert(parts, (valueDescription:gsub("%s+$", "")))
+        end
         local fullText = table.concat(parts, ". ")
         if fullText ~= "" and fullText ~= state.lastSpokenFullText then
             state.lastSpokenFullText = fullText
+            state.lastSpokenName = elemId
+            if valueName and valueName ~= "" then
+                state.lastSpokenItemName = valueName
+            end
             Log.Info("VALUE: " .. fullText)
             Ext.Tolk.Speak(fullText, true)
         end
@@ -1480,7 +1725,6 @@ local function HandleCCSnapshot(snapshot, state)
     -- =================================================================
     local slots = {}
     local tabName = nil
-    local ccItemName = nil
 
     if isScreenEntry then
         -- ----- Derive tab name -----
@@ -1492,38 +1736,47 @@ local function HandleCCSnapshot(snapshot, state)
         -- over focusedSectionLabel ("Spell") for better labels.
         if not tabName and selectedSectionLabel then
             tabName = selectedSectionLabel
-            ccItemName = H.ExtractTextFromData(focusedElement, nil, false)
         end
         if not tabName and selectedTabName
             and not selectedTabName:find("^ListBoxItem:") then
             tabName = selectedTabName
-            ccItemName = H.ExtractTextFromData(focusedElement, nil, false)
         end
         if not tabName and focusedSectionLabel then
             tabName = focusedSectionLabel
-            ccItemName = H.ExtractTextFromData(focusedElement, nil, false)
         end
 
         -- Appearance page: no CC VM type, no recognized tab name.
-        -- Detect by the Randomise button's element name.
-        if not tabName and focusedElement.elemName
-            and focusedElement.elemName:find("Appearance", 1, true) then
-            tabName = "Appearance"
+        -- Detect by the Randomise button (unique to Appearance) or
+        -- by element names containing "Appearance".
+        if not tabName then
+            if focusedElement.elemName
+                and (focusedElement.elemName:find("Appearance", 1, true)
+                    or focusedElement.elemName:find("newRandom", 1, true)) then
+                tabName = "Appearance"
+            elseif focusedElement.elemText
+                and focusedElement.elemText == "Randomise" then
+                tabName = "Appearance"
+            end
         end
 
-        -- Dedup: skip if same tab.
+        -- Dedup: skip screen entry announcement if same tab, but DON'T
+        -- return — let the rest of the function handle value cycling.
         if tabName and tabName == state.lastSpokenTab then
             Log.Debug("SKIP CC screen entry (same tab): " .. tabName)
-            return
+            isScreenEntry = false
         end
 
         Log.Info("SCREEN ENTRY: tab=" .. tostring(tabName)
             .. " sel=" .. tostring(snapshot.selectionChanged)
             .. " widget=" .. tostring(snapshot.widgetAdded))
 
-        -- Update lastSpokenTab.
+        -- Update lastSpokenTab.  Never overwrite with nil — preserve
+        -- the previous value so pages without recognized tab names
+        -- (like Appearance) don't trigger first-entry logic repeatedly.
         local previousTab = state.lastSpokenTab
-        state.lastSpokenTab = tabName
+        if tabName then
+            state.lastSpokenTab = tabName
+        end
         state.lastSpokenItemName = nil  -- reset so label speaks on new page
         state.lastSpokenName = nil
 
@@ -1535,8 +1788,13 @@ local function HandleCCSnapshot(snapshot, state)
         -- domains instead of InfoClassDescription for the parent class.
         if snapshot.selectionChanged then
             state.lastMainTab = detectedSectionLabel or tabName
-        elseif focusedSectionLabel then
+        elseif snapshot.focusChanged then
+            -- If we focused a sub-section (Skills, Spell), use it.
+            -- If we focused the god-object wrapper (nil), fall back
+            -- to the currently selected carousel tab (Race, Class).
+            -- If both are nil, keep the current state.
             state.lastMainTab = focusedSectionLabel
+                or selectedSectionLabel or state.lastMainTab
         end
 
         -- Deity page detection: deity carousel items inherit the
@@ -1609,6 +1867,8 @@ local function HandleCCSnapshot(snapshot, state)
         end
 
         -- Tab hint: spoken once per tab on first visit.
+        -- Only fire on selection-based entry (bumper press), not on
+        -- focus-only section crossings (summary panel scrolling).
         local hintKey = tabName
         if not hintKey and detectedSectionLabel then
             hintKey = detectedSectionLabel
@@ -1617,7 +1877,8 @@ local function HandleCCSnapshot(snapshot, state)
             state.tabHintsSpoken = {}
         end
         if hintKey and state.tabHintsSpoken
-            and not state.tabHintsSpoken[hintKey] then
+            and not state.tabHintsSpoken[hintKey]
+            and snapshot.selectionChanged then
             local hint = CC_TAB_HINTS[hintKey]
             if hint then
                 state.tabHintsSpoken[hintKey] = true
@@ -1635,204 +1896,104 @@ local function HandleCCSnapshot(snapshot, state)
             state.lastSpokenTitle = "Character Creation"
             state.tabHintSpoken = true
             state.lastMainTab = detectedSectionLabel or tabName
+            state.lastSpokenName = elemId
             Log.Info("CC SLOTS: first entry, tab=" .. tostring(tabName))
             SpeakSlots(slots, state, true)
             return
         end
-    else
-        -- Item navigation: dedup check.
-        -- Skip dedup when valueChanged (DC swapped on recycled element,
-        -- e.g. skill proficiency items all share the same elemId but
-        -- have different dcProps).
-        if elemId == state.lastSpokenName and not hasCarousel
-            and not snapshot.valueChanged then
-            local text = H.ExtractTextFromData(focusedElement, state.lastSpokenTab, false)
-            if not text or text == state.lastSpokenFullText then
+    end
+
+    -- =================================================================
+    -- Unified item extraction: parse ONCE via GetCCItemData.
+    -- Both screen entry and item nav use the same result.
+    -- =================================================================
+    local effectiveTabForExtraction = tabName or state.lastSpokenTab
+    local itemName, itemValue, itemDesc = GetCCItemData(
+        focusedElement, snapshot, state, effectiveTabForExtraction,
+        isScreenEntry)
+
+    -- Item navigation dedup: same elemId and same extracted name.
+    -- Skip dedup when valueChanged (DC swapped on recycled element)
+    -- or when the value differs from what was last spoken (body type
+    -- cycling: same "Body Type" name but different value each time).
+    if isItemNav and elemId == state.lastSpokenName and not hasCarousel
+        and not snapshot.valueChanged then
+        local valueDiffers = itemValue
+            and itemValue ~= state.lastSpokenFullText
+        if not valueDiffers then
+            if not itemName or itemName == state.lastSpokenItemName
+                or itemName == state.lastSpokenFullText then
                 Log.Debug("DEDUP SKIP: " .. tostring(elemId))
                 return
             end
         end
     end
 
-    -- ----- Item extraction -----
-    local itemName = nil
-    local itemValue = nil
-    local itemDesc = nil
+    -- ----- Section header suppression -----
+    -- Applied to the parsed name, not re-extracted.  GetCCItemData
+    -- returns raw data; the handler decides what to suppress.
+    if itemName then
+        local effectiveTab = tabName or state.lastSpokenTab
+        local normalTab = effectiveTab
+            and H.NormalizeForCompare(effectiveTab) or ""
+        local normalItem = H.NormalizeForCompare(itemName)
 
-    -- Path 1: section label found -> ccItemName is the auto-focused item.
-    -- Suppress if it duplicates the tab name or is a section header
-    -- (e.g., "Skill Proficiency", "Cantrip").  These headers get brief
-    -- focus during page transitions but aren't actionable items.
-    if ccItemName and tabName then
-        local normalTab = H.NormalizeForCompare(tabName)
-        local normalItem = H.NormalizeForCompare(ccItemName)
-        if normalItem == normalTab then
-            ccItemName = nil
+        if normalTab ~= "" and normalItem == normalTab then
+            -- Name duplicates tab; suppress name but keep desc/value.
+            Log.Debug("SUPPRESS TAB DUP: " .. itemName)
+            itemName = nil
         elseif CC_SECTION_HEADERS[normalItem] then
-            Log.Debug("SUPPRESS HEADER: " .. ccItemName .. " on tab " .. tabName)
-            ccItemName = nil
-        elseif focusedSectionLabel and normalItem:find(normalTab, 1, true) then
-            -- Name restates the section header (e.g., contains "skills").
-            -- Suppress — the tab name already conveys the section.
-            Log.Debug("SUPPRESS SECTION RESTATE: " .. ccItemName
-                .. " tab=" .. tabName)
-            ccItemName = nil
+            -- Known section header (Skill Proficiency, Cantrip, Spell).
+            Log.Debug("SUPPRESS HEADER: " .. itemName)
+            itemName = nil
+        elseif isScreenEntry and focusedSectionLabel
+            and normalTab ~= "" and not itemValue
+            and normalItem:find(normalTab, 1, true) then
+            -- Name restates section header; suppress name but keep desc.
+            Log.Debug("SUPPRESS SECTION RESTATE: " .. itemName)
+            itemName = nil
         end
-    end
-    if ccItemName then
-        itemName = ccItemName
-        -- Try god-object description (sub-table or Info scalar).
-        if focusedElement.dcProps and tabName then
-            local godBody = GetGodObjectDescription(
-                focusedElement.dcProps, tabName, ccItemName)
-            if godBody and godBody ~= "" then
-                itemDesc = godBody
-            end
-        end
-        -- Fall back to selectedElement VM description.
-        if not itemDesc and snapshot.selectedElement
-            and snapshot.selectedElement.dcProps then
-            local vmDesc = snapshot.selectedElement.dcProps.Description
-            if type(vmDesc) == "string" and vmDesc ~= "" then
-                itemDesc = vmDesc
-            end
+
+        -- When name is suppressed but desc/value will still speak,
+        -- update state.lastSpokenName so the dedup check on the NEXT
+        -- element doesn't compare against the stale elemId from two
+        -- visits ago.  Without this, Custom->Origin(suppressed)->Custom
+        -- causes the second Custom to dedup-skip because
+        -- lastSpokenName still points at the first Custom's elemId.
+        if not itemName and (itemDesc or itemValue) then
+            state.lastSpokenName = elemId
+            state.lastSpokenItemName = nil
         end
     end
 
-    -- Path 2: CC-specific DC extraction (Skill, Ability, Spell).
-    if not itemName then
-        local splitName, splitValue, splitDesc = FormatCCDCTextSplit(focusedElement.dcProps)
-        -- Path 3: origin context (body type label, identity, origin desc).
-        if not splitName or splitName == "" then
-            splitName, splitValue, splitDesc = ExtractOriginContext(focusedElement)
-        end
-        -- Path 4: generic fallback.
-        if not splitName or splitName == "" then
-            splitName = H.FormatDCText(focusedElement.dcProps)
-        end
-        if not splitName or splitName == "" then
-            splitName = H.ExtractTextFromData(focusedElement, state.lastSpokenTab, isScreenEntry)
-        end
-        if splitName and splitName ~= "" then
-            -- Use lastSpokenTab for dedup (covers item nav where tabName is nil).
-            local effectiveTab = tabName or state.lastSpokenTab
-            local normalTab = effectiveTab and H.NormalizeForCompare(effectiveTab) or ""
-            local normalItem = H.NormalizeForCompare(splitName)
-            if normalTab ~= "" and normalItem == normalTab then
-                -- Name duplicates tab; keep desc/value but suppress name.
-            elseif CC_SECTION_HEADERS[normalItem] then
-                -- Known section header; suppress on screen entry.
-                Log.Debug("SUPPRESS HEADER (Path2): " .. splitName)
-            elseif isScreenEntry and focusedSectionLabel
-                and normalTab ~= "" and not splitValue
-                and normalItem:find(normalTab, 1, true) then
-                -- Name restates section header; suppress name but keep desc.
-                -- Description is baked into splitName (concatenated by
-                -- FormatCCDCTextSplit).  Extract it from dcProps directly.
-                -- When focused is null, C++ puts selected data into
-                -- focusedElement, so check there first.
-                if not splitDesc then
-                    local descSource = nil
-                    if focusedElement.dcProps
-                        and focusedElement.dcProps.Description then
-                        descSource = focusedElement.dcProps.Description
-                    elseif snapshot.selectedElement
-                        and snapshot.selectedElement.dcProps
-                        and snapshot.selectedElement.dcProps.Description then
-                        descSource = snapshot.selectedElement.dcProps.Description
-                    end
-                    if type(descSource) == "string" and descSource ~= "" then
-                        splitDesc = descSource
-                    end
-                end
-                Log.Debug("SUPPRESS SECTION RESTATE (Path2): " .. splitName)
-            else
-                itemName = splitName
-            end
-            itemValue = splitValue
-            itemDesc = splitDesc
-        end
-    end
-
-    -- God-object description for item nav (race/subrace/deity/domain).
-    -- Screen entry gets this via the ccItemName path; item nav needs it too.
-    if not itemDesc and itemName and not isScreenEntry
+    -- AUTO-RECOVERY: If lastMainTab points to a sub-section (Skills)
+    -- but we're focused on an item that matches a god-object selected
+    -- category (SelectedRace.Name == "Elf"), auto-correct lastMainTab.
+    -- This handles d-pad up from Skills back to the Race carousel
+    -- where focusedSectionLabel is nil (god-object DC) and
+    -- selectedSectionLabel is unavailable (no selection change).
+    if itemName and not isScreenEntry and isItemNav
         and focusedElement.dcType == "gui::DCCharacterCreation"
-        and focusedElement.dcProps
-        and state.lastMainTab then
-        local godDescription = GetGodObjectDescription(
-            focusedElement.dcProps, state.lastMainTab, itemName)
-        if godDescription and godDescription ~= "" then
-            itemDesc = godDescription
-        end
-    end
-
-    -- Spell description: look up from Ext.Stats when focused on a spell button.
-    if not itemDesc and itemName
-        and focusedElement.elemType
-        and (focusedElement.elemType:find("LSButton", 1, true)
-            or focusedElement.elemType:find("spellButton", 1, true))
-        and itemName ~= "spell" then
-        local spellSuccess, spellDesc = pcall(GetSpellDescription, itemName)
-        if spellSuccess and spellDesc then
-            itemDesc = spellDesc
-            Log.Debug("SPELL DESC: " .. itemName .. " -> " .. tostring(spellDesc):sub(1, 60))
-        end
-    end
-
-    -- Feature/passive description: look up from stats when focused on
-    -- a race/class feature (proficiencies, Darkvision, Rage, etc.).
-    if not itemDesc and itemName
-        and focusedElement.dcType
-        and CC_FEATURE_DC_TYPES[focusedElement.dcType] then
-        local featureSuccess, featureDesc = pcall(
-            GetFeatureDescription, itemName, focusedElement.dcType)
-        if featureSuccess and featureDesc then
-            itemDesc = featureDesc
-            Log.Debug("FEATURE DESC: " .. itemName .. " -> "
-                .. tostring(featureDesc):sub(1, 60))
-        end
-    end
-
-    -- Summary panel stat labels: items whose DC has only a value, no name.
-    -- Prepend a static label based on dcType (e.g., "Initiative: +1").
-    if itemName and focusedElement.dcType
-        and CC_SUMMARY_STAT_LABELS[focusedElement.dcType] then
-        local staticLabel = CC_SUMMARY_STAT_LABELS[focusedElement.dcType]
-        if staticLabel and staticLabel ~= "" and not itemValue then
-            -- The "name" is actually the value; rewrite as label + value.
-            itemValue = itemName
-            itemName = staticLabel
-        end
-    end
-
-    -- Ability Bonus: format as "+2 Bonus to Strength" instead of just "+2 Bonus".
-    if itemName and itemName:find("Bonus", 1, true)
-        and focusedElement.dcProps
-        and focusedElement.dcProps.SelectedBonusAbility then
-        itemName = itemName .. " to " .. focusedElement.dcProps.SelectedBonusAbility
-    end
-
-    -- Inline carousel value.
-    -- Suppress bare numeric carousel values (e.g. "0", "1") that are
-    -- selection indices rather than meaningful displayed values.  Real
-    -- carousel values like "Head 3" or "On" contain text, not just digits.
-    if hasCarousel then
-        local carouselValue = snapshot.inlineCarouselValue
-        if carouselValue and not carouselValue:match("^%d+$") then
-            itemValue = carouselValue
-        else
-            Log.Debug("SUPPRESS NUMERIC CAROUSEL: " .. tostring(carouselValue))
-        end
-    end
-
-    -- Toggle items (Heterochromia, Hide Clothes): read value from god-object.
-    if not itemValue and itemName and focusedElement.dcProps then
-        local toggleProperty = CC_TOGGLE_PROPERTIES[itemName]
-        if toggleProperty then
-            local toggleValue = focusedElement.dcProps[toggleProperty]
-            if type(toggleValue) == "string" and toggleValue ~= "" then
-                itemValue = toggleValue
+        and focusedElement.dcProps then
+        for recoveryTab, selectedPropKey
+            in pairs(CC_SELECTED_DESCRIPTION_KEYS) do
+            local selectedPropData =
+                focusedElement.dcProps[selectedPropKey]
+            if type(selectedPropData) == "table" then
+                local currentActiveName = selectedPropData.Name
+                    or selectedPropData.DisplayName
+                    or selectedPropData.Title
+                if currentActiveName and currentActiveName ~= ""
+                    and currentActiveName:lower()
+                    == itemName:lower() then
+                    if state.lastMainTab ~= recoveryTab then
+                        Log.Debug("AUTO-RECOVER lastMainTab: "
+                            .. tostring(state.lastMainTab) .. " -> "
+                            .. recoveryTab)
+                        state.lastMainTab = recoveryTab
+                    end
+                    break
+                end
             end
         end
     end
@@ -1857,50 +2018,11 @@ local function HandleCCSnapshot(snapshot, state)
         and itemName == state.lastSpokenItemName then
         -- Same label, different value -> speak value only.
         state.lastSpokenFullText = itemValue
+        state.lastSpokenName = elemId
+        state.lastSpokenItemName = itemName
         Log.Info("VALUE CYCLE: " .. itemValue)
         Ext.Tolk.Speak(itemValue, true)
         return
-    end
-
-    -- Suppress incomplete placeholder items like "(x2)" or "(x3)" that
-    -- appear briefly before the real DC loads on summary panel items.
-    -- The multiplication sign can be Unicode (U+00D7, 2 bytes) or ASCII.
-    -- Force a re-read so the real data speaks on the next tick.
-    if itemName then
-        local isPlaceholder = false
-        -- ASCII: "(x2)", "(X3)", etc.
-        if itemName:find("^%([xX]%d+%)$") then
-            isPlaceholder = true
-        end
-        -- Unicode: starts with "(" ends with ")", short, contains a digit
-        if not isPlaceholder and #itemName <= 8
-            and itemName:sub(1, 1) == "("
-            and itemName:sub(-1) == ")"
-            and itemName:find("%d") then
-            isPlaceholder = true
-        end
-        if isPlaceholder then
-            Log.Info("SUPPRESS PLACEHOLDER: " .. itemName
-                .. " (len=" .. #itemName .. ")")
-            -- Clear dedup state so the next INPC-triggered snapshot
-            -- with real data can speak without being suppressed.
-            -- The element already has an INPC subscription from C++;
-            -- when the DC property updates to the real value (e.g.,
-            -- "Rapiers" replacing "(x2)"), valueChanged=true fires
-            -- a new snapshot that Lua will process normally.
-            state.lastSpokenFullText = nil
-            state.lastSpokenName = nil
-            state.lastSpokenItemName = nil
-            return
-        end
-    end
-
-    -- Suppress bare "0" values that are selection indices rather than
-    -- meaningful game values.  Abilities and Skills use signed modifiers
-    -- ("+0", "-1") so they won't match the bare "0" check.
-    if itemValue and itemValue == "0" then
-        Log.Debug("SUPPRESS BARE ZERO VALUE: " .. tostring(itemName))
-        itemValue = nil
     end
 
     if itemName then
