@@ -1552,7 +1552,8 @@ local function SubscribeCCYButton(state)
         if not event.Pressed then return end
         if not state.inCharacterCreation then return end
         local buttonName = tostring(event.Button)
-        if buttonName == "Y" and state.lastMainTab ~= "Naming" then
+        if buttonName == "Y" and state.lastMainTab ~= "Naming"
+            and not state.inPostNamingCC then
             -- Y from any CC tab → forward to naming screen.
             -- Use lastMainTab (survives widget root resets) instead of
             -- lastSpokenTab (gets cleared on widget root change).
