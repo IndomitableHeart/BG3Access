@@ -1507,16 +1507,26 @@ local ccYButtonSubscription = nil
 local namingScreenWasSpoken = false
 
 local function SpeakNamingScreen(state)
-    -- Get character name from entity API.
+    -- Get character name from the correct source.
+    -- For origin characters: use SelectedOrigin.Name from the god-object
+    -- DC (tracked in state by HandleCCSnapshot).  The entity API's
+    -- CharacterName lags behind the UI carousel selection.
+    -- For custom characters: use the entity API (reflects renames).
     local characterName = nil
-    local namingSuccess, namingEntities = pcall(
-        Ext.Entity.GetAllEntitiesWithComponent,
-        "CCCharacterDefinition")
-    if namingSuccess and namingEntities and #namingEntities > 0 then
-        pcall(function()
-            characterName = namingEntities[1].CCCharacterDefinition
-                .Definition.Name
-        end)
+    if state.isCustomOrigin then
+        -- Custom: entity API has the renamed name (Big Pillow, etc.)
+        local namingSuccess, namingEntities = pcall(
+            Ext.Entity.GetAllEntitiesWithComponent,
+            "CCCharacterDefinition")
+        if namingSuccess and namingEntities and #namingEntities > 0 then
+            pcall(function()
+                characterName = namingEntities[1].CCCharacterDefinition
+                    .Definition.Name
+            end)
+        end
+    else
+        -- Origin character: use tracked SelectedOrigin.Name
+        characterName = state.selectedOriginName
     end
     if not characterName or characterName == ""
         or characterName:find("^%[%d+%]$") then
@@ -1662,6 +1672,21 @@ local function HandleCCSnapshot(snapshot, state)
     if not state.inCharacterCreation then
         state.inCharacterCreation = true
         SubscribeCCYButton(state)
+    end
+
+    -- Track the selected origin from the god-object DC.  The entity
+    -- API's CharacterName lags behind the UI carousel — SelectedOrigin
+    -- reflects what the game actually displays on the naming screen.
+    if focusedElement.dcProps
+        and focusedElement.dcType == "gui::DCCharacterCreation" then
+        local trackedOrigin = focusedElement.dcProps.SelectedOrigin
+        if type(trackedOrigin) == "table" then
+            state.selectedOriginName = trackedOrigin.Name
+                or trackedOrigin.DisplayName or trackedOrigin.Title
+            state.isCustomOrigin =
+                trackedOrigin.IsCustom == "On"
+                or trackedOrigin.IsCustom == true
+        end
     end
 
     -- Detect guardian CC: first real CC element after naming screen.

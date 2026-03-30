@@ -385,6 +385,14 @@ local function HandleTickSnapshot(snapshot)
         -- Reset dialog state when a non-dialog widget appears.
         if not CS.IsDialogOrCutscene(newDCType) then
             CS.ResetDialogState()
+            -- If returning to CC after a cutscene (e.g. origin preview),
+            -- reset speech state so the next snapshot triggers a clean entry.
+            if state.inCharacterCreation then
+                state.lastSpokenTab = nil
+                state.lastSpokenTitle = nil
+                state.lastSpokenName = nil
+                state.lastSpokenItemName = nil
+            end
         end
         -- Reset hint only when entering a genuinely different menu.
         -- Compare against BOTH currentWidgetDCType (for menus that
