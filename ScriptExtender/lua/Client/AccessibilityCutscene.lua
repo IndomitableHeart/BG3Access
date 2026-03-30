@@ -228,11 +228,11 @@ local AD_TRACKS = {
 
 -- Tracks whether AD has already played this session to avoid replaying
 -- on subsequent Running transitions (e.g. after a save/load cycle).
-local adPlayedThisSession = false
+local adPlayedThisSession = true
 
 -- Delay (ms) between the Running state and AD playback start.
 -- Tune this to align with the actual cutscene start.
-local AD_START_DELAY_MS = 1400
+local AD_START_DELAY_MS = 500
 
 -- Called from the Manager on every GameStateChanged event.
 local function HandleGameStateForAD(fromState, toState)

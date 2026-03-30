@@ -290,6 +290,18 @@ local function HandleTickSnapshot(snapshot)
     end
 
     local focusedElement = snapshot.focusedElement
+
+    -- =================================================================
+    -- CC dispatch (early): CC snapshots may lack elemType during rapid
+    -- focus bounces (e.g. guardian page entry).  Route to CC handler
+    -- before the elemType filter so they aren't dropped.
+    -- =================================================================
+    if focusedElement and not suppressSnapshots
+        and CC.IsCCSnapshot(snapshot) then
+        CC.HandleCCSnapshot(snapshot, state)
+        return
+    end
+
     if not focusedElement or not focusedElement.elemType then return end
 
     -- During loading states, only allow visual text (tips, splash screen).
@@ -410,13 +422,7 @@ local function HandleTickSnapshot(snapshot)
         Log.Info("Controller bindings interactive mode activated")
     end
 
-    -- =================================================================
-    -- CC dispatch: delegate to AccessibilityCC and return.
-    -- =================================================================
-    if CC.IsCCSnapshot(snapshot) then
-        CC.HandleCCSnapshot(snapshot, state)
-        return
-    end
+    -- CC dispatch already handled above (before elemType filter).
 
     -- =================================================================
     -- Dialog answer navigation: when focus changes within an active
@@ -716,6 +722,11 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     state.screenEntryJustSpoke = false
     state.currentWidgetDCType = nil
     state.previousWidgetDCType = nil
+    state.inCharacterCreation = false
+    state.inPostNamingCC = false
+    state.pendingTransition = nil
+    state.suppressGuardianTeardown = false
+    if CC and CC.UnsubscribeCCYButton then CC.UnsubscribeCCYButton() end
     lastWidgetRootStr = nil
     seenWidgetRoots = {}
     CS.ResetDialogState()

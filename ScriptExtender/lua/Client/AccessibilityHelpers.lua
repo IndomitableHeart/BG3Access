@@ -275,6 +275,57 @@ local function GetTranslatedStringIfHandle(textOrHandle, logContextStringOptiona
 end
 
 -- ---------------------------------------------------------------------------
+-- Diagnostic: dump UI widget info using safe Ext.UI bridge functions.
+-- Logs the topmost widget and focused element with DC type info.
+-- For full widget enumeration, use the C++ widget scan logs (Initial
+-- widget scan) which already iterate all widgets with SEH guards.
+-- Call from anywhere: H.DumpWidgets() or H.DumpWidgets("optional label")
+-- ---------------------------------------------------------------------------
+local function DumpWidgets(label)
+    local tag = label or "WIDGET DUMP"
+
+    -- Topmost widget via safe C++ function.
+    local topWidget = nil
+    pcall(function() topWidget = Ext.UI.GetTopmostWidget() end)
+    if topWidget then
+        local dcType = "(none)"
+        pcall(function()
+            local dataContext = topWidget.DataContext
+            if dataContext then
+                dcType = dataContext:GetClassType().TypeName or "(unknown)"
+            end
+        end)
+        local widgetName = "(unnamed)"
+        pcall(function() widgetName = topWidget.Name or "(unnamed)" end)
+        Log.Info(tag .. " topmost: name=" .. widgetName .. " DC=" .. dcType)
+    else
+        Log.Info(tag .. " topmost: nil")
+    end
+
+    -- Focused element via safe C++ function.
+    local focusedElement = nil
+    pcall(function() focusedElement = Ext.UI.GetFocusedElement() end)
+    if focusedElement then
+        local dcType = "(none)"
+        pcall(function()
+            local dataContext = focusedElement.DataContext
+            if dataContext then
+                dcType = dataContext:GetClassType().TypeName or "(unknown)"
+            end
+        end)
+        local elemName = "(unnamed)"
+        pcall(function() elemName = focusedElement.Name or "(unnamed)" end)
+        Log.Info(tag .. " focused: name=" .. elemName .. " DC=" .. dcType)
+    else
+        Log.Info(tag .. " focused: nil")
+    end
+
+    -- Force the C++ to re-scan widgets which logs all widget details.
+    pcall(function() Ext.UI.ForceGlobalFocusUpdate() end)
+    Log.Info(tag .. " forced widget re-scan (check C++ logs for full list)")
+end
+
+-- ---------------------------------------------------------------------------
 -- Exports
 -- ---------------------------------------------------------------------------
 BG3Access.Client.Helpers = {
@@ -289,4 +340,5 @@ BG3Access.Client.Helpers = {
     ExtractStatusText            = ExtractStatusText,
     ExtractTextFromData          = ExtractTextFromData,
     GetTranslatedStringIfHandle  = GetTranslatedStringIfHandle,
+    DumpWidgets                  = DumpWidgets,
 }

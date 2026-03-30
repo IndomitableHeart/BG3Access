@@ -102,6 +102,14 @@ local CC_ELEM_NAME_OVERRIDES = {
     ["newRandomAppearance"] = "Randomize your appearance",
 }
 
+-- Instructional speech for special interactive elements (text boxes,
+-- custom inputs) keyed by elemName.  When a focused element matches,
+-- the instruction is spoken and no further CC processing occurs.
+local CC_INTERACTIVE_INSTRUCTIONS = {
+    ["characterName"] = "Using your keyboard, type your character name"
+        .. " and press B to return to character creation.",
+}
+
 -- Toggle items on the Appearance page whose values come from
 -- god-object properties (not from the element's own DC).
 local CC_TOGGLE_PROPERTIES = {
@@ -154,17 +162,17 @@ local CC_SELECTED_DESCRIPTION_KEYS = {
 -- Tab hints: spoken once on first visit to each tab.  Combines what the
 -- page is for with navigation guidance where non-obvious.
 local CC_TAB_HINTS = {
-    ["Origin"] = "Choose your character origin. Custom lets you build from scratch. Other origins have preset backstories. D-pad left and right to browse origins. Press right trigger to see a summary of your character.",
-    ["Race"] = "Choose your race. Each has unique traits and proficiencies. D-pad left and right to browse races. D-pad down to see racial features. D-pad left or right from within the features list returns to the race selection.",
+    ["Origin"] = "You can choose to create a custom character and build from scratch, or you can choose a character with a preset backstory. D-pad left and right to cycle between custom and preset characters, and down to navigate content. Press right trigger to see a summary of your character.",
+    ["Race"] = "Choose your race. Each has unique traits and proficiencies. D-pad left and right to browse races. D-pad down to see racial features and skills. D-pad left or right from within the features list returns to the race selection.",
     ["Subrace"] = "Choose your subrace. D-pad left and right to browse subraces. D-pad down to see subrace features. D-pad left or right from within the features list returns to the subrace selection.",
     ["Class"] = "Choose your class. This determines your abilities, spells, and proficiencies. D-pad left and right to browse classes. D-pad down to see class features. D-pad left or right from within the features list returns to the class selection.",
     ["Background"] = "Choose your background. This affects your skill proficiencies and how characters react to you. D-pad left and right to browse backgrounds.",
     ["Abilities"] = nil,  -- handled separately with points remaining
     ["Skills"] = nil,  -- handled separately with instruction text
     ["Spell"] = "Change your cantrip selection by choosing from the spell list below. D-pad in all directions to navigate the spell grid. Cantrips don't use spell slots and can be cast at will.",
-    ["High Elf Cantrip"] = "Choose a cantrip from the list below. D-pad in all directions to navigate the spell grid. Cantrips don't use spell slots and can be cast at will.",
+    ["High Elf Cantrip"] = "This is the cantrip linked to your selected race. Cantrips don't use spell slots and can be cast at will.",
     ["Appearance"] = "Customize your character's appearance. D-pad up and down to navigate options. D-pad left and right to change values.",
-    ["Deity"] = "Choose your deity. D-pad left and right to browse deities.",
+    ["Deity"] = "Choose your deity. Use standard D-pad navigation to browse deities.",
     ["Subclass"] = "Choose your subclass. D-pad left and right to browse options.",
     ["Feat"] = "Choose a feat. Feats grant powerful new abilities and bonuses. D-pad left and right to browse feats.",
 }
@@ -1201,6 +1209,16 @@ local function GetCCItemData(focusedElement, snapshot, state, tabName,
             and dcProps and effectiveMainTab then
             itemDescription = GetGodObjectDescription(
                 dcProps, effectiveMainTab, itemName)
+            -- Inline carousel items (Race, Subrace on appearance page):
+            -- itemName is the label ("Race"), but the actual value to look
+            -- up is in the carousel value ("Drow").  Try that too.
+            if not itemDescription
+                and snapshot.inlineCarouselValue
+                and snapshot.inlineCarouselValue ~= "" then
+                itemDescription = GetGodObjectDescription(
+                    dcProps, effectiveMainTab,
+                    snapshot.inlineCarouselValue)
+            end
         end
 
         -- B. Feature/passive API via GetFeatureDescription.
@@ -1476,10 +1494,185 @@ local function DumpCCEntityComponents()
     Log.Info("=== END CC ENTITY DIAGNOSTIC ===")
 end
 
+-- ============================================================================
+-- CC Y-button subscription for naming screen detection
+-- ============================================================================
+-- The naming screen has no d-pad focusable elements (buttons map to
+-- controller inputs directly).  Instead of trying to detect it from
+-- snapshots (which look identical to transient empty-focus bounces),
+-- we detect the Y-button press directly and speak the naming screen
+-- from the controller input callback.  Deterministic, no timing.
+
+local ccYButtonSubscription = nil
+local namingScreenWasSpoken = false
+
+local function SpeakNamingScreen(state)
+    -- Get character name from entity API.
+    local characterName = nil
+    local namingSuccess, namingEntities = pcall(
+        Ext.Entity.GetAllEntitiesWithComponent,
+        "CCCharacterDefinition")
+    if namingSuccess and namingEntities and #namingEntities > 0 then
+        pcall(function()
+            characterName = namingEntities[1].CCCharacterDefinition
+                .Definition.Name
+        end)
+    end
+    if not characterName or characterName == ""
+        or characterName:find("^%[%d+%]$") then
+        characterName = "Tav"
+    end
+
+    state.lastSpokenTab = "Naming"
+    state.lastMainTab = "Naming"
+    namingScreenWasSpoken = true
+
+    local speech = "Enter Character Name. " .. characterName
+        .. ". Press A to rename. Press Y to choose guardian"
+    Log.Info("NAMING SCREEN: " .. speech)
+    Ext.Tolk.Speak(speech, true)
+    state.lastSpokenFullText = speech
+    state.lastSpokenName = ""
+    state.lastSpokenItemName = "Naming"
+end
+
+local function SubscribeCCYButton(state)
+    if ccYButtonSubscription then return end
+    ccYButtonSubscription = Ext.Events.ControllerButtonInput:Subscribe(function(event)
+        if not event.Pressed then return end
+        if not state.inCharacterCreation then return end
+        local buttonName = tostring(event.Button)
+        if buttonName == "Y" and state.lastMainTab ~= "Naming" then
+            -- Y from any CC tab → forward to naming screen.
+            -- Use lastMainTab (survives widget root resets) instead of
+            -- lastSpokenTab (gets cleared on widget root change).
+            -- Set lockout so snapshot handler drops lingering CC snapshots.
+            state.suppressGuardianTeardown = false
+            state.pendingTransition = "Naming"
+            Log.Debug("CC Y-button: transition to Naming")
+            SpeakNamingScreen(state)
+        elseif buttonName == "B" and state.lastMainTab == "Naming" then
+            -- B from naming screen or text input → back to main CC.
+            -- Set lockout so snapshot handler drops stale snapshots
+            -- until a real CC element arrives.
+            state.suppressGuardianTeardown = false
+            state.pendingTransition = "MainCC"
+            namingScreenWasSpoken = false
+            Log.Debug("CC B-button: transition from Naming to MainCC")
+        elseif buttonName == "B" and state.inPostNamingCC then
+            -- B from guardian CC → back to naming screen.
+            -- Suppress all CC snapshots until the next button press.
+            -- The naming screen has no detectable elements; stale guardian
+            -- snapshots keep firing during teardown.
+            state.suppressGuardianTeardown = true
+            state.inPostNamingCC = false
+            Log.Debug("CC B-button: transition from Guardian to Naming")
+            SpeakNamingScreen(state)
+        end
+    end)
+    Log.Debug("Subscribed CC Y-button listener")
+end
+
+local function UnsubscribeCCYButton()
+    if ccYButtonSubscription then
+        Ext.Events.ControllerButtonInput:Unsubscribe(ccYButtonSubscription)
+        ccYButtonSubscription = nil
+        Log.Debug("Unsubscribed CC Y-button listener")
+    end
+end
+
 -- Main CC handler.  Called by Manager when IsCCSnapshot returns true.
 -- state is a table reference to shared Manager state variables.
 local function HandleCCSnapshot(snapshot, state)
     local focusedElement = snapshot.focusedElement
+
+    -- =================================================================
+    -- Guardian teardown suppression: after B from guardian, suppress ALL
+    -- CC snapshots until the next button press (Y or B).  The naming
+    -- screen was already spoken by the B callback; these are stale
+    -- guardian elements being torn down by Noesis.
+    -- =================================================================
+    if state.suppressGuardianTeardown then
+        Log.Debug("SUPPRESS: dropping guardian teardown snapshot")
+        return
+    end
+
+
+    -- =================================================================
+    -- Transition lockout: when Y or B triggers a known screen change,
+    -- pendingTransition is set to the destination.  Drop all snapshots
+    -- until the UI catches up to that destination.  This prevents
+    -- lingering stale snapshots from interrupting the correct speech.
+    -- =================================================================
+    if state.pendingTransition then
+        local hasRealDCType = focusedElement.dcType
+            and focusedElement.dcType ~= "(none)"
+            and focusedElement.dcType ~= ""
+        if state.pendingTransition == "Naming" then
+            -- The naming screen was already spoken by the Y-button callback.
+            -- Drop empty snapshots (naming screen has no focusable elements).
+            -- Clear the lockout when a real element arrives (guardian page
+            -- or returning CC page) and fall through to process it.
+            if hasRealDCType then
+                state.pendingTransition = nil
+                state.lastSpokenTab = nil
+                -- Keep lastMainTab = "Naming" so guardian detection
+                -- (inPostNamingCC) can fire and B-handler works.
+                Log.Debug("LOCKOUT: cleared (real element arrived)")
+                -- Fall through to process this snapshot normally.
+            else
+                -- Empty snapshot during naming screen — nothing to process.
+                return
+            end
+        elseif state.pendingTransition == "MainCC" then
+            -- Waiting for main CC (real focused element).  Drop stale
+            -- naming/transition snapshots until a real CC element arrives.
+            if hasRealDCType then
+                state.pendingTransition = nil
+                state.lastMainTab = nil
+                state.lastSpokenTab = nil
+                state.inPostNamingCC = false
+                Log.Debug("LOCKOUT: arrived at MainCC (state reset)")
+                -- Fall through to process this snapshot normally.
+            else
+                Log.Debug("LOCKOUT: dropping snapshot (waiting for MainCC)")
+                return
+            end
+        end
+    end
+
+    -- Interactive element instructions: text boxes, custom inputs, etc.
+    -- Speak the instruction once and suppress all subsequent snapshots
+    -- for the same element (e.g. each keystroke fires a value change).
+    if focusedElement.elemName then
+        local instruction = CC_INTERACTIVE_INSTRUCTIONS[focusedElement.elemName]
+        if instruction then
+            if state.activeInstruction ~= focusedElement.elemName then
+                state.activeInstruction = focusedElement.elemName
+                Log.Info("CC INSTRUCTION: " .. focusedElement.elemName)
+                Ext.Tolk.Speak(instruction, true)
+            end
+            return
+        else
+            state.activeInstruction = nil
+        end
+    end
+
+    -- Mark that we're in CC and subscribe the Y/B button listener.
+    if not state.inCharacterCreation then
+        state.inCharacterCreation = true
+        SubscribeCCYButton(state)
+    end
+
+    -- Detect guardian CC: first real CC element after naming screen.
+    if not state.inPostNamingCC
+        and state.lastMainTab == "Naming"
+        and focusedElement.dcType
+        and focusedElement.dcType ~= "(none)"
+        and focusedElement.dcType ~= "" then
+        state.inPostNamingCC = true
+        Log.Debug("Guardian CC detected (post-naming)")
+    end
 
     -- Entity diagnostic disabled -- data collected 2026-03-27.
     -- See memory/project_cc_entity_components.md for results.
@@ -1574,72 +1767,14 @@ local function HandleCCSnapshot(snapshot, state)
     local isValueOnly = not isScreenEntry and not isItemNav
         and not isCarouselOnly and snapshot.valueChanged
 
+    -- Naming screen is handled directly by the Y-button callback
+    -- (SubscribeCCYButton / SpeakNamingScreen).  No snapshot detection
+    -- needed — the controller input event IS the signal.
+
     -- Nothing to do?
     if not isScreenEntry and not isItemNav
         and not isCarouselOnly and not isValueOnly then
         return
-    end
-
-    -- =================================================================
-    -- Naming screen: buttons are hardcoded to controller inputs (A, Y),
-    -- not d-pad navigable.  Detect via CC step and speak the screen
-    -- content using API data for the character name.
-    -- =================================================================
-    -- Naming screen: CharacterCreationStep becomes "Naming" once all
-    -- required pages are complete, and STAYS "Naming" even when bumping
-    -- back to earlier tabs.  So we can't use the step alone.  Instead,
-    -- detect the naming screen by: the focused element has NO focusable
-    -- items (elemId is empty or just "ContentControl::base"), isScreenEntry
-    -- fired, and we came from a regular CC tab (not already on Naming).
-    -- The naming page has only button-mapped actions (A=Rename, Y=Guardian),
-    -- nothing d-pad navigable.
-    if isScreenEntry and state.lastSpokenTab ~= "Naming"
-        and not selectedSectionLabel and not selectedTabName
-        and focusedElement.dcType == "gui::DCCharacterCreation"
-        and (not focusedElement.elemId or focusedElement.elemId == ""
-            or focusedElement.elemId == "ContentControl::base") then
-        -- Check that it's actually the naming screen by looking for
-        -- CharacterName in dcProps (only present on the naming page's
-        -- god-object, and the focused element has no meaningful content).
-        if focusedElement.dcProps
-            and focusedElement.dcProps.CharacterName then
-            state.lastSpokenTab = "Naming"
-            state.lastMainTab = "Naming"
-
-            -- Get character name from entity API (primary).
-            local characterName = nil
-            local entitySuccess, entities = pcall(
-                Ext.Entity.GetAllEntitiesWithComponent,
-                "CCCharacterDefinition")
-            if entitySuccess and entities and #entities > 0 then
-                pcall(function()
-                    characterName = entities[1].CCCharacterDefinition
-                        .Definition.Name
-                end)
-            end
-            -- God-object fallback, filtering placeholder strings.
-            if not characterName or characterName == ""
-                or characterName:find("^%[%d+%]$") then
-                local godName = focusedElement.dcProps.CharacterName
-                if godName and godName ~= ""
-                    and not godName:find("^%[%d+%]$") then
-                    characterName = godName
-                end
-            end
-            if not characterName or characterName == ""
-                or characterName:find("^%[%d+%]$") then
-                characterName = "Tav"
-            end
-
-            local speech = "Enter Character Name. " .. characterName
-                .. ". Press A to rename. Press Y to choose guardian"
-            Log.Info("NAMING SCREEN: " .. speech)
-            Ext.Tolk.Speak(speech, true)
-            state.lastSpokenFullText = speech
-            state.lastSpokenName = elemId
-            state.lastSpokenItemName = "Naming"
-            return
-        end
     end
 
     -- =================================================================
@@ -1672,7 +1807,7 @@ local function HandleCCSnapshot(snapshot, state)
             state.lastSpokenFullText = carouselValue
             state.lastSpokenName = elemId
             state.lastCarouselTick = Ext.Utils.MonotonicTime()
-            Log.Info("CAROUSEL: " .. carouselValue)
+                    Log.Info("CAROUSEL: " .. carouselValue)
             Ext.Tolk.Speak(carouselValue, true)
         end
         return
@@ -1711,7 +1846,7 @@ local function HandleCCSnapshot(snapshot, state)
         if fullText ~= "" and fullText ~= state.lastSpokenFullText then
             state.lastSpokenFullText = fullText
             state.lastSpokenName = elemId
-            if valueName and valueName ~= "" then
+                    if valueName and valueName ~= "" then
                 state.lastSpokenItemName = valueName
             end
             Log.Info("VALUE: " .. fullText)
@@ -1889,15 +2024,31 @@ local function HandleCCSnapshot(snapshot, state)
 
         -- First CC entry: natural introduction speech.
         if not previousTab then
-            slots["title"] = "Character Creation"
-            slots["hint"] = "You are on the " .. (tabName or "origin")
-                .. " page. Use bumpers to switch tabs."
-            slots["tabName"] = nil  -- suppress raw tab name
-            state.lastSpokenTitle = "Character Creation"
+            if namingScreenWasSpoken then
+                -- Guardian character creation entry (from naming screen).
+                slots["title"] = "Guardian Appearance"
+                slots["hint"] = "Choose your guardian's appearance."
+                    .. " D-pad up and down to browse options."
+                    .. " D-pad left and right to change values."
+                    .. " Press Y to venture forth and start the game."
+                    .. " Press B to return to character naming."
+                slots["tabName"] = nil
+                slots["body"] = nil  -- suppress regular Race tab hint
+                state.lastSpokenTitle = "Guardian Appearance"
+                namingScreenWasSpoken = false
+                Log.Info("CC SLOTS: guardian entry")
+            else
+                -- Main character creation entry.
+                slots["title"] = "Character Creation"
+                slots["hint"] = "You are on the " .. (tabName or "origin")
+                    .. " page. Use bumpers to switch tabs."
+                slots["tabName"] = nil
+                state.lastSpokenTitle = "Character Creation"
+                Log.Info("CC SLOTS: first entry, tab=" .. tostring(tabName))
+            end
             state.tabHintSpoken = true
             state.lastMainTab = detectedSectionLabel or tabName
             state.lastSpokenName = elemId
-            Log.Info("CC SLOTS: first entry, tab=" .. tostring(tabName))
             SpeakSlots(slots, state, true)
             return
         end
@@ -2020,7 +2171,7 @@ local function HandleCCSnapshot(snapshot, state)
         state.lastSpokenFullText = itemValue
         state.lastSpokenName = elemId
         state.lastSpokenItemName = itemName
-        Log.Info("VALUE CYCLE: " .. itemValue)
+            Log.Info("VALUE CYCLE: " .. itemValue)
         Ext.Tolk.Speak(itemValue, true)
         return
     end
@@ -2068,4 +2219,6 @@ BG3Access.Client.CC = {
     GetSectionLabel     = GetSectionLabel,
     GetBodyTypeName     = GetBodyTypeName,
     CC_SECTION_LABELS   = CC_SECTION_LABELS,
+    SubscribeCCYButton  = SubscribeCCYButton,
+    UnsubscribeCCYButton = UnsubscribeCCYButton,
 }
