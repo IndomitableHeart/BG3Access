@@ -157,9 +157,9 @@ end
 -- false = no hint.  Missing key = default hint.
 -- ---------------------------------------------------------------------------
 local MENU_HINTS = {
-    ["gui::DCOptions"]         = "Use bumpers to switch tabs, press down for content.",
-    ["gui::DCLobbyBrowser"]    = "Use bumpers to switch tabs, press down for content.",
-    ["gui::DCModBrowser"]      = "Use bumpers to switch tabs, press down for content.",
+    ["gui::DCOptions"]         = "Use LB and RB to switch tabs. Up and down cycles through options. Left and right changes values",
+    ["gui::DCLobbyBrowser"]    = "Use LB and RB to switch tabs, Up and down to explore lobbies",
+    ["gui::DCModBrowser"]      = "Use bumpers to switch tabs. Use up and down to cycle through items",
     ["gui::DCNewGameSettings"] = false,
     ["gui::DCDMSettings"]      = false,
     ["gui::VMPreset"]          = false,
@@ -299,6 +299,18 @@ local function HandleTickSnapshot(snapshot)
     if focusedElement and not suppressSnapshots
         and CC.IsCCSnapshot(snapshot) then
         CC.HandleCCSnapshot(snapshot, state)
+        return
+    end
+
+    -- =================================================================
+    -- Radial slot events (RT shortcuts menu, RB action radial).
+    -- Delegated to AccessibilityWorld module.
+    -- =================================================================
+    if snapshot.radialSlotChanged then
+        local World = BG3Access.Client.World
+        if World then
+            World.HandleRadialSlot(snapshot)
+        end
         return
     end
 
@@ -739,6 +751,8 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     seenWidgetRoots = {}
     CS.ResetDialogState()
     CS.HandleGameStateForAD(tostring(e.FromState), tostring(e.ToState))
+    local World = BG3Access.Client.World
+    if World then World.ResetState() end
     local toState = tostring(e.ToState)
     suppressSnapshots = LOADING_STATES[toState] or false
     SetupGlobalFocusMonitor()

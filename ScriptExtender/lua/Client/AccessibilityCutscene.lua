@@ -232,7 +232,7 @@ local adPlayedThisSession = true
 
 -- Delay (ms) between the Running state and AD playback start.
 -- Tune this to align with the actual cutscene start.
-local AD_START_DELAY_MS = 500
+local AD_START_DELAY_MS = 1500
 
 -- Called from the Manager on every GameStateChanged event.
 local function HandleGameStateForAD(fromState, toState)

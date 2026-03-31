@@ -165,7 +165,18 @@ local function FormatDCTextSplit(dcProps)
     local value = dcProps.Value
     local desc = dcProps.Description
 
-    if not text then text = dcProps.Title end
+    if not text and dcProps.Title then
+        text = dcProps.Title
+        -- Savegame items: append location and difficulty.
+        local levelName = dcProps.LevelName
+        if type(levelName) == "string" and levelName ~= "" then
+            text = text .. ", " .. levelName
+        end
+        local difficulty = dcProps.Difficulty
+        if type(difficulty) == "string" and difficulty ~= "" then
+            text = text .. ", " .. difficulty
+        end
+    end
     if not text and dcProps.Name then
         text = dcProps.Name
         local currentPlayers = dcProps.CurrentPlayers
@@ -326,6 +337,149 @@ local function DumpWidgets(label)
 end
 
 -- ---------------------------------------------------------------------------
+-- Stat description resolution (shared by CC and World modules).
+-- ---------------------------------------------------------------------------
+
+-- Level map values for description parameter resolution.
+-- Maps LevelMapValue keys to dice expressions.
+-- TODO: level-aware lookup based on character level (currently assumes level 1).
+local LEVEL_MAP_VALUES = {
+    ["D4Cantrip"]  = "1d4",
+    ["D6Cantrip"]  = "1d6",
+    ["D8Cantrip"]  = "1d8",
+    ["D10Cantrip"] = "1d10",
+    ["D12Cantrip"] = "1d12",
+    ["D4"]         = "1d4",
+    ["D6"]         = "1d6",
+    ["D8"]         = "1d8",
+    ["D10"]        = "1d10",
+    ["D12"]        = "1d12",
+}
+
+--- ParseDescriptionParam: extract a human-readable value from a
+--- DescriptionParams expression.
+--- E.g., "DealDamage(1d8,Necrotic)" -> "1d8 Necrotic damage"
+---       "ApplyStatus(BURNING,100,1)" -> "Burning"
+---       "RegainHitPoints(1d8)" -> "1d8"
+---       "LevelMapValue(D8Cantrip)" -> "1d8"
+---       "Distance(12)" -> "12m"
+local function ParseDescriptionParam(expression)
+    if not expression or expression == "" then return nil end
+
+    local dice, damageType = expression:match("DealDamage%(([^,]+),([^,)]+)")
+    if dice and damageType then
+        local levelMapKey = dice:match("LevelMapValue%(([^)]+)%)")
+        if levelMapKey and LEVEL_MAP_VALUES[levelMapKey] then
+            dice = LEVEL_MAP_VALUES[levelMapKey]
+        end
+        return dice .. " " .. damageType .. " damage"
+    end
+
+    local levelMapKey = expression:match("LevelMapValue%(([^)]+)%)")
+    if levelMapKey then
+        local resolved = LEVEL_MAP_VALUES[levelMapKey]
+        if resolved then return resolved end
+        return levelMapKey
+    end
+
+    local healDice = expression:match("RegainHitPoints%(([^)]+)%)")
+    if healDice then return healDice end
+
+    local statusName = expression:match("ApplyStatus%(([^,]+)")
+    if statusName then
+        return statusName:gsub("_", " "):lower():gsub("^%l", string.upper)
+    end
+
+    local distance = expression:match("Distance%(([^)]+)%)")
+    if distance then return distance .. "m" end
+
+    if expression:match("^%d+d?%d*$") then
+        return expression
+    end
+
+    return nil
+end
+
+--- ResolveDescriptionParams: replace [1], [2], etc. in a description
+--- using DescriptionParams from a stat entry.
+--- @param text string  The description text with [N] placeholders.
+--- @param stat table|nil  The stat object (for stat.DescriptionParams).
+--- @param paramsString string|nil  Direct params string override.
+--- @return string|nil  Text with params substituted.
+local function ResolveDescriptionParams(text, stat, paramsString)
+    if not text then return nil end
+    if not text:find("%[%d+%]") then return text end
+
+    local rawParams = paramsString
+    if not rawParams and stat then
+        local paramSuccess, paramValue = pcall(function()
+            return stat.DescriptionParams
+        end)
+        if paramSuccess and type(paramValue) == "string" then
+            rawParams = paramValue
+        end
+    end
+
+    local params = {}
+    if rawParams and rawParams ~= "" then
+        local index = 1
+        for param in rawParams:gmatch("[^;]+") do
+            local resolved = ParseDescriptionParam(
+                param:match("^%s*(.-)%s*$"))
+            if resolved then
+                params[index] = resolved
+            end
+            index = index + 1
+        end
+    end
+
+    local result = text:gsub("%[(%d+)%]", function(numStr)
+        local paramIndex = tonumber(numStr)
+        if paramIndex and params[paramIndex] then
+            return params[paramIndex]
+        end
+        return ""
+    end)
+
+    result = result:gsub("  +", " "):match("^%s*(.-)%s*$")
+    if result == "" then return nil end
+    return result
+end
+
+--- ReadStatDescription: safely read and resolve a stat entry's Description.
+--- Handles pcall, TranslatedString types (string/userdata/table),
+--- Loca resolution, and parameter substitution.
+--- @param stat table  A stat object from Ext.Stats.Get().
+--- @return string|nil  Resolved description text, or nil.
+local function ReadStatDescription(stat)
+    if not stat then return nil end
+    local propSuccess, propValue = pcall(function()
+        return stat.Description
+    end)
+    if not propSuccess or not propValue then return nil end
+
+    local handle = nil
+    if type(propValue) == "string" and propValue ~= "" then
+        handle = propValue
+    elseif type(propValue) == "userdata" then
+        local asString = tostring(propValue)
+        if asString and asString ~= "" then
+            handle = asString
+        end
+    elseif type(propValue) == "table" and propValue.Handle
+        and propValue.Handle.Handle then
+        handle = propValue.Handle.Handle
+    end
+    if handle then
+        local resolved = GetTranslatedStringIfHandle(handle)
+        if resolved and resolved ~= "" then
+            return ResolveDescriptionParams(resolved, stat)
+        end
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
 -- Exports
 -- ---------------------------------------------------------------------------
 BG3Access.Client.Helpers = {
@@ -341,4 +495,7 @@ BG3Access.Client.Helpers = {
     ExtractTextFromData          = ExtractTextFromData,
     GetTranslatedStringIfHandle  = GetTranslatedStringIfHandle,
     DumpWidgets                  = DumpWidgets,
+    ParseDescriptionParam        = ParseDescriptionParam,
+    ResolveDescriptionParams     = ResolveDescriptionParams,
+    ReadStatDescription          = ReadStatDescription,
 }

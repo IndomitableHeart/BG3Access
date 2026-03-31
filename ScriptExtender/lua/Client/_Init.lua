@@ -3,5 +3,6 @@ BG3Access.Shared.RequireFiles("Client/", {
 "AccessibilityHelpers",
 "AccessibilityCC",
 "AccessibilityCutscene",
+"AccessibilityWorld",
 "AccessibilityManager",
 })
