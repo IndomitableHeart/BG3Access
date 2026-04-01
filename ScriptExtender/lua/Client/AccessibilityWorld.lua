@@ -21,11 +21,22 @@ local Log = BG3Access.Client.Log
 local H = BG3Access.Client.Helpers
 
 -- ============================================================================
+-- Constants
+-- ============================================================================
+
+-- Spoken once when the radial first opens (first slot event after reset).
+local RADIAL_HINT = "A to select. X to customize. B to close."
+    .. " LB and RB switch between rings"
+
+-- ============================================================================
 -- State
 -- ============================================================================
 
--- No Lua-side dedup state needed -- C++ handles radial dedup via
--- pointer address comparison with center-rest reset.
+-- Hint spoken once per radial session (reset on GameStateChanged).
+local radialHintSpoken = false
+-- Tracks whether the radial is currently open (to distinguish fresh
+-- opens from LB/RB page switches within the radial).
+local inRadial = false
 
 -- ============================================================================
 -- Tag parsing
@@ -251,6 +262,37 @@ local function SpeakRadialSlot(slotData)
 end
 
 -- ============================================================================
+-- Radial open detection (called by Manager on VMHotBar focus change)
+-- ============================================================================
+
+--- HandleRadialOpen: speak the radial intro when focus first moves to the
+--- HotBar PageView.  Called by the Manager when it detects a focusChanged
+--- event on an element with dcType containing "VMHotBar".
+--- Suppressed when already inside the radial (LB/RB page switches cause
+--- focus changes to new PageView elements but are NOT fresh opens).
+--- Hint speaks on first open per gameplay session; subsequent opens speak
+--- just the title ("Action Radial").
+local function HandleRadialOpen()
+    if inRadial then return end
+    inRadial = true
+
+    local parts = { "Action Radial" }
+    if not radialHintSpoken then
+        radialHintSpoken = true
+        table.insert(parts, RADIAL_HINT)
+    end
+    local speech = table.concat(parts, ". ")
+    Log.Info("RADIAL OPEN: " .. speech)
+    Ext.Tolk.Speak(speech, true)
+end
+
+--- ClearRadialFocus: called by the Manager when focus moves to a
+--- non-radial element, indicating the radial has been closed.
+local function ClearRadialFocus()
+    inRadial = false
+end
+
+-- ============================================================================
 -- Entry point (called by AccessibilityManager)
 -- ============================================================================
 
@@ -266,7 +308,8 @@ end
 --- ResetState: clear radial tracking state.
 --- Called on GameStateChanged to prevent stale dedup across sessions.
 local function ResetState()
-    -- No Lua state to reset -- C++ handles all radial dedup.
+    radialHintSpoken = false
+    inRadial = false
 end
 
 -- ============================================================================
@@ -274,6 +317,8 @@ end
 -- ============================================================================
 
 BG3Access.Client.World = {
-    HandleRadialSlot = HandleRadialSlot,
-    ResetState       = ResetState,
+    HandleRadialOpen  = HandleRadialOpen,
+    ClearRadialFocus  = ClearRadialFocus,
+    HandleRadialSlot  = HandleRadialSlot,
+    ResetState        = ResetState,
 }

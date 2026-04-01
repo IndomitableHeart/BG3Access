@@ -8,7 +8,7 @@
 -- so it cannot affect other menus.
 --
 -- The Manager detects CC and delegates here via HandleCCSnapshot().
--- This module reads/writes shared state through a state table reference.
+-- This module owns its own state table (ccState) with no shared state coupling.
 
 local Log = BG3Access.Client.Log
 local H   = BG3Access.Client.Helpers
@@ -264,6 +264,31 @@ local CC_SUMMARY_STAT_LABELS = {
     ["ls.VMStat"]      = "Initiative",
     ["ls.VMRangeStat"] = "Hit Points",
     ["ls.VMClass"]     = "",  -- already has name ("Level 1 Barbarian")
+}
+
+-- ============================================================================
+-- CC-internal state (isolated from Manager and other handlers)
+-- ============================================================================
+local ccState = {
+    lastSpokenName           = nil,
+    lastSpokenFullText       = nil,
+    lastSpokenTab            = nil,
+    lastSpokenTitle          = nil,
+    lastSpokenItemName       = nil,
+    lastMainTab              = nil,
+    lastCarouselTick         = nil,
+    tabHintSpoken            = false,
+    tabHintsSpoken           = nil,
+    abilityHintSpoken        = false,
+    screenEntryJustSpoke     = false,
+    inCharacterCreation      = false,
+    inPostNamingCC           = false,
+    pendingTransition        = nil,
+    suppressGuardianTeardown = false,
+    activeInstruction        = nil,
+    selectedOriginName       = nil,
+    isCustomOrigin           = nil,
+    currentWidgetDCType      = nil,
 }
 
 -- ============================================================================
@@ -892,12 +917,11 @@ end
 -- Parameters:
 --   focusedElement  - the focused element data table
 --   snapshot        - full snapshot from C++
---   state           - shared Manager state (lastMainTab, etc.)
 --   tabName         - current tab name (may be nil for item nav)
 --   isScreenEntry   - boolean, passed to H.ExtractTextFromData
 --
 -- Returns: name, value, description (all strings or nil)
-local function GetCCItemData(focusedElement, snapshot, state, tabName,
+local function GetCCItemData(focusedElement, snapshot, tabName,
                              isScreenEntry)
     if not focusedElement then return nil, nil, nil end
 
@@ -941,7 +965,7 @@ local function GetCCItemData(focusedElement, snapshot, state, tabName,
     -- 5. H.ExtractTextFromData: visual text / elemText fallback.
     --    Pass the effective tab name for context.
     if not elementClaimed then
-        local effectiveTab = tabName or state.lastSpokenTab
+        local effectiveTab = tabName or ccState.lastSpokenTab
         itemName = H.ExtractTextFromData(
             focusedElement, effectiveTab, isScreenEntry)
         itemValue = nil
@@ -1016,6 +1040,17 @@ local function GetCCItemData(focusedElement, snapshot, state, tabName,
             end
         end
 
+        -- Slider setting value: dcProps.Value is only a concrete number
+        -- during INPC (val=1) snapshots -- the binding expression makes it
+        -- nil at initial focus.  H.FormatDCValue reads it the same way
+        -- the Menus pipeline does, restoring the value on left/right presses.
+        if not itemValue and focusedElement.dcType == "gui::VMSliderSetting" then
+            local sliderValue = H.FormatDCValue(dcProps)
+            if sliderValue and sliderValue ~= "" then
+                itemValue = sliderValue
+            end
+        end
+
         -- Bonus ability: append selected ability name for "+2 Bonus" items.
         if itemName:find("Bonus", 1, true) and dcProps
             and dcProps.SelectedBonusAbility then
@@ -1049,7 +1084,7 @@ local function GetCCItemData(focusedElement, snapshot, state, tabName,
 
         -- Deity detection: if lastMainTab isn't a known StaticData type
         -- but the tab name IS a deity display name, fix it.
-        local effectiveMainTab = state.lastMainTab
+        local effectiveMainTab = ccState.lastMainTab
         if effectiveMainTab
             and not CC_TAB_STATIC_DATA_TYPE[effectiveMainTab]
             and GetStaticDataDescription("God", effectiveMainTab) then
@@ -1171,6 +1206,18 @@ local function IsCCSnapshot(snapshot)
         return true
     end
 
+    -- Context fallback: if already in CC, any focused element with a real
+    -- DC type is a CC element.  Catches CC-internal VM types not in the
+    -- explicit tables above (e.g. gui::VMSliderSetting for Appearance
+    -- sliders, any other per-control VM types Larian adds).
+    -- Safe because dialog overlays and cutscene widgets are routed away
+    -- by the Manager before IsCCSnapshot is ever called.
+    if ccState.inCharacterCreation
+        and focusedElement.dcType
+        and focusedElement.dcType ~= "(none)" then
+        return true
+    end
+
     return false
 end
 
@@ -1178,34 +1225,6 @@ end
 -- CC Snapshot Handler
 -- ============================================================================
 
--- Shared speech slot assembly (same order as Manager).
-local SLOT_ORDER = { "title", "hint", "tabName", "body", "itemName", "itemValue", "itemDesc" }
-
-local function SpeakSlots(slots, state, isScreenEntry)
-    local parts = {}
-    for _, slotName in ipairs(SLOT_ORDER) do
-        local slotValue = slots[slotName]
-        if slotValue and slotValue ~= "" then
-            table.insert(parts, (slotValue:gsub("[%.%s]+$", "")))
-        end
-    end
-    if #parts == 0 then return end
-    local assembled = H.StripMarkupTags(table.concat(parts, ". "))
-    if not assembled or assembled == "" then return end
-
-    local interrupt = true
-    if state.screenEntryJustSpoke and not isScreenEntry then
-        interrupt = false
-        state.screenEntryJustSpoke = false
-    end
-    if isScreenEntry then
-        state.screenEntryJustSpoke = true
-    end
-
-    Log.Info("SPEAK" .. (interrupt and "" or " (append)") .. ": " .. assembled)
-    Ext.Tolk.Speak(assembled, interrupt)
-    state.lastSpokenFullText = assembled
-end
 
 -- One-shot diagnostic: dump CC entity components on first CC entry.
 -- Recurses into userdata/table fields up to maxDepth levels.
@@ -1360,14 +1379,14 @@ end
 local ccYButtonSubscription = nil
 local namingScreenWasSpoken = false
 
-local function SpeakNamingScreen(state)
+local function SpeakNamingScreen()
     -- Get character name from the correct source.
     -- For origin characters: use SelectedOrigin.Name from the god-object
-    -- DC (tracked in state by HandleCCSnapshot).  The entity API's
+    -- DC (tracked in ccState by HandleCCSnapshot).  The entity API's
     -- CharacterName lags behind the UI carousel selection.
     -- For custom characters: use the entity API (reflects renames).
     local characterName = nil
-    if state.isCustomOrigin then
+    if ccState.isCustomOrigin then
         -- Custom: entity API has the renamed name (Big Pillow, etc.)
         local namingSuccess, namingEntities = pcall(
             Ext.Entity.GetAllEntitiesWithComponent,
@@ -1380,59 +1399,59 @@ local function SpeakNamingScreen(state)
         end
     else
         -- Origin character: use tracked SelectedOrigin.Name
-        characterName = state.selectedOriginName
+        characterName = ccState.selectedOriginName
     end
     if not characterName or characterName == ""
         or characterName:find("^%[%d+%]$") then
         characterName = "Tav"
     end
 
-    state.lastSpokenTab = "Naming"
-    state.lastMainTab = "Naming"
+    ccState.lastSpokenTab = "Naming"
+    ccState.lastMainTab = "Naming"
     namingScreenWasSpoken = true
 
     local speech = "Enter Character Name. " .. characterName
         .. ". Press A to rename. Press Y to choose guardian"
     Log.Info("NAMING SCREEN: " .. speech)
     Ext.Tolk.Speak(speech, true)
-    state.lastSpokenFullText = speech
-    state.lastSpokenName = ""
-    state.lastSpokenItemName = "Naming"
+    ccState.lastSpokenFullText = speech
+    ccState.lastSpokenName = ""
+    ccState.lastSpokenItemName = "Naming"
 end
 
-local function SubscribeCCYButton(state)
+local function SubscribeCCYButton()
     if ccYButtonSubscription then return end
     ccYButtonSubscription = Ext.Events.ControllerButtonInput:Subscribe(function(event)
         if not event.Pressed then return end
-        if not state.inCharacterCreation then return end
+        if not ccState.inCharacterCreation then return end
         local buttonName = tostring(event.Button)
-        if buttonName == "Y" and state.lastMainTab ~= "Naming"
-            and not state.inPostNamingCC then
+        if buttonName == "Y" and ccState.lastMainTab ~= "Naming"
+            and not ccState.inPostNamingCC then
             -- Y from any CC tab → forward to naming screen.
             -- Use lastMainTab (survives widget root resets) instead of
             -- lastSpokenTab (gets cleared on widget root change).
             -- Set lockout so snapshot handler drops lingering CC snapshots.
-            state.suppressGuardianTeardown = false
-            state.pendingTransition = "Naming"
+            ccState.suppressGuardianTeardown = false
+            ccState.pendingTransition = "Naming"
             Log.Debug("CC Y-button: transition to Naming")
-            SpeakNamingScreen(state)
-        elseif buttonName == "B" and state.lastMainTab == "Naming" then
+            SpeakNamingScreen()
+        elseif buttonName == "B" and ccState.lastMainTab == "Naming" then
             -- B from naming screen or text input → back to main CC.
             -- Set lockout so snapshot handler drops stale snapshots
             -- until a real CC element arrives.
-            state.suppressGuardianTeardown = false
-            state.pendingTransition = "MainCC"
+            ccState.suppressGuardianTeardown = false
+            ccState.pendingTransition = "MainCC"
             namingScreenWasSpoken = false
             Log.Debug("CC B-button: transition from Naming to MainCC")
-        elseif buttonName == "B" and state.inPostNamingCC then
+        elseif buttonName == "B" and ccState.inPostNamingCC then
             -- B from guardian CC → back to naming screen.
             -- Suppress all CC snapshots until the next button press.
             -- The naming screen has no detectable elements; stale guardian
             -- snapshots keep firing during teardown.
-            state.suppressGuardianTeardown = true
-            state.inPostNamingCC = false
+            ccState.suppressGuardianTeardown = true
+            ccState.inPostNamingCC = false
             Log.Debug("CC B-button: transition from Guardian to Naming")
-            SpeakNamingScreen(state)
+            SpeakNamingScreen()
         end
     end)
     Log.Debug("Subscribed CC Y-button listener")
@@ -1446,9 +1465,43 @@ local function UnsubscribeCCYButton()
     end
 end
 
+--- ResetCCNavigation: clear CC navigation dedup state only.
+--- Defined before HandleCCSnapshot so it can be called on cutscene return.
+local function ResetCCNavigation()
+    ccState.lastSpokenTab = nil
+    ccState.lastSpokenTitle = nil
+    ccState.lastSpokenName = nil
+    ccState.lastSpokenItemName = nil
+end
+
+--- ResetCCState: clear all CC state.
+--- Defined before HandleCCSnapshot so it can be called on cutscene return.
+--- Also exported for Manager to call on GameStateChanged.
+local function ResetCCState()
+    ccState.lastSpokenName = nil
+    ccState.lastSpokenFullText = nil
+    ccState.lastSpokenTab = nil
+    ccState.lastSpokenTitle = nil
+    ccState.lastSpokenItemName = nil
+    ccState.lastMainTab = nil
+    ccState.lastCarouselTick = nil
+    ccState.tabHintSpoken = false
+    ccState.tabHintsSpoken = nil
+    ccState.abilityHintSpoken = false
+    ccState.screenEntryJustSpoke = false
+    ccState.inCharacterCreation = false
+    ccState.inPostNamingCC = false
+    ccState.pendingTransition = nil
+    ccState.suppressGuardianTeardown = false
+    ccState.activeInstruction = nil
+    ccState.selectedOriginName = nil
+    ccState.isCustomOrigin = nil
+    ccState.currentWidgetDCType = nil
+end
+
 -- Main CC handler.  Called by Manager when IsCCSnapshot returns true.
--- state is a table reference to shared Manager state variables.
-local function HandleCCSnapshot(snapshot, state)
+-- Uses module-level ccState for all CC-specific state.
+local function HandleCCSnapshot(snapshot)
     local focusedElement = snapshot.focusedElement
 
     -- =================================================================
@@ -1457,7 +1510,7 @@ local function HandleCCSnapshot(snapshot, state)
     -- screen was already spoken by the B callback; these are stale
     -- guardian elements being torn down by Noesis.
     -- =================================================================
-    if state.suppressGuardianTeardown then
+    if ccState.suppressGuardianTeardown then
         Log.Debug("SUPPRESS: dropping guardian teardown snapshot")
         return
     end
@@ -1469,18 +1522,18 @@ local function HandleCCSnapshot(snapshot, state)
     -- until the UI catches up to that destination.  This prevents
     -- lingering stale snapshots from interrupting the correct speech.
     -- =================================================================
-    if state.pendingTransition then
+    if ccState.pendingTransition then
         local hasRealDCType = focusedElement.dcType
             and focusedElement.dcType ~= "(none)"
             and focusedElement.dcType ~= ""
-        if state.pendingTransition == "Naming" then
+        if ccState.pendingTransition == "Naming" then
             -- The naming screen was already spoken by the Y-button callback.
             -- Drop empty snapshots (naming screen has no focusable elements).
             -- Clear the lockout when a real element arrives (guardian page
             -- or returning CC page) and fall through to process it.
             if hasRealDCType then
-                state.pendingTransition = nil
-                state.lastSpokenTab = nil
+                ccState.pendingTransition = nil
+                ccState.lastSpokenTab = nil
                 -- Keep lastMainTab = "Naming" so guardian detection
                 -- (inPostNamingCC) can fire and B-handler works.
                 Log.Debug("LOCKOUT: cleared (real element arrived)")
@@ -1489,14 +1542,14 @@ local function HandleCCSnapshot(snapshot, state)
                 -- Empty snapshot during naming screen — nothing to process.
                 return
             end
-        elseif state.pendingTransition == "MainCC" then
+        elseif ccState.pendingTransition == "MainCC" then
             -- Waiting for main CC (real focused element).  Drop stale
             -- naming/transition snapshots until a real CC element arrives.
             if hasRealDCType then
-                state.pendingTransition = nil
-                state.lastMainTab = nil
-                state.lastSpokenTab = nil
-                state.inPostNamingCC = false
+                ccState.pendingTransition = nil
+                ccState.lastMainTab = nil
+                ccState.lastSpokenTab = nil
+                ccState.inPostNamingCC = false
                 Log.Debug("LOCKOUT: arrived at MainCC (state reset)")
                 -- Fall through to process this snapshot normally.
             else
@@ -1512,21 +1565,21 @@ local function HandleCCSnapshot(snapshot, state)
     if focusedElement.elemName then
         local instruction = CC_INTERACTIVE_INSTRUCTIONS[focusedElement.elemName]
         if instruction then
-            if state.activeInstruction ~= focusedElement.elemName then
-                state.activeInstruction = focusedElement.elemName
+            if ccState.activeInstruction ~= focusedElement.elemName then
+                ccState.activeInstruction = focusedElement.elemName
                 Log.Info("CC INSTRUCTION: " .. focusedElement.elemName)
                 Ext.Tolk.Speak(instruction, true)
             end
             return
         else
-            state.activeInstruction = nil
+            ccState.activeInstruction = nil
         end
     end
 
     -- Mark that we're in CC and subscribe the Y/B button listener.
-    if not state.inCharacterCreation then
-        state.inCharacterCreation = true
-        SubscribeCCYButton(state)
+    if not ccState.inCharacterCreation then
+        ccState.inCharacterCreation = true
+        SubscribeCCYButton()
     end
 
     -- Track the selected origin from the god-object DC.  The entity
@@ -1536,21 +1589,21 @@ local function HandleCCSnapshot(snapshot, state)
         and focusedElement.dcType == "gui::DCCharacterCreation" then
         local trackedOrigin = focusedElement.dcProps.SelectedOrigin
         if type(trackedOrigin) == "table" then
-            state.selectedOriginName = trackedOrigin.Name
+            ccState.selectedOriginName = trackedOrigin.Name
                 or trackedOrigin.DisplayName or trackedOrigin.Title
-            state.isCustomOrigin =
+            ccState.isCustomOrigin =
                 trackedOrigin.IsCustom == "On"
                 or trackedOrigin.IsCustom == true
         end
     end
 
     -- Detect guardian CC: first real CC element after naming screen.
-    if not state.inPostNamingCC
-        and state.lastMainTab == "Naming"
+    if not ccState.inPostNamingCC
+        and ccState.lastMainTab == "Naming"
         and focusedElement.dcType
         and focusedElement.dcType ~= "(none)"
         and focusedElement.dcType ~= "" then
-        state.inPostNamingCC = true
+        ccState.inPostNamingCC = true
         Log.Debug("Guardian CC detected (post-naming)")
     end
 
@@ -1587,8 +1640,8 @@ local function HandleCCSnapshot(snapshot, state)
 
     Log.Info("CC CLASSIFY: selSec=" .. tostring(selectedSectionLabel)
         .. " selTab=" .. tostring(selectedTabName)
-        .. " lastTab=" .. tostring(state.lastSpokenTab)
-        .. " mainTab=" .. tostring(state.lastMainTab)
+        .. " lastTab=" .. tostring(ccState.lastSpokenTab)
+        .. " mainTab=" .. tostring(ccState.lastMainTab)
         .. " sel=" .. tostring(snapshot.selectionChanged)
         .. " foc=" .. tostring(snapshot.focusChanged))
     -- Diagnostic: log selectedElement dcType to discover unknown VM types.
@@ -1601,12 +1654,12 @@ local function HandleCCSnapshot(snapshot, state)
         -- Check known signals for tab switch vs in-page cycling.
         if selectedSectionLabel then
             -- Known CC VM type: same section = in-page, different = tab switch.
-            if selectedSectionLabel ~= state.lastSpokenTab then
+            if selectedSectionLabel ~= ccState.lastSpokenTab then
                 isScreenEntry = true
             end
         elseif selectedTabName
             and not selectedTabName:find("^ListBoxItem:")
-            and selectedTabName ~= state.lastSpokenTab then
+            and selectedTabName ~= ccState.lastSpokenTab then
             -- Header carousel tab changed (skip raw ListBoxItem indices
             -- which are body type cycling on the Appearance page).
             isScreenEntry = true
@@ -1623,7 +1676,7 @@ local function HandleCCSnapshot(snapshot, state)
     -- Section-change detection: focus moves to an element whose section
     -- label differs from lastSpokenTab (e.g. Spell page buttons).
     if not isScreenEntry and snapshot.focusChanged
-        and focusedSectionLabel and focusedSectionLabel ~= state.lastSpokenTab then
+        and focusedSectionLabel and focusedSectionLabel ~= ccState.lastSpokenTab then
         isScreenEntry = true
         Log.Info("CC section change detected: " .. tostring(focusedSectionLabel))
     end
@@ -1636,7 +1689,7 @@ local function HandleCCSnapshot(snapshot, state)
         and focusedElement.elemName
         and (focusedElement.elemName:find("Appearance", 1, true)
             or focusedElement.elemName:find("newRandom", 1, true))
-        and state.lastSpokenTab ~= "Appearance" then
+        and ccState.lastSpokenTab ~= "Appearance" then
         isScreenEntry = true
         Log.Info("CC Appearance page detected via elemName")
     end
@@ -1664,13 +1717,13 @@ local function HandleCCSnapshot(snapshot, state)
         local carouselValue = snapshot.inlineCarouselValue
 
         -- Append description via StaticData API for tabs that have one.
-        local effectiveTab = state.lastMainTab or state.lastSpokenTab
+        local effectiveTab = ccState.lastMainTab or ccState.lastSpokenTab
         -- Deity detection: tab name is a deity name, not "Deity".
         if effectiveTab
             and not CC_TAB_STATIC_DATA_TYPE[effectiveTab]
             and GetStaticDataDescription("God", effectiveTab) then
             effectiveTab = "Deity"
-            state.lastMainTab = "Deity"
+            ccState.lastMainTab = "Deity"
         end
         if effectiveTab
             and CC_TAB_STATIC_DATA_TYPE[effectiveTab]
@@ -1683,10 +1736,10 @@ local function HandleCCSnapshot(snapshot, state)
             end
         end
 
-        if carouselValue ~= state.lastSpokenFullText then
-            state.lastSpokenFullText = carouselValue
-            state.lastSpokenName = elemId
-            state.lastCarouselTick = Ext.Utils.MonotonicTime()
+        if carouselValue ~= ccState.lastSpokenFullText then
+            ccState.lastSpokenFullText = carouselValue
+            ccState.lastSpokenName = elemId
+            ccState.lastCarouselTick = Ext.Utils.MonotonicTime()
                     Log.Info("CAROUSEL: " .. carouselValue)
             Ext.Tolk.Speak(carouselValue, true)
         end
@@ -1696,8 +1749,8 @@ local function HandleCCSnapshot(snapshot, state)
     -- Suppress value-only events that immediately follow a carousel event
     -- on the same element (e.g., Face carousel fires "Head 3", then a
     -- stale value event fires just "Face" and interrupts).
-    if isValueOnly and state.lastCarouselTick then
-        local elapsed = Ext.Utils.MonotonicTime() - state.lastCarouselTick
+    if isValueOnly and ccState.lastCarouselTick then
+        local elapsed = Ext.Utils.MonotonicTime() - ccState.lastCarouselTick
         if elapsed < 200 then
             Log.Debug("SUPPRESS POST-CAROUSEL VALUE: " .. tostring(focusedElement.elemText))
             return
@@ -1709,25 +1762,34 @@ local function HandleCCSnapshot(snapshot, state)
         -- extraction (structured, toggles, appearance, bonus ability,
         -- deity detection, god-object description).
         local valueName, valueValue, valueDescription = GetCCItemData(
-            focusedElement, snapshot, state, nil, false)
+            focusedElement, snapshot, nil, false)
 
-        -- Assemble and speak.
-        local parts = {}
-        if valueName and valueName ~= "" then
-            table.insert(parts, (valueName:gsub("%s+$", "")))
+        -- Slider settings: speak only the changing number, not the name.
+        -- The name was already spoken when focus arrived (isItemNav path).
+        -- Repeating it on every left/right press is too verbose.
+        local fullText
+        if focusedElement.dcType == "gui::VMSliderSetting"
+            and valueValue and valueValue ~= "" then
+            fullText = valueValue
+        else
+            local parts = {}
+            if valueName and valueName ~= "" then
+                table.insert(parts, (valueName:gsub("%s+$", "")))
+            end
+            if valueValue and valueValue ~= "" then
+                table.insert(parts, (valueValue:gsub("%s+$", "")))
+            end
+            if valueDescription and valueDescription ~= "" then
+                table.insert(parts, (valueDescription:gsub("%s+$", "")))
+            end
+            fullText = table.concat(parts, ". ")
         end
-        if valueValue and valueValue ~= "" then
-            table.insert(parts, (valueValue:gsub("%s+$", "")))
-        end
-        if valueDescription and valueDescription ~= "" then
-            table.insert(parts, (valueDescription:gsub("%s+$", "")))
-        end
-        local fullText = table.concat(parts, ". ")
-        if fullText ~= "" and fullText ~= state.lastSpokenFullText then
-            state.lastSpokenFullText = fullText
-            state.lastSpokenName = elemId
-                    if valueName and valueName ~= "" then
-                state.lastSpokenItemName = valueName
+
+        if fullText ~= "" and fullText ~= ccState.lastSpokenFullText then
+            ccState.lastSpokenFullText = fullText
+            ccState.lastSpokenName = elemId
+            if valueName and valueName ~= "" then
+                ccState.lastSpokenItemName = valueName
             end
             Log.Info("VALUE: " .. fullText)
             Ext.Tolk.Speak(fullText, true)
@@ -1776,7 +1838,7 @@ local function HandleCCSnapshot(snapshot, state)
 
         -- Dedup: skip screen entry announcement if same tab, but DON'T
         -- return — let the rest of the function handle value cycling.
-        if tabName and tabName == state.lastSpokenTab then
+        if tabName and tabName == ccState.lastSpokenTab then
             Log.Debug("SKIP CC screen entry (same tab): " .. tabName)
             isScreenEntry = false
         end
@@ -1788,12 +1850,12 @@ local function HandleCCSnapshot(snapshot, state)
         -- Update lastSpokenTab.  Never overwrite with nil — preserve
         -- the previous value so pages without recognized tab names
         -- (like Appearance) don't trigger first-entry logic repeatedly.
-        local previousTab = state.lastSpokenTab
+        local previousTab = ccState.lastSpokenTab
         if tabName then
-            state.lastSpokenTab = tabName
+            ccState.lastSpokenTab = tabName
         end
-        state.lastSpokenItemName = nil  -- reset so label speaks on new page
-        state.lastSpokenName = nil
+        ccState.lastSpokenItemName = nil  -- reset so label speaks on new page
+        ccState.lastSpokenName = nil
 
         -- Track main RB tab separately from lastSpokenTab.
         -- Update on RB tab switches (selectionChanged=true) and on
@@ -1802,14 +1864,14 @@ local function HandleCCSnapshot(snapshot, state)
         -- lookups read the correct source: e.g. SelectedSubClass for
         -- domains instead of InfoClassDescription for the parent class.
         if snapshot.selectionChanged then
-            state.lastMainTab = detectedSectionLabel or tabName
+            ccState.lastMainTab = detectedSectionLabel or tabName
         elseif snapshot.focusChanged then
             -- If we focused a sub-section (Skills, Spell), use it.
             -- If we focused the god-object wrapper (nil), fall back
             -- to the currently selected carousel tab (Race, Class).
-            -- If both are nil, keep the current state.
-            state.lastMainTab = focusedSectionLabel
-                or selectedSectionLabel or state.lastMainTab
+            -- If both are nil, keep the current ccState.
+            ccState.lastMainTab = focusedSectionLabel
+                or selectedSectionLabel or ccState.lastMainTab
         end
 
         -- Deity page detection: deity carousel items inherit the
@@ -1817,10 +1879,10 @@ local function HandleCCSnapshot(snapshot, state)
         -- so detectedSectionLabel is always nil.  Instead, check if the
         -- tab name is actually a deity display name from the StaticData
         -- cache.  If so, this is the deity page.
-        if state.lastMainTab
-            and not CC_TAB_STATIC_DATA_TYPE[state.lastMainTab]
-            and GetStaticDataDescription("God", state.lastMainTab) then
-            state.lastMainTab = "Deity"
+        if ccState.lastMainTab
+            and not CC_TAB_STATIC_DATA_TYPE[ccState.lastMainTab]
+            and GetStaticDataDescription("God", ccState.lastMainTab) then
+            ccState.lastMainTab = "Deity"
             if tabName and not CC_TAB_STATIC_DATA_TYPE[tabName] then
                 tabName = "Deity"
             end
@@ -1828,7 +1890,7 @@ local function HandleCCSnapshot(snapshot, state)
 
         -- ----- Title -----
         local screenTitle = nil
-        local effectiveDCType = state.currentWidgetDCType
+        local effectiveDCType = ccState.currentWidgetDCType
             or focusedElement.dcType
             or (snapshot.widgetData and snapshot.widgetData.dcType)
         if effectiveDCType == "gui::DCCharacterCreation" then
@@ -1839,17 +1901,17 @@ local function HandleCCSnapshot(snapshot, state)
             and H.NormalizeForCompare(screenTitle) == normalTab then
             screenTitle = nil
         end
-        if screenTitle and screenTitle == state.lastSpokenTitle then
+        if screenTitle and screenTitle == ccState.lastSpokenTitle then
             screenTitle = nil
         end
         if screenTitle then
-            state.lastSpokenTitle = screenTitle
+            ccState.lastSpokenTitle = screenTitle
             slots["title"] = screenTitle
         end
 
         -- ----- Hint -----
-        if not state.tabHintSpoken then
-            state.tabHintSpoken = true
+        if not ccState.tabHintSpoken then
+            ccState.tabHintSpoken = true
             slots["hint"] = "Use bumpers to switch tabs."
         end
 
@@ -1867,8 +1929,8 @@ local function HandleCCSnapshot(snapshot, state)
         -- Abilities page: speak points remaining and first-time rules hint.
         if tabName == "Abilities" and focusedElement.dcProps then
             local bodyParts = {}
-            if not state.abilityHintSpoken then
-                state.abilityHintSpoken = true
+            if not ccState.abilityHintSpoken then
+                ccState.abilityHintSpoken = true
                 table.insert(bodyParts,
                     "Every 2 points above 10 gives plus 1 to related rolls")
             end
@@ -1888,15 +1950,15 @@ local function HandleCCSnapshot(snapshot, state)
         if not hintKey and detectedSectionLabel then
             hintKey = detectedSectionLabel
         end
-        if hintKey and not state.tabHintsSpoken then
-            state.tabHintsSpoken = {}
+        if hintKey and not ccState.tabHintsSpoken then
+            ccState.tabHintsSpoken = {}
         end
-        if hintKey and state.tabHintsSpoken
-            and not state.tabHintsSpoken[hintKey]
+        if hintKey and ccState.tabHintsSpoken
+            and not ccState.tabHintsSpoken[hintKey]
             and snapshot.selectionChanged then
             local hint = CC_TAB_HINTS[hintKey]
             if hint then
-                state.tabHintsSpoken[hintKey] = true
+                ccState.tabHintsSpoken[hintKey] = true
                 slots["body"] = hint
                 Log.Info("TAB HINT: " .. hintKey .. " -> " .. hint:sub(1, 60))
             end
@@ -1914,7 +1976,7 @@ local function HandleCCSnapshot(snapshot, state)
                     .. " Press B to return to character naming."
                 slots["tabName"] = nil
                 slots["body"] = nil  -- suppress regular Race tab hint
-                state.lastSpokenTitle = "Guardian Appearance"
+                ccState.lastSpokenTitle = "Guardian Appearance"
                 namingScreenWasSpoken = false
                 Log.Info("CC SLOTS: guardian entry")
             else
@@ -1923,13 +1985,13 @@ local function HandleCCSnapshot(snapshot, state)
                 slots["hint"] = "You are on the " .. (tabName or "origin")
                     .. " page. Use bumpers to switch tabs."
                 slots["tabName"] = nil
-                state.lastSpokenTitle = "Character Creation"
+                ccState.lastSpokenTitle = "Character Creation"
                 Log.Info("CC SLOTS: first entry, tab=" .. tostring(tabName))
             end
-            state.tabHintSpoken = true
-            state.lastMainTab = detectedSectionLabel or tabName
-            state.lastSpokenName = elemId
-            SpeakSlots(slots, state, true)
+            ccState.tabHintSpoken = true
+            ccState.lastMainTab = detectedSectionLabel or tabName
+            ccState.lastSpokenName = elemId
+            H.SpeakSlots(slots, ccState, true)
             return
         end
     end
@@ -1938,22 +2000,22 @@ local function HandleCCSnapshot(snapshot, state)
     -- Unified item extraction: parse ONCE via GetCCItemData.
     -- Both screen entry and item nav use the same result.
     -- =================================================================
-    local effectiveTabForExtraction = tabName or state.lastSpokenTab
+    local effectiveTabForExtraction = tabName or ccState.lastSpokenTab
     local itemName, itemValue, itemDesc = GetCCItemData(
-        focusedElement, snapshot, state, effectiveTabForExtraction,
+        focusedElement, snapshot, effectiveTabForExtraction,
         isScreenEntry)
 
     -- Item navigation dedup: same elemId and same extracted name.
     -- Skip dedup when valueChanged (DC swapped on recycled element)
     -- or when the value differs from what was last spoken (body type
     -- cycling: same "Body Type" name but different value each time).
-    if isItemNav and elemId == state.lastSpokenName and not hasCarousel
+    if isItemNav and elemId == ccState.lastSpokenName and not hasCarousel
         and not snapshot.valueChanged then
         local valueDiffers = itemValue
-            and itemValue ~= state.lastSpokenFullText
+            and itemValue ~= ccState.lastSpokenFullText
         if not valueDiffers then
-            if not itemName or itemName == state.lastSpokenItemName
-                or itemName == state.lastSpokenFullText then
+            if not itemName or itemName == ccState.lastSpokenItemName
+                or itemName == ccState.lastSpokenFullText then
                 Log.Debug("DEDUP SKIP: " .. tostring(elemId))
                 return
             end
@@ -1964,7 +2026,7 @@ local function HandleCCSnapshot(snapshot, state)
     -- Applied to the parsed name, not re-extracted.  GetCCItemData
     -- returns raw data; the handler decides what to suppress.
     if itemName then
-        local effectiveTab = tabName or state.lastSpokenTab
+        local effectiveTab = tabName or ccState.lastSpokenTab
         local normalTab = effectiveTab
             and H.NormalizeForCompare(effectiveTab) or ""
         local normalItem = H.NormalizeForCompare(itemName)
@@ -1986,14 +2048,14 @@ local function HandleCCSnapshot(snapshot, state)
         end
 
         -- When name is suppressed but desc/value will still speak,
-        -- update state.lastSpokenName so the dedup check on the NEXT
+        -- update ccState.lastSpokenName so the dedup check on the NEXT
         -- element doesn't compare against the stale elemId from two
         -- visits ago.  Without this, Custom->Origin(suppressed)->Custom
         -- causes the second Custom to dedup-skip because
         -- lastSpokenName still points at the first Custom's elemId.
         if not itemName and (itemDesc or itemValue) then
-            state.lastSpokenName = elemId
-            state.lastSpokenItemName = nil
+            ccState.lastSpokenName = elemId
+            ccState.lastSpokenItemName = nil
         end
     end
 
@@ -2017,11 +2079,11 @@ local function HandleCCSnapshot(snapshot, state)
                 if currentActiveName and currentActiveName ~= ""
                     and currentActiveName:lower()
                     == itemName:lower() then
-                    if state.lastMainTab ~= recoveryTab then
+                    if ccState.lastMainTab ~= recoveryTab then
                         Log.Debug("AUTO-RECOVER lastMainTab: "
-                            .. tostring(state.lastMainTab) .. " -> "
+                            .. tostring(ccState.lastMainTab) .. " -> "
                             .. recoveryTab)
-                        state.lastMainTab = recoveryTab
+                        ccState.lastMainTab = recoveryTab
                     end
                     break
                 end
@@ -2031,9 +2093,9 @@ local function HandleCCSnapshot(snapshot, state)
 
     -- Cross-element dedup.
     if isItemNav and itemName and not itemDesc and not itemValue
-        and state.lastSpokenFullText then
+        and ccState.lastSpokenFullText then
         local normalItem = H.NormalizeForCompare(itemName)
-        local normalLast = H.NormalizeForCompare(state.lastSpokenFullText)
+        local normalLast = H.NormalizeForCompare(ccState.lastSpokenFullText)
         if normalItem == normalLast
             or (normalLast:sub(-#normalItem) == normalItem) then
             Log.Debug("DEDUP SKIP (cross-element): " .. tostring(itemName))
@@ -2045,22 +2107,22 @@ local function HandleCCSnapshot(snapshot, state)
     -- left/right on Body Type), suppress the label and speak only the
     -- new value.  Mimics Options menu behavior (label on first visit,
     -- value-only on subsequent changes).
-    if itemName and itemValue and state.lastSpokenItemName
-        and itemName == state.lastSpokenItemName then
+    if itemName and itemValue and ccState.lastSpokenItemName
+        and itemName == ccState.lastSpokenItemName then
         -- Same label, different value -> speak value only.
-        state.lastSpokenFullText = itemValue
-        state.lastSpokenName = elemId
-        state.lastSpokenItemName = itemName
+        ccState.lastSpokenFullText = itemValue
+        ccState.lastSpokenName = elemId
+        ccState.lastSpokenItemName = itemName
             Log.Info("VALUE CYCLE: " .. itemValue)
         Ext.Tolk.Speak(itemValue, true)
         return
     end
 
     if itemName then
-        state.lastSpokenItemName = itemName
+        ccState.lastSpokenItemName = itemName
         slots["itemName"] = itemName
-        state.lastSpokenName = elemId
-        state.lastSpokenFullText = itemName
+        ccState.lastSpokenName = elemId
+        ccState.lastSpokenFullText = itemName
         Log.Info("ITEM: " .. tostring(focusedElement.elemType)
             .. "  name=" .. itemName
             .. (itemValue and ("  val=" .. itemValue) or "")
@@ -2086,7 +2148,34 @@ local function HandleCCSnapshot(snapshot, state)
         end
     end
 
-    SpeakSlots(slots, state, isScreenEntry)
+    H.SpeakSlots(slots, ccState, isScreenEntry)
+end
+
+-- ============================================================================
+-- State query and reset (exported for Manager)
+-- ============================================================================
+
+--- IsInCC: returns true if currently in character creation.
+--- Called by the Manager for cutscene-to-CC return detection.
+local function IsInCC()
+    return ccState.inCharacterCreation
+end
+
+--- HandleWidgetAdded: called by the Manager for every widgetAdded event,
+--- the same way Menus.HandleWidgetAdded is called.  CC owns all logic about
+--- what to do when its widget re-appears after a dialog or cutscene.
+---
+--- When the CC widget (gui::DCCharacterCreation) is re-added while already
+--- in CC (e.g. returning from an origin preview blurb), treat it as a fresh
+--- first entry.  This clears stale navigation dedup so d-pad works correctly
+--- rather than inheriting focus state from before the blurb.
+local function HandleWidgetAdded(widgetData)
+    if not widgetData or not widgetData.dcType then return end
+    if not ccState.inCharacterCreation then return end
+    if widgetData.dcType ~= "gui::DCCharacterCreation" then return end
+    Log.Info("CC: DCCharacterCreation re-added while in CC"
+        .. " -- resetting for fresh entry (blurb return)")
+    ResetCCState()
 end
 
 -- ============================================================================
@@ -2094,11 +2183,15 @@ end
 -- ============================================================================
 
 BG3Access.Client.CC = {
-    IsCCSnapshot        = IsCCSnapshot,
-    HandleCCSnapshot    = HandleCCSnapshot,
-    GetSectionLabel     = GetSectionLabel,
-    GetBodyTypeName     = GetBodyTypeName,
-    CC_SECTION_LABELS   = CC_SECTION_LABELS,
-    SubscribeCCYButton  = SubscribeCCYButton,
+    IsCCSnapshot         = IsCCSnapshot,
+    HandleCCSnapshot     = HandleCCSnapshot,
+    HandleWidgetAdded    = HandleWidgetAdded,
+    GetSectionLabel      = GetSectionLabel,
+    GetBodyTypeName      = GetBodyTypeName,
+    CC_SECTION_LABELS    = CC_SECTION_LABELS,
+    SubscribeCCYButton   = SubscribeCCYButton,
     UnsubscribeCCYButton = UnsubscribeCCYButton,
+    IsInCC               = IsInCC,
+    ResetCCNavigation    = ResetCCNavigation,
+    ResetCCState         = ResetCCState,
 }

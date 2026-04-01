@@ -98,6 +98,38 @@ local function FormatDCText(dcProps)
 
     if not text then text = dcProps.Title end
 
+    -- Character assignment player slots (VMCharacterAssignPlayerSlot):
+    -- prefer Player.Name over the Roman numeral slot Name.
+    if not text and dcProps.Player and type(dcProps.Player) == "table" then
+        local playerName = dcProps.Player.Name
+        if type(playerName) == "string" and playerName ~= "" then
+            text = playerName
+            if dcProps.IsHost then
+                text = text .. " (Host)"
+            end
+        end
+    end
+    -- Slot state when no player assigned ("Open" / "Closed").
+    if not text and type(dcProps.State) == "string"
+        and dcProps.State ~= "" then
+        local slotLabel = dcProps.Name
+        if type(slotLabel) == "string" and slotLabel ~= "" then
+            text = "Slot " .. slotLabel .. ": " .. dcProps.State
+        else
+            text = dcProps.State
+        end
+    end
+    -- Character assignment character slots (VMCharacterAssignCharacterSlot).
+    if not text and dcProps.Character
+        and type(dcProps.Character) == "table" then
+        local charName = dcProps.Character.CharacterName
+            or dcProps.Character.Name
+            or dcProps.Character.DisplayName
+            or dcProps.Character.Title
+        if type(charName) == "string" and charName ~= "" then
+            text = charName
+        end
+    end
     -- VMLobby and similar: Name is the primary text property.
     if not text and dcProps.Name then
         text = dcProps.Name
@@ -177,6 +209,39 @@ local function FormatDCTextSplit(dcProps)
             text = text .. ", " .. difficulty
         end
     end
+    -- Character assignment player slots (VMCharacterAssignPlayerSlot):
+    -- Player.Name is the display name of the connected player.  This
+    -- must be checked BEFORE dcProps.Name, which is the Roman numeral
+    -- slot identifier ("I", "II", etc.) and is not useful on its own.
+    if not text and dcProps.Player and type(dcProps.Player) == "table" then
+        local playerName = dcProps.Player.Name
+        if type(playerName) == "string" and playerName ~= "" then
+            text = playerName
+        end
+    end
+    -- Slot state when no player is assigned ("Open" / "Closed").
+    -- Pair with the Roman numeral slot label so the user knows the slot.
+    if not text and type(dcProps.State) == "string"
+        and dcProps.State ~= "" then
+        local slotLabel = dcProps.Name
+        if type(slotLabel) == "string" and slotLabel ~= "" then
+            text = "Slot " .. slotLabel .. ": " .. dcProps.State
+        else
+            text = dcProps.State
+        end
+    end
+    -- Character assignment character slots (VMCharacterAssignCharacterSlot):
+    -- Character is a sub-object containing the assigned character's info.
+    if not text and dcProps.Character
+        and type(dcProps.Character) == "table" then
+        local charName = dcProps.Character.CharacterName
+            or dcProps.Character.Name
+            or dcProps.Character.DisplayName
+            or dcProps.Character.Title
+        if type(charName) == "string" and charName ~= "" then
+            text = charName
+        end
+    end
     if not text and dcProps.Name then
         text = dcProps.Name
         local currentPlayers = dcProps.CurrentPlayers
@@ -191,6 +256,26 @@ local function FormatDCTextSplit(dcProps)
         end
     end
     if not text then text = dcProps.TitleProperty end
+    -- Playthrough holders (save game groups): use ProtagonistName and
+    -- LatestSave sub-object for distinguishing info.
+    if not text and dcProps.ProtagonistName then
+        text = dcProps.ProtagonistName
+        local latestSave = dcProps.LatestSave
+        if type(latestSave) == "table" then
+            local saveTitle = latestSave.Title
+            if type(saveTitle) == "string" and saveTitle ~= "" then
+                text = text .. ", " .. saveTitle
+            end
+            local levelName = latestSave.LevelName
+            if type(levelName) == "string" and levelName ~= "" then
+                text = text .. ", " .. levelName
+            end
+            local timeString = latestSave.TimeString
+            if type(timeString) == "string" and timeString ~= "" then
+                text = text .. ", " .. timeString
+            end
+        end
+    end
     if not text and dcProps.LobbyMessage then
         local lobbyMessage = dcProps.LobbyMessage
         if type(lobbyMessage) == "string" and lobbyMessage ~= ""
@@ -219,6 +304,10 @@ local function FormatDCTextSplit(dcProps)
     local textProperty = dcProps.TextProperty
     if textProperty and textProperty ~= "" and textProperty ~= text then
         descParts[#descParts + 1] = textProperty
+    end
+    -- Host indicator for character assignment player slots.
+    if dcProps.IsHost then
+        descParts[#descParts + 1] = "Host"
     end
     local descResult = #descParts > 0 and table.concat(descParts, ". ") or nil
 
@@ -267,6 +356,19 @@ local function ExtractTextFromData(data, lastSpokenTab, tabFlushPending)
     if dcText and dcText ~= "" then return dcText end
 
     if data.elemText and data.elemText ~= "" then return data.elemText end
+
+    -- Check namedTexts for a title or header element.  Container elements
+    -- (e.g., ContentControl wrapping a savegames list) may have no dcProps or
+    -- elemText but expose a TitleText named element that identifies the screen.
+    if data.namedTexts then
+        for elementName, elementText in pairs(data.namedTexts) do
+            local nameLower = elementName:lower()
+            if (nameLower:find("title") or nameLower:find("header"))
+                and elementText and elementText ~= "" then
+                return elementText
+            end
+        end
+    end
 
     return CleanElementName(data.elemName)
 end
@@ -480,6 +582,119 @@ local function ReadStatDescription(stat)
 end
 
 -- ---------------------------------------------------------------------------
+-- Speech slot assembly (shared by all menu handlers and CC).
+-- ---------------------------------------------------------------------------
+
+-- Slot names in the order they should be spoken.
+local SLOT_ORDER = { "title", "hint", "tabName", "body", "actions", "itemName", "itemValue", "itemDesc" }
+
+-- Standard DCMessageBox button hint.  Noesis Indie SDK crashes when
+-- enumerating the Actions IList collection from C++, so we handle
+-- button hints in Lua based on the dialog DC type.
+local DIALOG_BUTTON_HINT = "Press A to confirm, or B to cancel"
+
+--- SpeakSlots: assemble slots in order, apply interrupt logic, speak.
+--- @param slots table  Keyed by slot name (title, hint, tabName, etc.).
+--- @param handlerState table  Handler's isolated state table.  Must have
+---     screenEntryJustSpoke (bool) and lastSpokenFullText (string|nil).
+--- @param isScreenEntry boolean  Whether this is a screen entry event.
+local function SpeakSlots(slots, handlerState, isScreenEntry)
+    local parts = {}
+    for _, slotName in ipairs(SLOT_ORDER) do
+        local slotValue = slots[slotName]
+        if slotValue and slotValue ~= "" then
+            table.insert(parts, (slotValue:gsub("[%.%s]+$", "")))
+        end
+    end
+    if #parts == 0 then return end
+    local assembled = StripMarkupTags(table.concat(parts, ". "))
+    if not assembled or assembled == "" then return end
+
+    local interrupt = true
+    if handlerState.screenEntryJustSpoke and not isScreenEntry then
+        interrupt = false
+        handlerState.screenEntryJustSpoke = false
+    end
+    -- Visual text (loading tips, splash screen) should always append.
+    -- These arrive from the initial widget scan with no title, tab, hint,
+    -- or item -- just body text.  Appending lets tips queue naturally
+    -- instead of cutting each other off.
+    local isVisualTextOnly = slots["body"] and not slots["title"]
+        and not slots["tabName"] and not slots["hint"]
+        and not slots["itemName"]
+    if isVisualTextOnly then
+        interrupt = false
+    end
+    if isScreenEntry then
+        handlerState.screenEntryJustSpoke = true
+    end
+
+    local Log = BG3Access.Client.Log
+    Log.Info("SPEAK" .. (interrupt and "" or " (append)") .. ": " .. assembled)
+    Ext.Tolk.Speak(assembled, interrupt)
+    handlerState.lastSpokenFullText = assembled
+end
+
+--- ExtractFromNamedTexts: extract title and body parts from named text entries.
+--- @param namedTexts table|nil  Map of elementName -> elementText.
+--- @return string|nil titleText, table bodyParts
+local function ExtractFromNamedTexts(namedTexts)
+    if not namedTexts then return nil, {} end
+    local titleText = nil
+    local bodyParts = {}
+    for elementName, elementText in pairs(namedTexts) do
+        local nameLower = elementName:lower()
+        if nameLower:find("title") or nameLower:find("header") then
+            if not titleText then titleText = elementText end
+        elseif nameLower:find("body") or nameLower:find("description")
+            or nameLower:find("message") or nameLower:find("warning")
+            or nameLower:find("busy") or nameLower:find("status")
+            or nameLower:find("info")
+            or nameLower == "_visualtext" then
+            -- Filter out pure numeric text (e.g., "93%" from loading progress).
+            if nameLower == "_visualtext" and elementText:match("^%d+%%?$") then
+                -- skip progress percentages
+            else
+                table.insert(bodyParts, elementText)
+            end
+        end
+    end
+    return titleText, bodyParts
+end
+
+--- ExtractFromWidgetData: extract title, body, and actions from widget data.
+--- @param widgetData table|nil  Widget data table with dcProps and bindings.
+--- @return string|nil titleText, string|nil bodyText, string|nil actionsText
+local function ExtractFromWidgetData(widgetData)
+    if not widgetData then return nil, nil, nil end
+    local titleText = nil
+    local bodyText = nil
+    if widgetData.dcProps then
+        titleText = widgetData.dcProps.Title or widgetData.dcProps.TitleText
+            or widgetData.dcProps.Header or widgetData.dcProps.TitleProperty
+        bodyText = widgetData.dcProps.Description or widgetData.dcProps.Text
+            or widgetData.dcProps.Message or widgetData.dcProps.BodyText
+            or widgetData.dcProps.TextProperty or widgetData.dcProps.LobbyMessage
+    end
+    if widgetData.bindings then
+        for _, bindingEntry in ipairs(widgetData.bindings) do
+            if not titleText and bindingEntry.path and bindingEntry.path:find("Title") and bindingEntry.value then
+                titleText = bindingEntry.value
+            end
+            if not bodyText and bindingEntry.path and (bindingEntry.path:find("Description") or bindingEntry.path:find("Text") or bindingEntry.path:find("Message")) and bindingEntry.value then
+                bodyText = bindingEntry.value
+            end
+        end
+    end
+    -- Append button hint for standard message box dialogs.
+    local actionsText = nil
+    if widgetData.dcType and widgetData.dcType:find("MessageBox") then
+        actionsText = DIALOG_BUTTON_HINT
+    end
+    return titleText, bodyText, actionsText
+end
+
+-- ---------------------------------------------------------------------------
 -- Exports
 -- ---------------------------------------------------------------------------
 BG3Access.Client.Helpers = {
@@ -498,4 +713,9 @@ BG3Access.Client.Helpers = {
     ParseDescriptionParam        = ParseDescriptionParam,
     ResolveDescriptionParams     = ResolveDescriptionParams,
     ReadStatDescription          = ReadStatDescription,
+    SpeakSlots                   = SpeakSlots,
+    SLOT_ORDER                   = SLOT_ORDER,
+    DIALOG_BUTTON_HINT           = DIALOG_BUTTON_HINT,
+    ExtractFromNamedTexts        = ExtractFromNamedTexts,
+    ExtractFromWidgetData        = ExtractFromWidgetData,
 }
