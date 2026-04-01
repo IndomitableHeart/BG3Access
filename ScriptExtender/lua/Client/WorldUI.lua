@@ -1,13 +1,15 @@
--- File: Client/AccessibilityWorld.lua
+-- File: Client/WorldUI.lua
 --
--- In-game world accessibility handler.
+-- In-game UI panel handler (gameplay screens, not pre-game menus).
 --
--- Handles UI elements that appear during gameplay (not menus):
+-- Handles UI elements that appear during gameplay:
 -- - RT shortcuts radial (character sheet, spell book, journal, etc.)
 -- - RB action radial (hotbar actions, spells, passives)
--- - Future: spatial awareness, context menus, combat UI
+-- - Future: character panel, spellbook, journal, trade, containers,
+--   alchemy, examine, active rolls, reactions, books, rewards
 --
--- The Manager detects radial snapshot events and delegates here.
+-- The Manager detects radial and in-game panel events and delegates here.
+-- Spatial navigation/exploration lives in WorldNav.lua.
 -- C++ provides the radial slot data (title, description, tag) via
 -- TickSnapshot.radialSlotChanged.
 --
@@ -293,7 +295,7 @@ local function ClearRadialFocus()
 end
 
 -- ============================================================================
--- Entry point (called by AccessibilityManager)
+-- Entry point (called by EventRouter)
 -- ============================================================================
 
 --- HandleRadialSlot: gather data then speak.
@@ -316,7 +318,7 @@ end
 -- Exports
 -- ============================================================================
 
-BG3Access.Client.World = {
+BG3Access.Client.WorldUI = {
     HandleRadialOpen  = HandleRadialOpen,
     ClearRadialFocus  = ClearRadialFocus,
     HandleRadialSlot  = HandleRadialSlot,

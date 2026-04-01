@@ -1,4 +1,4 @@
--- File: Client/AccessibilityLogger.lua
+-- File: Client/Logger.lua
 --
 -- Centralized logging for BG3Access.  All diagnostic output goes through
 -- this module so verbosity can be toggled at runtime without touching

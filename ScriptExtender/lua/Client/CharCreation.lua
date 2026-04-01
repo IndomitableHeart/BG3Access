@@ -1,4 +1,4 @@
--- File: Client/AccessibilityCC.lua
+-- File: Client/CharCreation.lua
 --
 -- Character Creation specific snapshot handler.
 --
@@ -297,7 +297,7 @@ local ccState = {
 
 -- Get the CC section label from a data table's dcType.
 -- Returns section name string or nil.
--- Stat description helpers: use shared versions from AccessibilityHelpers.
+-- Stat description helpers: use shared versions from Helpers.lua.
 -- ParseDescriptionParam, ResolveDescriptionParams, ReadStatDescription
 -- are all defined in Helpers and exported as H.* functions.
 local ParseDescriptionParam = H.ParseDescriptionParam

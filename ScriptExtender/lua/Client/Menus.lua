@@ -1,4 +1,4 @@
--- File: Client/AccessibilityMenus.lua
+-- File: Client/Menus.lua
 --
 -- Per-menu handler system using factory pattern.
 --

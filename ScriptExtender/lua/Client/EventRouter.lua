@@ -1,4 +1,4 @@
--- File: Client/AccessibilityManager.lua
+-- File: Client/EventRouter.lua
 --
 -- Thin router for the BG3Access accessibility system.
 --
@@ -10,10 +10,10 @@
 -- This file is a ROUTER ONLY.  It handles cross-cutting concerns
 -- (loading suppression, debug explore mode, game state transitions)
 -- and dispatches snapshots to the appropriate handler module:
---   CC (Character Creation)  -> AccessibilityCC.lua
---   Cutscene/Dialog          -> AccessibilityCutscene.lua
---   World/Radials            -> AccessibilityWorld.lua
---   Generic menus            -> AccessibilityMenus.lua (per-menu handlers)
+--   CC (Character Creation)  -> CharCreation.lua
+--   Cutscene/Dialog          -> Cutscene.lua
+--   WorldUI/Radials/Panels   -> WorldUI.lua
+--   Pre-game menus           -> Menus.lua (per-menu handlers)
 
 BG3Access = BG3Access or {}
 BG3Access.Client = BG3Access.Client or {}
@@ -73,7 +73,7 @@ local function HandleTickSnapshot(snapshot)
     -- Radial slot events (RT shortcuts menu, RB action radial).
     -- =================================================================
     if snapshot.radialSlotChanged then
-        local World = BG3Access.Client.World
+        local World = BG3Access.Client.WorldUI
         if World then
             World.HandleRadialSlot(snapshot)
         end
@@ -186,7 +186,7 @@ local function HandleTickSnapshot(snapshot)
     -- element, clear the flag so the next open is detected.
     -- =================================================================
     if snapshot.focusChanged then
-        local World = BG3Access.Client.World
+        local World = BG3Access.Client.WorldUI
         if World then
             if focusedElement.dcType
                 and focusedElement.dcType:find("VMHotBar") then
@@ -254,7 +254,7 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     if CC.UnsubscribeCCYButton then CC.UnsubscribeCCYButton() end
     CS.ResetDialogState()
     CS.HandleGameStateForAD(tostring(e.FromState), tostring(e.ToState))
-    local World = BG3Access.Client.World
+    local World = BG3Access.Client.WorldUI
     if World then World.ResetState() end
 
     -- Reset router state.

@@ -1,4 +1,4 @@
--- File: Client/AccessibilityCutscene.lua
+-- File: Client/Cutscene.lua
 --
 -- Dialog and cutscene accessibility handler.
 --

@@ -1,10 +1,10 @@
--- File: Client/AccessibilityHelpers.lua
+-- File: Client/Helpers.lua
 --
 -- Pure utility functions for BG3Access speech formatting and text extraction.
 -- None of these functions reference module-level state variables.  They take
 -- data in and return data out, making them safe to call from any context.
 --
--- CC-specific logic lives in AccessibilityCC.lua.  This file is generic only.
+-- CC-specific logic lives in CharCreation.lua.  This file is generic only.
 
 local Log = BG3Access.Client.Log
 
