@@ -39,6 +39,12 @@ local CC_SECTION_LABELS = {
     ["ls.VMAbility"]                  = "Abilities",
 }
 
+-- DC types that are CC-specific but only when inCharacterCreation is true.
+-- These types may also appear in non-CC contexts (e.g. Options sliders).
+local CC_CONTEXT_TYPES = {
+    ["gui::VMSliderSetting"]          = "Appearance",
+}
+
 -- Body type display names.  Keys are lowercase versions of the
 -- BodyTypeAndShape DC property values (Female, Male, FemaleStrong, MaleStrong).
 local BODY_TYPE_NAMES = {
@@ -602,6 +608,7 @@ end
 local function GetSectionLabel(data)
     if not data or not data.dcType then return nil end
     local label = CC_SECTION_LABELS[data.dcType]
+        or CC_CONTEXT_TYPES[data.dcType]
     if not label then return nil end
 
     -- Subrace detection: ls.VMSelectableRace is used for both races and
@@ -1206,15 +1213,10 @@ local function IsCCSnapshot(snapshot)
         return true
     end
 
-    -- Context fallback: if already in CC, any focused element with a real
-    -- DC type is a CC element.  Catches CC-internal VM types not in the
-    -- explicit tables above (e.g. gui::VMSliderSetting for Appearance
-    -- sliders, any other per-control VM types Larian adds).
-    -- Safe because dialog overlays and cutscene widgets are routed away
-    -- by the Manager before IsCCSnapshot is ever called.
-    if ccState.inCharacterCreation
-        and focusedElement.dcType
-        and focusedElement.dcType ~= "(none)" then
+    -- Types that appear in CC but also in other contexts (e.g. sliders).
+    -- Only claim when already in character creation.
+    if ccState.inCharacterCreation and focusedElement.dcType
+        and CC_CONTEXT_TYPES[focusedElement.dcType] then
         return true
     end
 
