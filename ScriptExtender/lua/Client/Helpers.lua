@@ -12,6 +12,20 @@ local Log = BG3Access.Client.Log
 -- Constants
 -- ---------------------------------------------------------------------------
 
+-- Level code to display name for multiplayer lobbies.  The game's
+-- TranslatedStringConverter with LocaKey resolves these visually,
+-- but Ext.Loca.GetTranslatedString does not find them.  Verified
+-- against the in-game lobby browser Location column.
+local LEVEL_DISPLAY_NAMES = {
+    ["WLD_Main_A"]            = "Wilderness",
+    ["SCL_Main_A"]            = "Shadow-Cursed Lands",
+    ["CTY_Main_A"]            = "Baldur's Gate",
+    ["BGO_Main_A"]            = "Wyrm's Crossing",
+    ["CRE_Main_A"]            = "Githyanki Creche",
+    ["TUT_Avernus_C"]         = "A Nautiloid in Hell",
+    ["SYS_Menuscreen_Camp_A"] = "Character Creation",
+}
+
 -- Status property names to check in dcProps for live status messages.
 local STATUS_PROPS = {
     "StatusText", "Status", "ErrorMessage", "Message",
@@ -85,6 +99,20 @@ local function CleanControllerFunctionality(rawText)
     return cleaned
 end
 
+-- Resolve a LocaString handle to translated text, or return the input as-is.
+local function GetTranslatedStringIfHandle(textOrHandle, logContextStringOptional)
+    if not textOrHandle or type(textOrHandle) ~= "string" or textOrHandle == "" then
+        return textOrHandle
+    end
+    if Ext.Loca and Ext.Loca.GetTranslatedString then
+        local translated = Ext.Loca.GetTranslatedString(textOrHandle)
+        if translated and translated ~= "" and translated ~= textOrHandle then
+            return translated
+        end
+    end
+    return textOrHandle
+end
+
 -- ---------------------------------------------------------------------------
 -- Format speech text from a data table's dcProps.
 -- Returns full text string or nil.
@@ -139,9 +167,19 @@ local function FormatDCText(dcProps)
             text = text .. ", " .. tostring(currentPlayers) .. " of "
                 .. tostring(maxPlayers) .. " players"
         end
-        local difficulty = dcProps.Difficulty
-        if difficulty and difficulty ~= "" then
-            text = text .. ", " .. difficulty
+        -- Map is a LocaKey — resolve via Loca, fall back to known
+        -- level codes, then raw code.
+        local map = dcProps.Map
+        if type(map) == "string" and map ~= "" then
+            local mapDisplay = GetTranslatedStringIfHandle(map)
+            if mapDisplay == map then
+                mapDisplay = LEVEL_DISPLAY_NAMES[map] or map
+            end
+            text = text .. ", " .. mapDisplay
+        end
+        local partyLevel = dcProps.PartyLevel
+        if partyLevel and partyLevel ~= "" then
+            text = text .. ", Level " .. tostring(partyLevel)
         end
     end
 
@@ -250,9 +288,19 @@ local function FormatDCTextSplit(dcProps)
             text = text .. ", " .. tostring(currentPlayers) .. " of "
                 .. tostring(maxPlayers) .. " players"
         end
-        local difficulty = dcProps.Difficulty
-        if difficulty and difficulty ~= "" then
-            text = text .. ", " .. difficulty
+        -- Map is a LocaKey — resolve via Loca, fall back to known
+        -- level codes, then raw code.
+        local map = dcProps.Map
+        if type(map) == "string" and map ~= "" then
+            local mapDisplay = GetTranslatedStringIfHandle(map)
+            if mapDisplay == map then
+                mapDisplay = LEVEL_DISPLAY_NAMES[map] or map
+            end
+            text = text .. ", " .. mapDisplay
+        end
+        local partyLevel = dcProps.PartyLevel
+        if partyLevel and partyLevel ~= "" then
+            text = text .. ", Level " .. tostring(partyLevel)
         end
     end
     if not text then text = dcProps.TitleProperty end
@@ -296,6 +344,19 @@ local function FormatDCTextSplit(dcProps)
                 or selItem.Label or selItem.DisplayName
         end
     end
+    -- VMCustomSettingCombobox: SelectedValue sub-object with Name.
+    if not valueResult then
+        local selectedValue = dcProps.SelectedValue
+        if type(selectedValue) == "table" then
+            local selectedName = selectedValue.Name or selectedValue.Text
+                or selectedValue.Title
+            if type(selectedName) == "string" and selectedName ~= "" then
+                valueResult = selectedName
+            end
+        elseif type(selectedValue) == "string" and selectedValue ~= "" then
+            valueResult = selectedValue
+        end
+    end
 
     local descParts = {}
     if desc and desc ~= "" then
@@ -306,12 +367,37 @@ local function FormatDCTextSplit(dcProps)
         descParts[#descParts + 1] = textProperty
     end
     -- Host indicator for character assignment player slots.
-    if dcProps.IsHost then
+    -- Only add when Player sub-object exists (multiplayer character assign),
+    -- not on every screen that happens to have IsHost (e.g., difficulty).
+    if dcProps.IsHost and dcProps.Player then
         descParts[#descParts + 1] = "Host"
+    end
+    -- Warning for custom difficulty settings that are locked after game start.
+    if dcProps.EditableInGame == "Off" then
+        local warningText = GetTranslatedStringIfHandle(
+            "h3c46af69gfe72g49f1gb524g8bf318295dc3")
+        if warningText and warningText ~= ""
+            and warningText ~= "h3c46af69gfe72g49f1gb524g8bf318295dc3" then
+            descParts[#descParts + 1] = warningText
+        end
+    end
+    -- SelectedValue description for combobox items (e.g., difficulty
+    -- presets: "Balanced" has "Enemies will provide a balanced challenge").
+    -- Returned as a 4th value so callers can place it after the value name.
+    local valueDescResult = nil
+    if dcProps.SelectedValue and type(dcProps.SelectedValue) == "table" then
+        local selectedDesc = dcProps.SelectedValue.Description
+        if type(selectedDesc) == "string" and selectedDesc ~= "" then
+            valueDescResult = selectedDesc
+        end
+    end
+    -- Strip trailing periods/spaces from each part to avoid ".." when joined.
+    for descIndex = 1, #descParts do
+        descParts[descIndex] = descParts[descIndex]:gsub("[%.%s]+$", "")
     end
     local descResult = #descParts > 0 and table.concat(descParts, ". ") or nil
 
-    return text, valueResult, descResult
+    return text, valueResult, descResult, valueDescResult
 end
 
 -- ---------------------------------------------------------------------------
@@ -328,6 +414,22 @@ local function FormatDCValue(dcProps)
         local selText = selItem.Text or selItem.Title or selItem.Name
             or selItem.Label or selItem.DisplayName
         if selText and selText ~= "" then return selText end
+    end
+
+    -- VMCustomSettingCombobox: SelectedValue sub-object with Name + Description.
+    local selectedValue = dcProps.SelectedValue
+    if type(selectedValue) == "table" then
+        local selectedName = selectedValue.Name or selectedValue.Text
+            or selectedValue.Title
+        if type(selectedName) == "string" and selectedName ~= "" then
+            local selectedDesc = selectedValue.Description
+            if type(selectedDesc) == "string" and selectedDesc ~= "" then
+                return selectedName .. ". " .. selectedDesc
+            end
+            return selectedName
+        end
+    elseif type(selectedValue) == "string" and selectedValue ~= "" then
+        return selectedValue
     end
 
     return nil
@@ -371,20 +473,6 @@ local function ExtractTextFromData(data, lastSpokenTab, tabFlushPending)
     end
 
     return CleanElementName(data.elemName)
-end
-
--- Resolve a LocaString handle to translated text, or return the input as-is.
-local function GetTranslatedStringIfHandle(textOrHandle, logContextStringOptional)
-    if not textOrHandle or type(textOrHandle) ~= "string" or textOrHandle == "" then
-        return textOrHandle
-    end
-    if Ext.Loca and Ext.Loca.GetTranslatedString then
-        local translated = Ext.Loca.GetTranslatedString(textOrHandle)
-        if translated and translated ~= "" and translated ~= textOrHandle then
-            return translated
-        end
-    end
-    return textOrHandle
 end
 
 -- ---------------------------------------------------------------------------
@@ -586,7 +674,7 @@ end
 -- ---------------------------------------------------------------------------
 
 -- Slot names in the order they should be spoken.
-local SLOT_ORDER = { "title", "hint", "tabName", "body", "actions", "itemName", "itemValue", "itemDesc" }
+local SLOT_ORDER = { "title", "hint", "tabName", "body", "actions", "itemName", "itemInfo", "itemValue", "itemDesc" }
 
 -- Standard DCMessageBox button hint.  Noesis Indie SDK crashes when
 -- enumerating the Actions IList collection from C++, so we handle

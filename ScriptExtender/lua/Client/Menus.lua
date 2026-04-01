@@ -388,31 +388,41 @@ local function CreateMenuHandler(config)
 
         -- ----- Item slots -----
         local itemName = nil
+        local itemInfo = nil
         local itemValue = nil
         local itemDesc = nil
 
-        local splitName, splitValue, splitDesc =
+        local splitName, splitValue, splitDesc, splitValueDesc =
             H.FormatDCTextSplit(focusedElement.dcProps)
         if not splitName or splitName == "" then
             splitName = H.ExtractTextFromData(
                 focusedElement, handlerState.lastSpokenTab, isScreenEntry)
             splitValue = nil
             splitDesc = nil
+            splitValueDesc = nil
         end
         if splitName and splitName ~= "" then
             local normalItem = H.NormalizeForCompare(splitName)
+            local normalTitle = screenTitle
+                and H.NormalizeForCompare(screenTitle) or ""
             local isDuplicate = (normalTab ~= ""
                 and normalItem == normalTab)
-                or (screenTitle
-                    and normalItem == H.NormalizeForCompare(screenTitle))
+                or (normalTitle ~= ""
+                    and (normalItem == normalTitle
+                        or normalTitle:find(normalItem, 1, true)))
             if not isDuplicate then
                 itemName = splitName
                 itemValue = splitValue
-            end
-            -- Keep description even when name is suppressed as tab dup.
-            if splitDesc then itemDesc = splitDesc end
-            if splitValue and not itemValue then
-                itemValue = splitValue
+                -- When a value has its own description (combobox options),
+                -- put the setting description before the value (itemInfo)
+                -- and the value description after it (itemDesc).
+                -- Order: name -> setting desc -> value -> value desc
+                if splitValueDesc then
+                    itemInfo = splitDesc
+                    itemDesc = splitValueDesc
+                else
+                    itemDesc = splitDesc
+                end
             end
         end
 
@@ -432,6 +442,7 @@ local function CreateMenuHandler(config)
                     and ("  desc=" .. tostring(itemDesc):sub(1, 40))
                     or ""))
         end
+        if itemInfo then slots["itemInfo"] = itemInfo end
         if itemValue then slots["itemValue"] = itemValue end
         if itemDesc then slots["itemDesc"] = itemDesc end
 
@@ -584,7 +595,26 @@ local PauseMenuHandler = CreateMenuHandler({
 
 local DifficultyHandler = CreateMenuHandler({
     name = "Difficulty",
-    hint = false,
+    hintFn = function(screenTitle)
+        if screenTitle and screenTitle:lower():find("custom") then
+            return "Pick and choose from a selection of rules to create"
+                .. " your own, custom way of playing Baldur's Gate 3."
+                .. " Using Custom Mode will not affect the game's story,"
+                .. " and achievements are still enabled."
+                .. " We recommend new players try a premade difficulty"
+                .. " for their first campaign, as this cannot be changed"
+                .. " at a later date"
+        end
+        return false
+    end,
+    -- Reset hint state when a new widget appears (e.g., transitioning
+    -- from preset selector to custom settings).  The hintFn decides
+    -- what to say based on screen title — false for presets, paragraph
+    -- for custom mode.
+    onWidgetAdded = function(widgetData, handlerState)
+        handlerState.tabHintSpoken = false
+        handlerState.lastSpokenTab = nil
+    end,
 })
 
 local ModManagerHandler = CreateMenuHandler({
