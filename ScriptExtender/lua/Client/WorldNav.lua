@@ -32,7 +32,7 @@ local H   = BG3Access.Client.Helpers
 -- ============================================================================
 
 -- Path-following.
-local GPS_LOOKAHEAD_NODES     = 8     -- nodes ahead on path (~4m)
+local GPS_LOOKAHEAD_NODES     = 6     -- nodes ahead on path (~3m)
 local GPS_DEVIATION_THRESHOLD = 3.0   -- meters off-path triggers recalculation
 local GPS_ARRIVAL_DISTANCE    = 5.0   -- meters to declare arrival
 local GPS_GUIDANCE_MOVEMENT   = 2.0   -- meters between guidance updates
@@ -245,20 +245,14 @@ end
 --- Determine the category for an entity.
 --- Returns "NPCs", "Doors", or "Items" (default).
 local function CategoriseEntity(entity)
-    -- Check for character components (NPCs).
-    local isChar = pcall(function()
-        return entity.ServerCharacter ~= nil
-    end)
-    if isChar then
-        local hasChar = false
-        pcall(function() hasChar = entity.ServerCharacter ~= nil end)
-        if hasChar then return "NPCs" end
-    end
+    -- IsCharacter = CharacterComponent (basic tag, visible from client).
+    -- IsDoor = ItemDoorComponent.
+    local ok, character = pcall(entity.GetComponent, entity,
+        "IsCharacter")
+    if ok and character then return "NPCs" end
 
-    -- Check for door component.
-    local hasDoor = false
-    pcall(function() hasDoor = entity.Door ~= nil end)
-    if hasDoor then return "Doors" end
+    local ok2, door = pcall(entity.GetComponent, entity, "IsDoor")
+    if ok2 and door then return "Doors" end
 
     return "Items"
 end
@@ -277,7 +271,7 @@ local function ScanAndCategorise(playerPosition)
 
     -- Try multiple component queries to find entities.
     local componentNames = {
-        "ServerItem", "ServerCharacter",
+        "ServerItem", "ServerCharacter", "IsDoor",
         "GameObjectVisual", "ItemTemplate",
     }
     for _, componentName in ipairs(componentNames) do
@@ -417,9 +411,15 @@ end
 -- GPS Tracking Mode (path following to selected target)
 -- ============================================================================
 
+-- Max nodes to advance per update (~2m at ~0.5m/node).
+-- Prevents skipping past curves around obstacles.
+local MAX_ADVANCE_PER_UPDATE = 4
+
 local function AdvancePathIndex(playerPosition)
     if not currentPath then return end
-    while currentPathIndex < #currentPath do
+    local advanced = 0
+    while currentPathIndex < #currentPath
+        and advanced < MAX_ADVANCE_PER_UPDATE do
         local nextIndex = currentPathIndex + 1
         local currentDistSquared = DistanceSquaredXZ(
             playerPosition, currentPath[currentPathIndex])
@@ -427,6 +427,7 @@ local function AdvancePathIndex(playerPosition)
             playerPosition, currentPath[nextIndex])
         if nextDistSquared < currentDistSquared then
             currentPathIndex = nextIndex
+            advanced = advanced + 1
         else
             break
         end
@@ -499,8 +500,12 @@ local function ProcessTrackingUpdate(playerPosition)
     local lookaheadPosition = GetLookaheadPosition()
     if not lookaheadPosition then return end
 
+    -- Direction = path tangent (current node → lookahead node), not
+    -- player → lookahead.  Straight line from player to lookahead
+    -- cuts through obstacles that the path routes around.
+    local currentNodePosition = currentPath[currentPathIndex]
     local clockHour = ComputeClockDirection(
-        playerPosition, lookaheadPosition)
+        currentNodePosition, lookaheadPosition)
     if not clockHour then return end
 
     -- Tracking speech: distance + clock (no target name).
@@ -520,7 +525,22 @@ local function ProcessTrackingUpdate(playerPosition)
     end
     lastDistanceToTarget = distanceToTarget
 
-    Log.Info("GPS: " .. guidance .. trend)
+    -- Log player's actual movement direction vs recommended direction.
+    local movementClock = nil
+    if lastGuidancePosition then
+        local moveDist = DistanceXZ(playerPosition, lastGuidancePosition)
+        if moveDist > 0.5 then
+            movementClock = ComputeClockDirection(
+                lastGuidancePosition, playerPosition)
+        end
+    end
+    local moveInfo = movementClock
+        and (" moved=" .. movementClock .. "h") or ""
+    Log.Info("GPS: " .. guidance .. trend
+        .. " guide=" .. clockHour .. "h" .. moveInfo
+        .. " pathIdx=" .. currentPathIndex
+        .. "/" .. #currentPath)
+
     Ext.Tolk.Speak(guidance, true)
     lastGuidancePosition = {
         playerPosition[1], playerPosition[2], playerPosition[3]
@@ -598,6 +618,8 @@ local function DisableGPS()
     lastDistanceToTarget = nil
     announcedHandles = {}
     lastProximityPosition = nil
+    entityListOpen = false
+    leftStickPressTime = nil
     Log.Info("GPS: OFF")
     Ext.Tolk.Speak("GPS off", true)
 end
@@ -920,6 +942,9 @@ local function OnControllerButton(event)
     end
 
     -- ----- Right Stick: press records time, release fires if >= 500ms -----
+    -- Never prevent stick press/release events -- the game needs both
+    -- press and release to keep its input state machine consistent.
+    -- Preventing a release leaves the game thinking the stick is held.
     if buttonName == "RightStick" then
         if event.Pressed then
             rightStickPressTime = now
@@ -927,7 +952,6 @@ local function OnControllerButton(event)
             if rightStickPressTime and not leftStickDown then
                 local holdDuration = now - rightStickPressTime
                 if holdDuration >= STICK_HOLD_MS then
-                    event:PreventAction()
                     ToggleGPS()
                 end
             end
@@ -936,16 +960,32 @@ local function OnControllerButton(event)
         return
     end
 
-    -- ----- Left Stick: press records time, release fires if >= 500ms -----
-    if buttonName == "LeftStick" then
+    -- ----- Left Stick: only handle when GPS is on -----
+    -- GPS off = don't touch the event at all.
+    if buttonName == "LeftStick" and not gpsEnabled then
+        return
+    end
+    if buttonName == "LeftStick" and gpsEnabled then
         if event.Pressed then
+            -- Prevent press so the game doesn't start its own LS action.
+            -- Release is always passed through to keep game state clean.
+            event:PreventAction()
             leftStickPressTime = now
         else
             if leftStickPressTime and not rightStickDown then
                 local holdDuration = now - leftStickPressTime
                 if holdDuration >= STICK_HOLD_MS then
-                    event:PreventAction()
-                    OpenEntityList()
+                    if trackingTarget and not entityListOpen then
+                        Log.Info("GPS: Target cleared")
+                        Ext.Tolk.Speak("Target cleared", true)
+                        trackingTarget = nil
+                        currentPath = nil
+                        currentPathIndex = 1
+                        lastGuidancePosition = nil
+                        lastDistanceToTarget = nil
+                    elseif not entityListOpen then
+                        OpenEntityList()
+                    end
                 end
             end
             leftStickPressTime = nil
