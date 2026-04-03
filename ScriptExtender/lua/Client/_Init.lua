@@ -5,5 +5,6 @@ BG3Access.Shared.RequireFiles("Client/", {
 "Cutscene",
 "WorldUI",
 "Menus",
+"WorldNav",
 "EventRouter",
 })

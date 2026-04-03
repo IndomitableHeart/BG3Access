@@ -256,6 +256,8 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     CS.HandleGameStateForAD(tostring(e.FromState), tostring(e.ToState))
     local World = BG3Access.Client.WorldUI
     if World then World.ResetState() end
+    local Nav = BG3Access.Client.WorldNav
+    if Nav then Nav.ResetState() end
 
     -- Reset router state.
     lastWidgetRootStr = nil
