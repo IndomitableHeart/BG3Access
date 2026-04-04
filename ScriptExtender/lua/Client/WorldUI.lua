@@ -5,10 +5,13 @@
 -- Handles UI elements that appear during gameplay:
 -- - RT shortcuts radial (character sheet, spell book, journal, etc.)
 -- - RB action radial (hotbar actions, spells, passives)
--- - Future: character panel, spellbook, journal, trade, containers,
---   alchemy, examine, active rolls, reactions, books, rewards
+-- - In-game panels: inventory, trade, journal, alchemy, examine, etc.
 --
--- The Manager detects radial and in-game panel events and delegates here.
+-- Panel handlers use the same factory pattern as Menus.lua
+-- (CreatePanelHandler), with isolated state and a generic pipeline
+-- that speaks DC properties via FormatDCTextSplit.
+--
+-- The EventRouter detects panel widget events and delegates here.
 -- Spatial navigation/exploration lives in WorldNav.lua.
 -- C++ provides the radial slot data (title, description, tag) via
 -- TickSnapshot.radialSlotChanged.
@@ -20,7 +23,8 @@
 -- LocaString handles, Lua falls back to Ext.Stats API lookups.
 
 local Log = BG3Access.Client.Log
-local H = BG3Access.Client.Helpers
+local Helpers  = BG3Access.Client.Helpers
+local Cutscene = BG3Access.Client.Cutscene
 
 -- ============================================================================
 -- Constants
@@ -30,8 +34,12 @@ local H = BG3Access.Client.Helpers
 local RADIAL_HINT = "A to select. X to customize. B to close."
     .. " LB and RB switch between rings"
 
+-- Default hint for panel handlers (false = no hint by default).
+-- Individual handlers override with specific hints.
+local DEFAULT_PANEL_HINT = false
+
 -- ============================================================================
--- State
+-- Radial state
 -- ============================================================================
 
 -- Hint spoken once per radial session (reset on GameStateChanged).
@@ -76,7 +84,7 @@ end
 --- LookupHotBarDescription: resolve description for an action/spell/item.
 ---
 --- Strategy (API-first per CLAUDE.md):
---- ALL paths use SE APIs via H.ReadStatDescription (shared helper).
+--- ALL paths use SE APIs via Helpers.ReadStatDescription (shared helper).
 --- ViewModel props are LAST RESORT fallback.
 ---
 --- Lookup order (all API-based):
@@ -101,7 +109,7 @@ local function LookupHotBarDescription(contentProps)
         InterruptData = true,
     }
 
-    -- Helper: try Ext.Stats.Get(id) -> H.ReadStatDescription.
+    -- Helper: try Ext.Stats.Get(id) -> Helpers.ReadStatDescription.
     -- Skips stat types that don't have Description per the game's schema.
     local function TryStatsDescription(statsId, label)
         if not statsId or statsId == "" then return nil end
@@ -119,7 +127,7 @@ local function LookupHotBarDescription(contentProps)
                     .. tostring(statType) .. " (no Description attribute, skipping)")
                 return nil
             end
-            local resolved = H.ReadStatDescription(statsData)
+            local resolved = Helpers.ReadStatDescription(statsData)
             if resolved and resolved ~= "" then
                 Log.Debug("  HotBar desc (" .. label .. "): " .. resolved)
                 return resolved
@@ -255,7 +263,7 @@ local function SpeakRadialSlot(slotData)
     if slotData.description and slotData.description ~= "" then
         table.insert(speechParts, slotData.description)
     end
-    local fullText = H.StripMarkupTags(table.concat(speechParts, ". "))
+    local fullText = Helpers.StripMarkupTags(table.concat(speechParts, ". "))
 
     -- No Lua-side dedup for radial events.  C++ handles dedup via
     -- pointer address comparison and resets on center rest.
@@ -295,7 +303,7 @@ local function ClearRadialFocus()
 end
 
 -- ============================================================================
--- Entry point (called by EventRouter)
+-- Entry point for radial (called by EventRouter)
 -- ============================================================================
 
 --- HandleRadialSlot: gather data then speak.
@@ -307,11 +315,783 @@ local function HandleRadialSlot(snapshot)
     end
 end
 
---- ResetState: clear radial tracking state.
+-- ============================================================================
+-- Panel handler factory (adapted from Menus.CreateMenuHandler)
+-- ============================================================================
+
+--- CreatePanelHandler: builds a handler with isolated state and a generic
+--- pipeline for in-game panel navigation.  Same factory pattern as
+--- Menus.CreateMenuHandler.
+---
+--- @param config table  Handler configuration:
+---   name (string)               -- handler name for logging
+---   hint (string|false|nil)     -- navigation hint text, false to suppress, nil for default
+---   onWidgetAdded (function)    -- optional: called on widgetAdded with (widgetData, handlerState)
+---   onReset (function)          -- optional: called on full state reset
+---   hintFn (function)           -- optional: dynamic hint based on (screenTitle, handlerState)
+---
+--- @return table  Handler with HandleSnapshot, HandleWidgetAdded,
+---                ResetState, ResetNavigation, ResetHint
+local function CreatePanelHandler(config)
+    local handlerState = {
+        lastSpokenName       = nil,
+        lastSpokenFullText   = nil,
+        lastSpokenTab        = nil,
+        lastSpokenTitle      = nil,
+        tabHintSpoken        = false,
+        screenEntryJustSpoke = false,
+        -- Optional: set by onWidgetAdded hooks for overrides.
+        titleOverride        = nil,
+        bodyOverride         = nil,
+    }
+
+    -- -----------------------------------------------------------------
+    -- HandleSnapshot: generic panel processing pipeline.
+    -- Handles classification, widget updates, carousel/value, screen
+    -- entry, item navigation, and speech output.
+    -- -----------------------------------------------------------------
+    local function HandleSnapshot(snapshot)
+        local focusedElement = snapshot.focusedElement
+        if not focusedElement or not focusedElement.elemType then return end
+
+        -- Dialog answer navigation: when focus changes within an active
+        -- dialog, the cutscene module handles answer speech.
+        if snapshot.focusChanged and focusedElement
+            and Cutscene.HandleDialogAnswerFocus(focusedElement) then
+            return
+        end
+
+        -- =============================================================
+        -- Classify: what kind of change is this?
+        -- =============================================================
+        local elemId = focusedElement.elemId or ""
+        local hasCarousel = snapshot.inlineCarouselChanged
+            and snapshot.inlineCarouselValue
+            and snapshot.inlineCarouselValue ~= ""
+
+        local isScreenEntry = false
+        if snapshot.selectionChanged then
+            isScreenEntry = true
+        elseif snapshot.widgetAdded and snapshot.widgetData
+            and not handlerState.lastSpokenTab then
+            isScreenEntry = true
+        elseif snapshot.focusChanged and focusedElement.isTab then
+            isScreenEntry = true
+        end
+
+        local isItemNav = snapshot.focusChanged
+            and not focusedElement.isTab and not isScreenEntry
+        local isCarouselOnly = hasCarousel and not snapshot.focusChanged
+        local isValueOnly = not isScreenEntry and not isItemNav
+            and not isCarouselOnly and snapshot.valueChanged
+
+        -- Widget text update: DC property changed (e.g., status text
+        -- update) or dialog appeared without focus change.
+        if not isScreenEntry and not isItemNav
+            and snapshot.widgetAdded and snapshot.widgetData then
+            local _, widgetBody, widgetActions = Helpers.ExtractFromWidgetData(
+                snapshot.widgetData)
+            local updateText = widgetBody or widgetActions
+            if updateText and updateText ~= ""
+                and updateText ~= handlerState.lastSpokenFullText then
+                handlerState.lastSpokenFullText = updateText
+                Log.Info("WIDGET UPDATE [" .. config.name .. "]: "
+                    .. updateText)
+                Ext.Tolk.Speak(updateText, true)
+                return
+            end
+        end
+
+        if not isScreenEntry and not isItemNav
+            and not isCarouselOnly and not isValueOnly then
+            return
+        end
+
+        -- =============================================================
+        -- Standalone carousel or value.
+        -- =============================================================
+        if isCarouselOnly then
+            local carouselValue = snapshot.inlineCarouselValue
+            if carouselValue ~= handlerState.lastSpokenFullText then
+                handlerState.lastSpokenFullText = carouselValue
+                Log.Info("CAROUSEL [" .. config.name .. "]: "
+                    .. carouselValue)
+                Ext.Tolk.Speak(carouselValue, true)
+            end
+            return
+        end
+
+        if isValueOnly then
+            local valueText = Helpers.FormatDCValue(focusedElement.dcProps)
+            if valueText and valueText ~= ""
+                and valueText ~= handlerState.lastSpokenFullText then
+                handlerState.lastSpokenFullText = valueText
+                Log.Info("VALUE [" .. config.name .. "]: " .. valueText)
+                Ext.Tolk.Speak(valueText, true)
+            end
+            return
+        end
+
+        -- =============================================================
+        -- Screen entry or item navigation: fill slots, speak.
+        -- =============================================================
+        local slots = {}
+        local tabName = nil
+        local normalTab = ""
+        local screenTitle = nil
+
+        if isScreenEntry then
+            -- Derive tab name.
+            if focusedElement.isTab then
+                tabName = focusedElement.tabName
+            end
+            normalTab = tabName and Helpers.NormalizeForCompare(tabName) or ""
+
+            -- Dedup: skip if same tab.
+            if tabName and tabName == handlerState.lastSpokenTab then
+                Log.Debug("SKIP screen entry (same tab) ["
+                    .. config.name .. "]: " .. tabName)
+                return
+            end
+
+            Log.Info("SCREEN ENTRY [" .. config.name .. "]: tab="
+                .. tostring(tabName)
+                .. " sel=" .. tostring(snapshot.selectionChanged)
+                .. " widget=" .. tostring(snapshot.widgetAdded))
+
+            -- Always update, even when nil, so widgetAdded doesn't
+            -- re-trigger.  Empty string = "screen entry processed".
+            handlerState.lastSpokenTab = tabName or ""
+            handlerState.lastSpokenName = nil
+
+            -- Gather data sources.
+            local allNamedTexts = {}
+            if focusedElement.namedTexts then
+                for elementName, elementText in pairs(focusedElement.namedTexts) do
+                    allNamedTexts[elementName] = elementText
+                end
+            end
+            if snapshot.widgetData and snapshot.widgetData.namedTexts then
+                for elementName, elementText in pairs(snapshot.widgetData.namedTexts) do
+                    if not allNamedTexts[elementName] then
+                        allNamedTexts[elementName] = elementText
+                    end
+                end
+            end
+            local nsTitle, nsBodyParts = Helpers.ExtractFromNamedTexts(
+                allNamedTexts)
+            local widgetTitle, widgetBody, widgetActions =
+                Helpers.ExtractFromWidgetData(snapshot.widgetData)
+
+            -- Title.
+            screenTitle = nsTitle or widgetTitle
+            -- Synthetic title from onWidgetAdded (e.g., "Item" / "Spell"
+            -- for SelectionFlyOut where the real title is inaccessible).
+            if not screenTitle and handlerState.titleOverride then
+                screenTitle = handlerState.titleOverride
+                handlerState.titleOverride = nil
+            end
+            if screenTitle and normalTab ~= ""
+                and Helpers.NormalizeForCompare(screenTitle) == normalTab then
+                screenTitle = nil
+            end
+            if screenTitle
+                and screenTitle == handlerState.lastSpokenTitle then
+                screenTitle = nil
+            end
+            if screenTitle then
+                handlerState.lastSpokenTitle = screenTitle
+                slots["title"] = screenTitle
+            end
+
+            -- Hint (once per panel visit).
+            -- Skip when customSpeakFn is configured -- the custom
+            -- function manages its own hint timing and placement.
+            if not config.customSpeakFn
+                and not handlerState.tabHintSpoken then
+                handlerState.tabHintSpoken = true
+                local panelHint
+                -- hintFn(screenTitle, handlerState) allows dynamic hints.
+                if config.hintFn then
+                    panelHint = config.hintFn(screenTitle, handlerState)
+                else
+                    -- nil means use default hint, false means no hint.
+                    panelHint = config.hint
+                    if panelHint == nil then
+                        panelHint = DEFAULT_PANEL_HINT
+                    end
+                end
+                if panelHint then
+                    slots["hint"] = panelHint
+                end
+            end
+
+            -- Tab name (suppress if title contains it).
+            if tabName then
+                local showTabName = true
+                if screenTitle
+                    and Helpers.NormalizeForCompare(screenTitle):find(
+                        normalTab, 1, true) then
+                    showTabName = false
+                end
+                if showTabName then
+                    slots["tabName"] = tabName
+                end
+            end
+
+            -- Body.
+            local bodyAssembled = nil
+            if nsBodyParts and #nsBodyParts > 0 then
+                bodyAssembled = table.concat(nsBodyParts, ". ")
+            end
+            if not bodyAssembled and handlerState.bodyOverride then
+                bodyAssembled = handlerState.bodyOverride
+                handlerState.bodyOverride = nil
+            end
+            if not bodyAssembled and widgetBody then
+                bodyAssembled = widgetBody
+            end
+            local statusText = Helpers.ExtractStatusText(
+                focusedElement.dcProps)
+            if statusText then
+                bodyAssembled = bodyAssembled
+                    and (bodyAssembled .. ". " .. statusText) or statusText
+            end
+            if bodyAssembled then
+                slots["body"] = bodyAssembled
+            end
+            -- Dialog button actions (e.g., "A: Yes, B: No").
+            if widgetActions then
+                slots["actions"] = widgetActions
+            end
+        else
+            -- Item navigation: dedup check.
+            if elemId == handlerState.lastSpokenName
+                and not hasCarousel then
+                local text = Helpers.ExtractTextFromData(
+                    focusedElement, handlerState.lastSpokenTab, false)
+                if not text
+                    or text == handlerState.lastSpokenFullText then
+                    Log.Debug("DEDUP SKIP [" .. config.name .. "]: "
+                        .. tostring(elemId))
+                    return
+                end
+            end
+        end
+
+        -- ----- Item slots -----
+        local itemName = nil
+        local itemInfo = nil
+        local itemValue = nil
+        local itemDesc = nil
+
+        local splitName, splitValue, splitDesc, splitValueDesc =
+            Helpers.FormatDCTextSplit(focusedElement.dcProps)
+        if not splitName or splitName == "" then
+            splitName = Helpers.ExtractTextFromData(
+                focusedElement, handlerState.lastSpokenTab, isScreenEntry)
+            splitValue = nil
+            splitDesc = nil
+            splitValueDesc = nil
+        end
+        if splitName and splitName ~= "" then
+            local normalItem = Helpers.NormalizeForCompare(splitName)
+            local normalTitle = screenTitle
+                and Helpers.NormalizeForCompare(screenTitle) or ""
+            local isDuplicate = (normalTab ~= ""
+                and normalItem == normalTab)
+                or (normalTitle ~= ""
+                    and (normalItem == normalTitle
+                        or normalTitle:find(normalItem, 1, true)))
+            if not isDuplicate then
+                itemName = splitName
+                itemValue = splitValue
+                -- When a value has its own description (combobox options),
+                -- put the setting description before the value (itemInfo)
+                -- and the value description after it (itemDesc).
+                -- Order: name -> setting desc -> value -> value desc
+                if splitValueDesc then
+                    itemInfo = splitDesc
+                    itemDesc = splitValueDesc
+                else
+                    itemDesc = splitDesc
+                end
+            end
+        end
+
+        if hasCarousel then
+            itemValue = snapshot.inlineCarouselValue
+        end
+
+        if itemName then
+            slots["itemName"] = itemName
+            handlerState.lastSpokenName = elemId
+            -- Only pre-set lastSpokenFullText for the default speech
+            -- path.  customSpeakFn manages its own dedup and updates
+            -- lastSpokenFullText after building the full speech string.
+            -- Pre-setting it here would defeat customSpeakFn's dedup
+            -- check (speech == lastSpokenFullText is always true).
+            if not config.customSpeakFn then
+                handlerState.lastSpokenFullText = itemName
+            end
+            Log.Info("ITEM [" .. config.name .. "]: "
+                .. tostring(focusedElement.elemType)
+                .. "  name=" .. itemName
+                .. (itemValue and ("  val=" .. itemValue) or "")
+                .. (itemDesc
+                    and ("  desc=" .. tostring(itemDesc):sub(1, 40))
+                    or ""))
+        end
+        if itemInfo then slots["itemInfo"] = itemInfo end
+        if itemValue then slots["itemValue"] = itemValue end
+        if itemDesc then slots["itemDesc"] = itemDesc end
+
+        -- customSpeakFn lets a handler control speech ordering entirely.
+        -- It receives (slots, handlerState, isScreenEntry) and is
+        -- responsible for calling Ext.Tolk.Speak and updating
+        -- handlerState.lastSpokenFullText / screenEntryJustSpoke.
+        if config.customSpeakFn then
+            config.customSpeakFn(slots, handlerState, isScreenEntry)
+        else
+            Helpers.SpeakSlots(slots, handlerState, isScreenEntry)
+        end
+    end
+
+    -- -----------------------------------------------------------------
+    -- HandleWidgetAdded: process widget added events.
+    -- -----------------------------------------------------------------
+    local function HandleWidgetAdded(widgetData)
+        if config.onWidgetAdded then
+            config.onWidgetAdded(widgetData, handlerState)
+        end
+    end
+
+    -- -----------------------------------------------------------------
+    -- State management.
+    -- -----------------------------------------------------------------
+
+    --- ResetState: full reset (GameStateChanged or handler deactivation).
+    local function ResetState()
+        handlerState.lastSpokenName = nil
+        handlerState.lastSpokenFullText = nil
+        handlerState.lastSpokenTab = nil
+        handlerState.lastSpokenTitle = nil
+        handlerState.tabHintSpoken = false
+        handlerState.screenEntryJustSpoke = false
+        handlerState.titleOverride = nil
+        handlerState.bodyOverride = nil
+        if config.onReset then
+            config.onReset(handlerState)
+        end
+    end
+
+    --- ResetNavigation: partial reset for widget root change within
+    --- the same handler (e.g., switching tabs in inventory).
+    --- Preserves tabHintSpoken so the hint doesn't re-speak.
+    local function ResetNavigation()
+        handlerState.lastSpokenTab = nil
+        handlerState.lastSpokenTitle = nil
+        handlerState.lastSpokenName = nil
+        handlerState.screenEntryJustSpoke = false
+        handlerState.titleOverride = nil
+        handlerState.bodyOverride = nil
+    end
+
+    --- ResetHint: reset tabHintSpoken so the hint speaks on next visit.
+    --- Called when this handler is deactivated (different handler takes over).
+    local function ResetHint()
+        handlerState.tabHintSpoken = false
+    end
+
+    return {
+        name              = config.name,
+        HandleSnapshot    = HandleSnapshot,
+        HandleWidgetAdded = HandleWidgetAdded,
+        ResetState        = ResetState,
+        ResetNavigation   = ResetNavigation,
+        ResetHint         = ResetHint,
+    }
+end
+
+-- ============================================================================
+-- Panel handler instances
+-- ============================================================================
+
+-- Character sheet / inventory / equipment (tabbed: Inventory, Character
+-- Sheet, Spells, Features).
+local CharacterPanelHandler = CreatePanelHandler({
+    name = "CharacterPanel",
+    hint = "Use bumpers to switch tabs. Up and down to navigate items.",
+})
+
+-- Trading / bartering dual inventory.
+local TradeHandler = CreatePanelHandler({
+    name = "Trade",
+    hint = "Use bumpers to switch between inventories."
+        .. " Up and down to navigate items.",
+})
+
+-- Inspect character or item details.
+local ExamineHandler = CreatePanelHandler({
+    name = "Examine",
+    hint = false,
+})
+
+-- Dice roll UI for skill checks and saving throws.
+local ActiveRollHandler = CreatePanelHandler({
+    name = "ActiveRoll",
+    hint = false,
+})
+
+-- Reaction ability decision during combat.
+local ReactionHandler = CreatePanelHandler({
+    name = "Reaction",
+    hint = false,
+})
+
+-- Alchemy crafting (recipes and ingredients).
+local AlchemyHandler = CreatePanelHandler({
+    name = "Alchemy",
+    hint = "Up and down to browse recipes.",
+})
+
+-- Item combination crafting.
+local CombineHandler = CreatePanelHandler({
+    name = "Combine",
+    hint = false,
+})
+
+-- Give items to NPC.
+local DonateHandler = CreatePanelHandler({
+    name = "Donate",
+    hint = false,
+})
+
+-- Pickpocket item selection.
+local PickpocketHandler = CreatePanelHandler({
+    name = "Pickpocket",
+    hint = false,
+})
+
+-- Spell scroll learning.
+local LearnSpellsHandler = CreatePanelHandler({
+    name = "LearnSpells",
+    hint = false,
+})
+
+-- Camp supplies / long rest.
+local CampHandler = CreatePanelHandler({
+    name = "Camp",
+    hint = false,
+})
+
+-- Quest log with categories (tabbed).
+local JournalQuestsHandler = CreatePanelHandler({
+    name = "JournalQuests",
+    hint = "Use bumpers to switch categories."
+        .. " Up and down to browse entries.",
+})
+
+-- Dialogue history with portraits.
+local JournalDialoguesHandler = CreatePanelHandler({
+    name = "JournalDialogues",
+    hint = false,
+})
+
+-- Illithid power tree progression.
+local TadpoleHandler = CreatePanelHandler({
+    name = "TadpolePowers",
+    hint = false,
+})
+
+-- Ground item or equipment slot picker.
+-- C++ post-processor extracts ObjectCollectionList[0].Title as
+-- "CollectionTitle" (e.g. "Search Results").  PanelContentType
+-- distinguishes "Item" from "Spell" for context-appropriate hints.
+-- Uses customSpeakFn for speech order: title, item name, then hints.
+-- Speech on entry: "Search Results. Brine Bulb. A to attack. X for actions. B to close."
+-- Speech on nav:   "Brine Bulb."
+local SelectionFlyOutHandler = CreatePanelHandler({
+    name = "SelectionFlyOut",
+    hint = false,
+    onWidgetAdded = function(widgetData, handlerState)
+        if widgetData.dcProps then
+            -- CollectionTitle from C++ post-processor (DCSelectionFlyOut).
+            -- Title from direct DC property (DCActiveSearch).
+            handlerState.collectionTitle =
+                widgetData.dcProps.CollectionTitle
+                or widgetData.dcProps.Title
+            handlerState.panelContentType =
+                widgetData.dcProps.PanelContentType
+        end
+    end,
+    onReset = function(handlerState)
+        handlerState.collectionTitle = nil
+        handlerState.panelContentType = nil
+    end,
+    customSpeakFn = function(slots, handlerState, isScreenEntry)
+        local parts = {}
+        if isScreenEntry then
+            -- Title from C++ collection extraction (e.g. "Search Results").
+            local title = handlerState.collectionTitle
+            if title then
+                table.insert(parts, title)
+            end
+        end
+        -- Item name.
+        if slots.itemName then
+            table.insert(parts, slots.itemName)
+        end
+        -- Value and description after name.
+        if slots.itemValue then
+            table.insert(parts, slots.itemValue)
+        end
+        if slots.itemDesc then
+            table.insert(parts, slots.itemDesc)
+        end
+        -- Hint on first visit only, AFTER the item name.
+        if isScreenEntry and not handlerState.tabHintSpoken then
+            handlerState.tabHintSpoken = true
+            if handlerState.panelContentType == "Spell" then
+                table.insert(parts, "A to cast. X for actions. B to close")
+            else
+                table.insert(parts,
+                    "A to attack. X for actions. B to close")
+            end
+        end
+        if #parts == 0 then return end
+        local speech = Helpers.StripMarkupTags(table.concat(parts, ". "))
+        if not speech or speech == "" then return end
+        if speech == handlerState.lastSpokenFullText
+            and not isScreenEntry then
+            return
+        end
+        Log.Info("FLYOUT [" .. (isScreenEntry and "entry" or "nav")
+            .. "]: " .. speech)
+        Ext.Tolk.Speak(speech, true)
+        handlerState.lastSpokenFullText = speech
+        if isScreenEntry then
+            handlerState.screenEntryJustSpoke = true
+        end
+    end,
+})
+
+-- Quest or encounter reward selection.
+local RewardHandler = CreatePanelHandler({
+    name = "Reward",
+    hint = false,
+})
+
+-- Save name input dialog.
+local SavePopupHandler = CreatePanelHandler({
+    name = "SavePopup",
+    hint = false,
+})
+
+-- Honour mode death memorial.
+local HonourHandler = CreatePanelHandler({
+    name = "Honour",
+    hint = false,
+})
+
+-- Online / crossplay settings (in-game).
+local ConnectivityHandler = CreatePanelHandler({
+    name = "Connectivity",
+    hint = false,
+})
+
+-- Larian account sign-up.
+local SignUpHandler = CreatePanelHandler({
+    name = "SignUp",
+    hint = false,
+})
+
+-- Sensitive content settings (nudity, gore).
+local FirstTimeSetupHandler = CreatePanelHandler({
+    name = "FirstTimeSetup",
+    hint = false,
+})
+
+-- HDR calibration.
+local HDRHandler = CreatePanelHandler({
+    name = "HDR",
+    hint = false,
+})
+
+-- Gamma / brightness calibration.
+local GammaHandler = CreatePanelHandler({
+    name = "Gamma",
+    hint = false,
+})
+
+-- Crossplay player report form.
+local ReportHandler = CreatePanelHandler({
+    name = "Report",
+    hint = false,
+})
+
+-- Multiplayer lobby room (different from lobby browser in Menus).
+local LobbyHandler = CreatePanelHandler({
+    name = "Lobby",
+    hint = false,
+})
+
+-- ============================================================================
+-- Panel DC type routing table
+-- ============================================================================
+
+local DC_TYPE_HANDLERS = {
+    -- Character sheet / inventory
+    ["gui::DCCharacterPanels"]    = CharacterPanelHandler,
+    -- Trading
+    ["gui::DCTrade"]              = TradeHandler,
+    -- Examine / inspect
+    ["gui::DCExamine"]            = ExamineHandler,
+    -- Dice rolls and reactions
+    ["gui::DCActiveRoll"]         = ActiveRollHandler,
+    ["gui::DCReactionDecision"]   = ReactionHandler,
+    -- Crafting
+    ["gui::DCAlchemy"]            = AlchemyHandler,
+    ["gui::DCCombine"]            = CombineHandler,
+    -- Item transfer
+    ["gui::DCDonate"]             = DonateHandler,
+    ["gui::DCPickpocket"]         = PickpocketHandler,
+    ["gui::DCLearnSpells"]        = LearnSpellsHandler,
+    -- Camp / rest
+    ["gui::DCMakeCamp"]           = CampHandler,
+    -- Journal
+    ["gui::DCJournalQuests"]      = JournalQuestsHandler,
+    ["gui::DCJournalDialogues"]   = JournalDialoguesHandler,
+    -- Illithid powers
+    ["gui::DCTadpolePowersTree"]  = TadpoleHandler,
+    -- Selection / rewards
+    ["gui::DCSelectionFlyOut"]    = SelectionFlyOutHandler,
+    ["gui::DCActiveSearch"]       = SelectionFlyOutHandler,
+    ["gui::DCRewardPanel"]        = RewardHandler,
+    -- Popups
+    ["gui::DCNewSavegamePopup"]   = SavePopupHandler,
+    ["gui::DCProofOfHonour"]      = HonourHandler,
+    -- Settings (in-game)
+    ["gui::DCConnectivityMenu"]   = ConnectivityHandler,
+    ["gui::DCSignUp"]             = SignUpHandler,
+    ["gui::DCFirstTimeSetup"]     = FirstTimeSetupHandler,
+    ["gui::DCHDRCalibration"]     = HDRHandler,
+    ["gui::DCGammaCalibration"]   = GammaHandler,
+    ["gui::DCReport"]             = ReportHandler,
+    -- Multiplayer lobby
+    ["gui::DCLobby"]              = LobbyHandler,
+}
+
+-- All handler instances for batch reset.
+local ALL_PANEL_HANDLERS = {
+    CharacterPanelHandler,
+    TradeHandler,
+    ExamineHandler,
+    ActiveRollHandler,
+    ReactionHandler,
+    AlchemyHandler,
+    CombineHandler,
+    DonateHandler,
+    PickpocketHandler,
+    LearnSpellsHandler,
+    CampHandler,
+    JournalQuestsHandler,
+    JournalDialoguesHandler,
+    TadpoleHandler,
+    SelectionFlyOutHandler,
+    RewardHandler,
+    SavePopupHandler,
+    HonourHandler,
+    ConnectivityHandler,
+    SignUpHandler,
+    FirstTimeSetupHandler,
+    HDRHandler,
+    GammaHandler,
+    ReportHandler,
+    LobbyHandler,
+}
+
+-- ============================================================================
+-- Panel routing (active handler tracking)
+-- ============================================================================
+
+-- Currently active panel handler (set by widget events).
+local activePanelHandler = nil
+
+--- IsWorldDCType: returns true if the given DC type belongs to an
+--- in-game panel handled by WorldUI.
+--- @param dcType string  The DataContext type from a widget.
+--- @return boolean
+local function IsWorldDCType(dcType)
+    if not dcType then return false end
+    return DC_TYPE_HANDLERS[dcType] ~= nil
+end
+
+--- HandlePanelWidgetAdded: called by EventRouter when a WorldUI panel
+--- widget appears.  Updates the active handler and calls its hook.
+--- @param widgetData table  The widget data from the snapshot.
+local function HandlePanelWidgetAdded(widgetData)
+    if not widgetData or not widgetData.dcType then return end
+
+    local newHandler = DC_TYPE_HANDLERS[widgetData.dcType]
+    if not newHandler then return end
+
+    if newHandler ~= activePanelHandler then
+        -- Deactivating old handler: full reset so it's clean on return.
+        if activePanelHandler then
+            activePanelHandler.ResetState()
+        end
+        activePanelHandler = newHandler
+        Log.Info("Active panel: " .. activePanelHandler.name
+            .. " (dc=" .. widgetData.dcType .. ")")
+    end
+
+    activePanelHandler.HandleWidgetAdded(widgetData)
+end
+
+--- HandlePanelWidgetRootChanged: called by EventRouter when the widget
+--- root changes while a WorldUI panel is active.
+local function HandlePanelWidgetRootChanged()
+    if activePanelHandler then
+        activePanelHandler.ResetNavigation()
+    end
+end
+
+--- RoutePanelSnapshot: called by EventRouter for all snapshots when
+--- a WorldUI panel is active.
+--- @param snapshot table  The full TickSnapshot from C++.
+local function RoutePanelSnapshot(snapshot)
+    if not activePanelHandler then return end
+    activePanelHandler.HandleSnapshot(snapshot)
+end
+
+--- ResetAllPanelHandlers: called on GameStateChanged or when switching
+--- away from WorldUI panels.  Resets all handler state.
+local function ResetAllPanelHandlers()
+    for handlerIndex = 1, #ALL_PANEL_HANDLERS do
+        ALL_PANEL_HANDLERS[handlerIndex].ResetState()
+    end
+    activePanelHandler = nil
+end
+
+--- GetActivePanelHandler: returns the currently active panel handler.
+--- @return table|nil  The active handler instance, or nil.
+local function GetActivePanelHandler()
+    return activePanelHandler
+end
+
+-- ============================================================================
+-- State management
+-- ============================================================================
+
+--- ResetState: clear all WorldUI state (radial + panels).
 --- Called on GameStateChanged to prevent stale dedup across sessions.
 local function ResetState()
+    -- Radial state.
     radialHintSpoken = false
     inRadial = false
+    -- Panel state.
+    ResetAllPanelHandlers()
 end
 
 -- ============================================================================
@@ -319,8 +1099,17 @@ end
 -- ============================================================================
 
 BG3Access.Client.WorldUI = {
-    HandleRadialOpen  = HandleRadialOpen,
-    ClearRadialFocus  = ClearRadialFocus,
-    HandleRadialSlot  = HandleRadialSlot,
-    ResetState        = ResetState,
+    -- Radial
+    HandleRadialOpen           = HandleRadialOpen,
+    ClearRadialFocus           = ClearRadialFocus,
+    HandleRadialSlot           = HandleRadialSlot,
+    -- Panel routing
+    IsWorldDCType              = IsWorldDCType,
+    HandlePanelWidgetAdded     = HandlePanelWidgetAdded,
+    HandlePanelWidgetRootChanged = HandlePanelWidgetRootChanged,
+    RoutePanelSnapshot         = RoutePanelSnapshot,
+    ResetAllPanelHandlers      = ResetAllPanelHandlers,
+    GetActivePanelHandler      = GetActivePanelHandler,
+    -- State management
+    ResetState                 = ResetState,
 }

@@ -14,8 +14,8 @@ BG3Access = BG3Access or {}
 BG3Access.Client = BG3Access.Client or {}
 
 local Log = BG3Access.Client.Log
-local H   = BG3Access.Client.Helpers
-local CS  = BG3Access.Client.Cutscene
+local Helpers  = BG3Access.Client.Helpers
+local Cutscene = BG3Access.Client.Cutscene
 
 -- ============================================================================
 -- Controller bindings interactive mode (Options-specific)
@@ -55,7 +55,7 @@ local function SpeakControllerBinding(dcKey)
     local binding = controllerBindingsData[dcKey]
     if type(binding) ~= "table" or not binding.Functionality then return false end
     local displayName = BUTTON_DISPLAY_NAMES[dcKey] or dcKey
-    local functionality = H.CleanControllerFunctionality(binding.Functionality)
+    local functionality = Helpers.CleanControllerFunctionality(binding.Functionality)
     if not functionality or functionality == "" then return false end
     local speech = displayName .. ": " .. functionality
     Log.Info("Controller binding -> " .. speech)
@@ -172,7 +172,7 @@ local function CreateMenuHandler(config)
         -- Dialog answer navigation: when focus changes within an active
         -- dialog, the cutscene module handles answer speech.
         if snapshot.focusChanged and focusedElement
-            and CS.HandleDialogAnswerFocus(focusedElement) then
+            and Cutscene.HandleDialogAnswerFocus(focusedElement) then
             return
         end
 
@@ -204,7 +204,7 @@ local function CreateMenuHandler(config)
         -- -> "No lobbies found") or dialog appeared without focus change.
         if not isScreenEntry and not isItemNav
             and snapshot.widgetAdded and snapshot.widgetData then
-            local _, widgetBody, widgetActions = H.ExtractFromWidgetData(
+            local _, widgetBody, widgetActions = Helpers.ExtractFromWidgetData(
                 snapshot.widgetData)
             local updateText = widgetBody or widgetActions
             if updateText and updateText ~= ""
@@ -237,7 +237,7 @@ local function CreateMenuHandler(config)
         end
 
         if isValueOnly then
-            local valueText = H.FormatDCValue(focusedElement.dcProps)
+            local valueText = Helpers.FormatDCValue(focusedElement.dcProps)
             if valueText and valueText ~= ""
                 and valueText ~= handlerState.lastSpokenFullText then
                 handlerState.lastSpokenFullText = valueText
@@ -260,7 +260,7 @@ local function CreateMenuHandler(config)
             if focusedElement.isTab then
                 tabName = focusedElement.tabName
             end
-            normalTab = tabName and H.NormalizeForCompare(tabName) or ""
+            normalTab = tabName and Helpers.NormalizeForCompare(tabName) or ""
 
             -- Dedup: skip if same tab.
             if tabName and tabName == handlerState.lastSpokenTab then
@@ -293,15 +293,15 @@ local function CreateMenuHandler(config)
                     end
                 end
             end
-            local nsTitle, nsBodyParts = H.ExtractFromNamedTexts(
+            local nsTitle, nsBodyParts = Helpers.ExtractFromNamedTexts(
                 allNamedTexts)
             local widgetTitle, widgetBody, widgetActions =
-                H.ExtractFromWidgetData(snapshot.widgetData)
+                Helpers.ExtractFromWidgetData(snapshot.widgetData)
 
             -- Title.
             screenTitle = nsTitle or widgetTitle
             if screenTitle and normalTab ~= ""
-                and H.NormalizeForCompare(screenTitle) == normalTab then
+                and Helpers.NormalizeForCompare(screenTitle) == normalTab then
                 screenTitle = nil
             end
             if screenTitle
@@ -337,7 +337,7 @@ local function CreateMenuHandler(config)
             if tabName then
                 local showTabName = true
                 if screenTitle
-                    and H.NormalizeForCompare(screenTitle):find(
+                    and Helpers.NormalizeForCompare(screenTitle):find(
                         normalTab, 1, true) then
                     showTabName = false
                 end
@@ -358,7 +358,7 @@ local function CreateMenuHandler(config)
             if not bodyAssembled and widgetBody then
                 bodyAssembled = widgetBody
             end
-            local statusText = H.ExtractStatusText(
+            local statusText = Helpers.ExtractStatusText(
                 focusedElement.dcProps)
             if statusText then
                 bodyAssembled = bodyAssembled
@@ -375,7 +375,7 @@ local function CreateMenuHandler(config)
             -- Item navigation: dedup check.
             if elemId == handlerState.lastSpokenName
                 and not hasCarousel then
-                local text = H.ExtractTextFromData(
+                local text = Helpers.ExtractTextFromData(
                     focusedElement, handlerState.lastSpokenTab, false)
                 if not text
                     or text == handlerState.lastSpokenFullText then
@@ -393,18 +393,18 @@ local function CreateMenuHandler(config)
         local itemDesc = nil
 
         local splitName, splitValue, splitDesc, splitValueDesc =
-            H.FormatDCTextSplit(focusedElement.dcProps)
+            Helpers.FormatDCTextSplit(focusedElement.dcProps)
         if not splitName or splitName == "" then
-            splitName = H.ExtractTextFromData(
+            splitName = Helpers.ExtractTextFromData(
                 focusedElement, handlerState.lastSpokenTab, isScreenEntry)
             splitValue = nil
             splitDesc = nil
             splitValueDesc = nil
         end
         if splitName and splitName ~= "" then
-            local normalItem = H.NormalizeForCompare(splitName)
+            local normalItem = Helpers.NormalizeForCompare(splitName)
             local normalTitle = screenTitle
-                and H.NormalizeForCompare(screenTitle) or ""
+                and Helpers.NormalizeForCompare(screenTitle) or ""
             local isDuplicate = (normalTab ~= ""
                 and normalItem == normalTab)
                 or (normalTitle ~= ""
@@ -446,7 +446,7 @@ local function CreateMenuHandler(config)
         if itemValue then slots["itemValue"] = itemValue end
         if itemDesc then slots["itemDesc"] = itemDesc end
 
-        H.SpeakSlots(slots, handlerState, isScreenEntry)
+        Helpers.SpeakSlots(slots, handlerState, isScreenEntry)
     end
 
     -- -----------------------------------------------------------------
@@ -710,7 +710,7 @@ local function HandleWidgetAdded(widgetData)
     activeHandler.HandleWidgetAdded(widgetData)
 end
 
---- HandleDialogOverlay: called by the Manager when a dialog overlay
+--- HandleDialogOverlay: called by EventRouter when a dialog overlay
 --- widget appears.  Only speaks if the snapshot context indicates a
 --- genuine modal dialog (not a pre-loaded widget).
 ---
@@ -721,15 +721,16 @@ end
 ---
 --- @param snapshot table  The full TickSnapshot from C++.
 --- @param widgetData table  The widget data for the dialog overlay.
+--- @return boolean  True if the dialog was spoken, false otherwise.
 local function HandleDialogOverlay(snapshot, widgetData)
     -- Skip if focus or selection changed on this tick -- the dialog
     -- is pre-loaded alongside a navigation event, not user-triggered.
     if snapshot.focusChanged or snapshot.selectionChanged then
         Log.Debug("Skipping pre-loaded dialog overlay (focus/sel changed)")
-        return
+        return false
     end
 
-    local _, bodyText, actionsText = H.ExtractFromWidgetData(widgetData)
+    local _, bodyText, actionsText = Helpers.ExtractFromWidgetData(widgetData)
     local titleText = nil
     if widgetData.dcProps then
         titleText = widgetData.dcProps.Title or widgetData.dcProps.TitleText
@@ -754,13 +755,15 @@ local function HandleDialogOverlay(snapshot, widgetData)
     if bodyText then table.insert(parts, bodyText) end
     if actionsText then table.insert(parts, actionsText) end
     if #parts > 0 then
-        local speech = H.StripMarkupTags(table.concat(parts, ". "))
+        local speech = Helpers.StripMarkupTags(table.concat(parts, ". "))
         Log.Info("DIALOG OVERLAY: " .. speech)
         Ext.Tolk.Speak(speech, true)
-        -- Suppress the active handler on this tick so the dialog
+        -- Suppress the active Menus handler on this tick so the dialog
         -- isn't immediately interrupted by the underlying menu.
         dialogOverlayJustSpoke = true
+        return true
     end
+    return false
 end
 
 --- HandleWidgetRootChanged: called by the Manager when the widget root

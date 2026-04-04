@@ -738,9 +738,9 @@ local function ExtractFromNamedTexts(namedTexts)
             or nameLower:find("message") or nameLower:find("warning")
             or nameLower:find("busy") or nameLower:find("status")
             or nameLower:find("info")
-            or nameLower == "_visualtext" then
+            or nameLower:find("^_visualtext") then
             -- Filter out pure numeric text (e.g., "93%" from loading progress).
-            if nameLower == "_visualtext" and elementText:match("^%d+%%?$") then
+            if nameLower:find("^_visualtext") and elementText:match("^%d+%%?$") then
                 -- skip progress percentages
             else
                 table.insert(bodyParts, elementText)

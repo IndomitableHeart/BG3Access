@@ -25,7 +25,7 @@
 -- No walkability scanning -- the path IS the validation.
 
 local Log = BG3Access.Client.Log
-local H   = BG3Access.Client.Helpers
+local Helpers = BG3Access.Client.Helpers
 
 -- ============================================================================
 -- Constants
@@ -190,7 +190,7 @@ end
 local function ResolveTranslatedString(translatedString)
     if not translatedString then return nil end
     if type(translatedString) == "string" then
-        return H.GetTranslatedStringIfHandle(translatedString)
+        return Helpers.GetTranslatedStringIfHandle(translatedString)
     end
     -- TranslatedString userdata: dig into .Handle.Handle for the key.
     local handle = nil
@@ -198,7 +198,7 @@ local function ResolveTranslatedString(translatedString)
         handle = translatedString.Handle.Handle
     end)
     if handle then
-        return H.GetTranslatedStringIfHandle(handle)
+        return Helpers.GetTranslatedStringIfHandle(handle)
     end
     return nil
 end

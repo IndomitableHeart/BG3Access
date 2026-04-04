@@ -12,7 +12,7 @@
 -- This module reads widget DC properties for speech output.
 
 local Log = BG3Access.Client.Log
-local H   = BG3Access.Client.Helpers
+local Helpers = BG3Access.Client.Helpers
 
 -- ============================================================================
 -- Constants
@@ -96,12 +96,12 @@ local function HandleSubtitle(dcProps)
     dialogState.inCutscene = true
 
     -- Strip markup tags from both fields.
-    local cleanSubtitle = H.StripMarkupTags(subtitleText)
+    local cleanSubtitle = Helpers.StripMarkupTags(subtitleText)
     if not cleanSubtitle or cleanSubtitle == "" then return end
 
     local parts = {}
     if speakerName and speakerName ~= "" then
-        local cleanSpeaker = H.StripMarkupTags(speakerName)
+        local cleanSpeaker = Helpers.StripMarkupTags(speakerName)
         if cleanSpeaker and cleanSpeaker ~= "" then
             table.insert(parts, cleanSpeaker)
         end
@@ -129,7 +129,7 @@ local function HandleDialogWidget(dcProps)
     dialogState.lastBodyText = bodyText
     dialogState.inDialog = true
 
-    local cleanBody = H.StripMarkupTags(bodyText)
+    local cleanBody = Helpers.StripMarkupTags(bodyText)
     if not cleanBody or cleanBody == "" then return end
 
     Log.Info("DIALOG: " .. cleanBody:sub(1, 80))
@@ -158,7 +158,7 @@ local function HandleDialogAnswerFocus(focusedElement)
 
     dialogState.lastAnswerText = answerText
 
-    local cleanAnswer = H.StripMarkupTags(answerText)
+    local cleanAnswer = Helpers.StripMarkupTags(answerText)
     if not cleanAnswer or cleanAnswer == "" then return false end
 
     -- Prefix with answer number if available.
@@ -228,23 +228,39 @@ local AD_TRACKS = {
 
 -- Tracks whether AD has already played this session to avoid replaying
 -- on subsequent Running transitions (e.g. after a save/load cycle).
-local adPlayedThisSession = true
+local adPlayedThisSession = false
+
+-- Set true when the user goes through the new game flow (difficulty
+-- selection via DCNewGameSettings).  Prevents AD from firing on
+-- "Continue" or "Load Game", which use the same StopLoading ->
+-- PrepareRunning transition but skip the new game screens.
+local newGameInitiated = false
 
 -- Delay (ms) between the Running state and AD playback start.
 -- Tune this to align with the actual cutscene start.
-local AD_START_DELAY_MS = 1500
+local AD_START_DELAY_MS = 200
+
+-- Called by EventRouter when a DCNewGameSettings widget appears
+-- (difficulty selection screen), signalling a genuine new game flow.
+local function NotifyNewGameInitiated()
+    newGameInitiated = true
+    Log.Info("AD: New game flow detected (difficulty selection)")
+end
 
 -- Called from the Manager on every GameStateChanged event.
 local function HandleGameStateForAD(fromState, toState)
     Log.Info("AD CHECK: " .. fromState .. " -> " .. toState
-        .. " played=" .. tostring(adPlayedThisSession))
+        .. " played=" .. tostring(adPlayedThisSession)
+        .. " newGame=" .. tostring(newGameInitiated))
 
-    -- The opening cutscene begins exactly on PrepareRunning -> Running.
-    -- This transition only fires when entering gameplay, never at
-    -- startup or the main menu.  Play once per VM session.
+    -- The opening cutscene begins on StopLoading -> PrepareRunning.
+    -- This transition fires for BOTH new games AND continued saves.
+    -- Only play AD when the user went through the new game flow
+    -- (difficulty selection), not on Continue or Load Game.
     if fromState == "StopLoading" and toState == "PrepareRunning"
-        and not adPlayedThisSession then
+        and not adPlayedThisSession and newGameInitiated then
         adPlayedThisSession = true
+        newGameInitiated = false
         local adFile = AD_TRACKS.opening
         if adFile then
             local fullPath = AD_BASE_PATH .. adFile
@@ -266,9 +282,11 @@ local function HandleGameStateForAD(fromState, toState)
         end
     end
 
-    -- Returning to the main menu cancels any playing AD.
+    -- Returning to the main menu cancels any playing AD and resets the
+    -- new game flag so it doesn't carry over from an abandoned attempt.
     if toState == "Menu" then
         pcall(Ext.Audio.StopFile)
+        newGameInitiated = false
         Log.Debug("AD: Stopped (returned to menu)")
     end
 end
@@ -298,5 +316,6 @@ BG3Access.Client.Cutscene = {
     HandleDialogWidgetEvent   = HandleDialogWidgetEvent,
     HandleDialogAnswerFocus   = HandleDialogAnswerFocus,
     HandleGameStateForAD      = HandleGameStateForAD,
+    NotifyNewGameInitiated    = NotifyNewGameInitiated,
     ResetDialogState          = ResetDialogState,
 }

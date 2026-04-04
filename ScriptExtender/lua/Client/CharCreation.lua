@@ -11,7 +11,7 @@
 -- This module owns its own state table (ccState) with no shared state coupling.
 
 local Log = BG3Access.Client.Log
-local H   = BG3Access.Client.Helpers
+local Helpers = BG3Access.Client.Helpers
 
 
 -- ============================================================================
@@ -218,7 +218,7 @@ local function GetPageInstructionText(tabName)
     end
     local parts = {}
     for _, handle in ipairs(handles) do
-        local resolved = H.GetTranslatedStringIfHandle(handle)
+        local resolved = Helpers.GetTranslatedStringIfHandle(handle)
         if resolved and resolved ~= "" then
             table.insert(parts, resolved)
         end
@@ -305,10 +305,10 @@ local ccState = {
 -- Returns section name string or nil.
 -- Stat description helpers: use shared versions from Helpers.lua.
 -- ParseDescriptionParam, ResolveDescriptionParams, ReadStatDescription
--- are all defined in Helpers and exported as H.* functions.
-local ParseDescriptionParam = H.ParseDescriptionParam
-local ResolveDescriptionParams = H.ResolveDescriptionParams
-local ReadStatDescription = H.ReadStatDescription
+-- are all defined in Helpers and exported as Helpers.* functions.
+local ParseDescriptionParam = Helpers.ParseDescriptionParam
+local ResolveDescriptionParams = Helpers.ResolveDescriptionParams
+local ReadStatDescription = Helpers.ReadStatDescription
 
 -- Resolve a TranslatedString from a cached prototype's DescriptionInfo.
 -- Handles string, userdata (tostring resolves it), and table formats.
@@ -316,7 +316,7 @@ local function ResolveTranslatedString(translatedString)
     if not translatedString then return nil end
     local stringType = type(translatedString)
     if stringType == "string" and translatedString ~= "" then
-        local resolved = H.GetTranslatedStringIfHandle(translatedString)
+        local resolved = Helpers.GetTranslatedStringIfHandle(translatedString)
         if resolved and not resolved:match("^h%x") then return resolved end
         return nil
     elseif stringType == "userdata" then
@@ -329,7 +329,7 @@ local function ResolveTranslatedString(translatedString)
         if handleSuccess and handle then
             local handleStr = tostring(handle)
             if handleStr and handleStr ~= "" then
-                local resolved = H.GetTranslatedStringIfHandle(handleStr)
+                local resolved = Helpers.GetTranslatedStringIfHandle(handleStr)
                 if resolved and not resolved:match("^h%x") then
                     return resolved
                 end
@@ -348,7 +348,7 @@ local function ResolveTranslatedString(translatedString)
         -- Try Handle.Handle first.
         if translatedString.Handle
             and translatedString.Handle.Handle then
-            local resolved = H.GetTranslatedStringIfHandle(
+            local resolved = Helpers.GetTranslatedStringIfHandle(
                 translatedString.Handle.Handle)
             if resolved and not resolved:match("^h%x") then
                 return resolved
@@ -486,7 +486,7 @@ local function BuildProgressionDescriptionCache()
             if not displayName then return end
             local description = ResolveTranslatedString(entry.Description)
             if not description then return end
-            description = H.StripMarkupTags(description)
+            description = Helpers.StripMarkupTags(description)
             local normalizedName = displayName:lower()
             if not progressionDescriptionCache[normalizedName] then
                 progressionDescriptionCache[normalizedName] = description
@@ -525,7 +525,7 @@ local function BuildStaticDataDescriptionCache(staticDataType)
             if not displayName then return end
             local description = ResolveTranslatedString(entry.Description)
             if not description then return end
-            description = H.StripMarkupTags(description)
+            description = Helpers.StripMarkupTags(description)
             local normalizedName = displayName:lower()
             if not cache[normalizedName] then
                 cache[normalizedName] = description
@@ -732,7 +732,7 @@ local function GetGodObjectDescription(dcProps, tabName, itemName)
                 local description = subTable.Description
                 if type(description) == "string"
                     and description ~= "" then
-                    return H.StripMarkupTags(description)
+                    return Helpers.StripMarkupTags(description)
                 end
             end
         end
@@ -877,7 +877,7 @@ local function ExtractOriginContext(data)
     -- "Origin" meta-option: play as a pre-made origin character.
     -- The actual description lives at DummyCharacter.Stats.OriginDescription
     -- (two levels deep, not accessible yet).
-    if H.NormalizeForCompare(elemText) == "origin" then
+    if Helpers.NormalizeForCompare(elemText) == "origin" then
         return nil, nil,
             "Play as an existing character from Baldur's Gate 3"
     end
@@ -887,11 +887,11 @@ local function ExtractOriginContext(data)
     if type(selectedOrigin) == "table" then
         local originName = selectedOrigin.Name or selectedOrigin.DisplayName
             or selectedOrigin.Title
-        if originName and H.NormalizeForCompare(elemText) == H.NormalizeForCompare(originName) then
+        if originName and Helpers.NormalizeForCompare(elemText) == Helpers.NormalizeForCompare(originName) then
             local originDesc = selectedOrigin.Description
             if type(originDesc) == "string" and originDesc ~= "" then
                 -- Custom: speak the API description, then action hint.
-                if H.NormalizeForCompare(originName) == "custom" then
+                if Helpers.NormalizeForCompare(originName) == "custom" then
                     local trimmedDesc = originDesc:gsub("[%.%s]+$", "")
                     return nil, nil,
                         trimmedDesc .. ". Create a custom character"
@@ -916,8 +916,8 @@ end
 --   1. Placeholder guard
 --   2. FormatCCDCTextSplit (Skill, Ability, Spell dcProps)
 --   3. ExtractOriginContext (Body Type, Identity, Origin)
---   4. H.FormatDCText (generic dcProps)
---   5. H.ExtractTextFromData (visual text / elemText fallback)
+--   4. Helpers.FormatDCText (generic dcProps)
+--   5. Helpers.ExtractTextFromData (visual text / elemText fallback)
 -- Then applies overrides (carousel, toggles, bonus ability, stat labels)
 -- and enriches with API-first descriptions.
 --
@@ -925,7 +925,7 @@ end
 --   focusedElement  - the focused element data table
 --   snapshot        - full snapshot from C++
 --   tabName         - current tab name (may be nil for item nav)
---   isScreenEntry   - boolean, passed to H.ExtractTextFromData
+--   isScreenEntry   - boolean, passed to Helpers.ExtractTextFromData
 --
 -- Returns: name, value, description (all strings or nil)
 local function GetCCItemData(focusedElement, snapshot, tabName,
@@ -938,7 +938,7 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
     local itemDescription = nil
 
     -- 1. Placeholder guard: strip placeholder elemText so downstream
-    --    extractors (H.ExtractTextFromData) don't pick it up.
+    --    extractors (Helpers.ExtractTextFromData) don't pick it up.
     local elemText = focusedElement.elemText
     if elemText and IsPlaceholder(elemText) then
         Log.Debug("GetCCItemData: strip placeholder elemText: " .. elemText)
@@ -961,19 +961,19 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
     local elementClaimed = (itemName and itemName ~= "")
         or (itemDescription and itemDescription ~= "")
 
-    -- 4. H.FormatDCText: generic dcProps formatting.
+    -- 4. Helpers.FormatDCText: generic dcProps formatting.
     if not elementClaimed then
-        itemName = H.FormatDCText(dcProps)
+        itemName = Helpers.FormatDCText(dcProps)
         itemValue = nil
         itemDescription = nil
         elementClaimed = itemName and itemName ~= ""
     end
 
-    -- 5. H.ExtractTextFromData: visual text / elemText fallback.
+    -- 5. Helpers.ExtractTextFromData: visual text / elemText fallback.
     --    Pass the effective tab name for context.
     if not elementClaimed then
         local effectiveTab = tabName or ccState.lastSpokenTab
-        itemName = H.ExtractTextFromData(
+        itemName = Helpers.ExtractTextFromData(
             focusedElement, effectiveTab, isScreenEntry)
         itemValue = nil
         itemDescription = nil
@@ -1049,10 +1049,10 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
 
         -- Slider setting value: dcProps.Value is only a concrete number
         -- during INPC (val=1) snapshots -- the binding expression makes it
-        -- nil at initial focus.  H.FormatDCValue reads it the same way
+        -- nil at initial focus.  Helpers.FormatDCValue reads it the same way
         -- the Menus pipeline does, restoring the value on left/right presses.
         if not itemValue and focusedElement.dcType == "gui::VMSliderSetting" then
-            local sliderValue = H.FormatDCValue(dcProps)
+            local sliderValue = Helpers.FormatDCValue(dcProps)
             if sliderValue and sliderValue ~= "" then
                 itemValue = sliderValue
             end
@@ -1898,9 +1898,9 @@ local function HandleCCSnapshot(snapshot)
         if effectiveDCType == "gui::DCCharacterCreation" then
             screenTitle = "Character Creation"
         end
-        local normalTab = tabName and H.NormalizeForCompare(tabName) or ""
+        local normalTab = tabName and Helpers.NormalizeForCompare(tabName) or ""
         if screenTitle and normalTab ~= ""
-            and H.NormalizeForCompare(screenTitle) == normalTab then
+            and Helpers.NormalizeForCompare(screenTitle) == normalTab then
             screenTitle = nil
         end
         if screenTitle and screenTitle == ccState.lastSpokenTitle then
@@ -1920,7 +1920,7 @@ local function HandleCCSnapshot(snapshot)
         -- ----- Tab name -----
         if tabName then
             local showTabName = true
-            if screenTitle and H.NormalizeForCompare(screenTitle):find(normalTab, 1, true) then
+            if screenTitle and Helpers.NormalizeForCompare(screenTitle):find(normalTab, 1, true) then
                 showTabName = false
             end
             if showTabName then
@@ -1993,7 +1993,7 @@ local function HandleCCSnapshot(snapshot)
             ccState.tabHintSpoken = true
             ccState.lastMainTab = detectedSectionLabel or tabName
             ccState.lastSpokenName = elemId
-            H.SpeakSlots(slots, ccState, true)
+            Helpers.SpeakSlots(slots, ccState, true)
             return
         end
     end
@@ -2030,8 +2030,8 @@ local function HandleCCSnapshot(snapshot)
     if itemName then
         local effectiveTab = tabName or ccState.lastSpokenTab
         local normalTab = effectiveTab
-            and H.NormalizeForCompare(effectiveTab) or ""
-        local normalItem = H.NormalizeForCompare(itemName)
+            and Helpers.NormalizeForCompare(effectiveTab) or ""
+        local normalItem = Helpers.NormalizeForCompare(itemName)
 
         if normalTab ~= "" and normalItem == normalTab then
             -- Name duplicates tab; suppress name but keep desc/value.
@@ -2096,8 +2096,8 @@ local function HandleCCSnapshot(snapshot)
     -- Cross-element dedup.
     if isItemNav and itemName and not itemDesc and not itemValue
         and ccState.lastSpokenFullText then
-        local normalItem = H.NormalizeForCompare(itemName)
-        local normalLast = H.NormalizeForCompare(ccState.lastSpokenFullText)
+        local normalItem = Helpers.NormalizeForCompare(itemName)
+        local normalLast = Helpers.NormalizeForCompare(ccState.lastSpokenFullText)
         if normalItem == normalLast
             or (normalLast:sub(-#normalItem) == normalItem) then
             Log.Debug("DEDUP SKIP (cross-element): " .. tostring(itemName))
@@ -2150,7 +2150,7 @@ local function HandleCCSnapshot(snapshot)
         end
     end
 
-    H.SpeakSlots(slots, ccState, isScreenEntry)
+    Helpers.SpeakSlots(slots, ccState, isScreenEntry)
 end
 
 -- ============================================================================

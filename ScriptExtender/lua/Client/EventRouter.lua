@@ -20,21 +20,29 @@ BG3Access.Client = BG3Access.Client or {}
 
 -- Module references (loaded before this file by _Init.lua).
 local Log   = BG3Access.Client.Log
-local H     = BG3Access.Client.Helpers
+local Helpers = BG3Access.Client.Helpers
 local CC    = BG3Access.Client.CC
-local CS    = BG3Access.Client.Cutscene
+local Cutscene = BG3Access.Client.Cutscene
 local Menus = BG3Access.Client.Menus
 
 -- ---------------------------------------------------------------------------
 -- Cross-cutting state (not owned by any single handler).
 -- ---------------------------------------------------------------------------
-local suppressSnapshots   = false
+-- Start suppressed: the mod loads during a loading state (LoadMenu)
+-- and no GameStateChanged fires for the initial state.
+local suppressSnapshots   = true
 local lastWidgetRootStr   = nil
 local debugExploreMode    = false
 -- Explore mode uses its own lastSpokenFullText to avoid needing a handler state.
 local exploreLastSpoken   = nil
 -- Loading tips use their own dedup to avoid needing a handler state.
-local lastSpokenLoadingTip = nil
+-- Table used as a set because multiple tips can arrive in the same snapshot.
+local spokenLoadingTips = {}
+-- True when snapshots should route to WorldUI panel handlers instead of Menus.
+local routeToWorld        = false
+-- True when a dialog overlay spoke on this tick while WorldUI is active.
+-- Suppresses the panel handler so dialog speech isn't interrupted.
+local worldDialogOverlayJustSpoke = false
 
 -- ---------------------------------------------------------------------------
 -- HandleTickSnapshot: thin router.
@@ -47,8 +55,8 @@ local function HandleTickSnapshot(snapshot)
     -- =================================================================
     if snapshot.widgetAdded and snapshot.widgetData
         and snapshot.widgetData.dcType
-        and CS.IsDialogOrCutscene(snapshot.widgetData.dcType) then
-        CS.HandleDialogWidgetEvent(snapshot.widgetData)
+        and Cutscene.IsDialogOrCutscene(snapshot.widgetData.dcType) then
+        Cutscene.HandleDialogWidgetEvent(snapshot.widgetData)
         -- If no focused element data, nothing else to do (pure cutscene).
         if not snapshot.focusedElement
             or not snapshot.focusedElement.elemType then
@@ -80,20 +88,45 @@ local function HandleTickSnapshot(snapshot)
         return
     end
 
+    -- =================================================================
+    -- Context menu events (WorldContextMenu popup -- X button actions).
+    -- =================================================================
+    if snapshot.contextMenuChanged then
+        local itemText = snapshot.contextMenuItemText
+        if itemText and itemText ~= "" then
+            Log.Info("CONTEXT MENU: " .. itemText)
+            Ext.Tolk.Speak(itemText, true)
+        end
+        return
+    end
+
     if not focusedElement or not focusedElement.elemType then return end
 
     -- =================================================================
     -- Loading suppression: only allow visual text (tips, splash screen).
+    -- C++ sends indexed keys (_visualText_1, _visualText_2, ...) to
+    -- avoid Lua table key collisions.  Speak each non-percentage text.
     -- =================================================================
     if suppressSnapshots then
         if snapshot.widgetAdded and focusedElement.namedTexts then
-            local visualText = focusedElement.namedTexts["_visualText"]
-            if visualText and visualText ~= ""
-                and not visualText:match("^%d+%%?$")
-                and visualText ~= lastSpokenLoadingTip then
-                lastSpokenLoadingTip = visualText
-                Log.Info("LOADING TIP: " .. visualText)
-                Ext.Tolk.Speak(visualText, false)
+            -- Collect and sort keys so tips speak in document order
+            -- (pairs() iteration order is not guaranteed).
+            local visualKeys = {}
+            for textKey, _ in pairs(focusedElement.namedTexts) do
+                if textKey:find("^_visualText_") then
+                    table.insert(visualKeys, textKey)
+                end
+            end
+            table.sort(visualKeys)
+            for _, textKey in ipairs(visualKeys) do
+                local visualText = focusedElement.namedTexts[textKey]
+                if visualText and visualText ~= ""
+                    and not visualText:match("^%d+%%?$")
+                    and not spokenLoadingTips[visualText] then
+                    spokenLoadingTips[visualText] = true
+                    Log.Info("LOADING TIP: " .. visualText)
+                    Ext.Tolk.Speak(visualText, false)
+                end
             end
         end
         return
@@ -115,7 +148,7 @@ local function HandleTickSnapshot(snapshot)
         end
         if data.dcType then table.insert(parts, "DC:" .. data.dcType) end
         if data.isFocusable then table.insert(parts, "focusable") end
-        local text = H.ExtractTextFromData(data, nil, false)
+        local text = Helpers.ExtractTextFromData(data, nil, false)
         if text then table.insert(parts, "text:" .. text) end
         Log.Info("EXPLORE sel=" .. tostring(snapshot.selectionChanged)
             .. " foc=" .. tostring(snapshot.focusChanged)
@@ -134,7 +167,7 @@ local function HandleTickSnapshot(snapshot)
                     .. table.concat(propParts, " | "))
             end
         end
-        local speech = H.StripMarkupTags(table.concat(parts, " | "))
+        local speech = Helpers.StripMarkupTags(table.concat(parts, " | "))
         if speech ~= "" and speech ~= exploreLastSpoken then
             exploreLastSpoken = speech
             Log.Info("EXPLORE: " .. speech)
@@ -150,30 +183,65 @@ local function HandleTickSnapshot(snapshot)
     if widgetRootId ~= "" and widgetRootId ~= lastWidgetRootStr then
         lastWidgetRootStr = widgetRootId
         Log.Info("Widget root changed to " .. widgetRootId)
-        Menus.HandleWidgetRootChanged()
+        if routeToWorld then
+            local World = BG3Access.Client.WorldUI
+            if World then World.HandlePanelWidgetRootChanged() end
+        else
+            Menus.HandleWidgetRootChanged()
+        end
     end
 
     -- =================================================================
-    -- Widget added events: route to Menus for handler activation,
+    -- Widget added events: route to the appropriate handler module,
     -- and handle cross-cutting dialog/CC cleanup.
     -- =================================================================
     if snapshot.widgetAdded and snapshot.widgetData
         and snapshot.widgetData.dcType then
         local newDCType = snapshot.widgetData.dcType
+        Log.Debug("WIDGET EVENT: dcType=" .. newDCType)
         -- Reset dialog state when a non-dialog widget appears.
-        if not CS.IsDialogOrCutscene(newDCType) then
-            CS.ResetDialogState()
+        if not Cutscene.IsDialogOrCutscene(newDCType) then
+            Cutscene.ResetDialogState()
+        end
+        -- Difficulty selection signals a genuine new game flow (not
+        -- Continue or Load).  The AD system uses this to decide whether
+        -- to play the opening audio description.
+        if newDCType == "gui::DCNewGameSettings" then
+            Cutscene.NotifyNewGameInitiated()
         end
         -- Dialog overlays (MessageBox) are handled separately with full
         -- snapshot context to distinguish real modals from pre-loaded widgets.
         if Menus.IsDialogOverlay(newDCType) then
-            Menus.HandleDialogOverlay(snapshot, snapshot.widgetData)
+            local dialogSpoke = Menus.HandleDialogOverlay(
+                snapshot, snapshot.widgetData)
+            -- When WorldUI is active, suppress panel routing on this tick
+            -- so the dialog speech isn't immediately interrupted.
+            if dialogSpoke and routeToWorld then
+                worldDialogOverlayJustSpoke = true
+            end
         else
-            -- Route to CC and Menus for handler activation and widget hooks.
-            -- CC.HandleWidgetAdded detects its own widget re-appearing after
-            -- a blurb/cutscene and resets state internally.
+            -- CC always gets widget events (detects its own re-appearance).
             CC.HandleWidgetAdded(snapshot.widgetData)
-            Menus.HandleWidgetAdded(snapshot.widgetData)
+
+            -- Route to WorldUI or Menus based on DC type.
+            local World = BG3Access.Client.WorldUI
+            if World and World.IsWorldDCType(newDCType) then
+                World.HandlePanelWidgetAdded(snapshot.widgetData)
+                -- Switch routing to WorldUI if not already there.
+                if not routeToWorld then
+                    Menus.ResetAllHandlers()
+                    routeToWorld = true
+                    Log.Info("Routing to WorldUI panels")
+                end
+            else
+                Menus.HandleWidgetAdded(snapshot.widgetData)
+                -- Switch routing to Menus if coming from WorldUI.
+                if routeToWorld then
+                    if World then World.ResetAllPanelHandlers() end
+                    routeToWorld = false
+                    Log.Info("Routing to Menus")
+                end
+            end
         end
     end
 
@@ -199,9 +267,22 @@ local function HandleTickSnapshot(snapshot)
     end
 
     -- =================================================================
-    -- Dispatch to per-menu handler via Menus router.
+    -- Dispatch to the active handler module.
     -- =================================================================
-    Menus.RouteSnapshot(snapshot)
+    if routeToWorld then
+        -- Dialog overlay just spoke on this tick -- suppress the panel
+        -- handler so it doesn't immediately interrupt the dialog speech.
+        if worldDialogOverlayJustSpoke then
+            worldDialogOverlayJustSpoke = false
+            return
+        end
+        local World = BG3Access.Client.WorldUI
+        if World then
+            World.RoutePanelSnapshot(snapshot)
+        end
+    else
+        Menus.RouteSnapshot(snapshot)
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -238,10 +319,11 @@ SetupGlobalFocusMonitor()
 -- Game state transitions.
 -- ---------------------------------------------------------------------------
 local LOADING_STATES = {
+    LoadMenu = true,
     StartLoading = true, StartServer = true, LoadSession = true,
     LoadLevel = true, SwapLevel = true, UnloadLevel = true,
     UnloadSession = true, InitNetwork = true, InitConnection = true,
-    StopLoading = true, Idle = true,
+    StopLoading = true,
 }
 
 Ext.Events.GameStateChanged:Subscribe(function(e)
@@ -252,8 +334,8 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     Menus.ResetAllHandlers()
     CC.ResetCCState()
     if CC.UnsubscribeCCYButton then CC.UnsubscribeCCYButton() end
-    CS.ResetDialogState()
-    CS.HandleGameStateForAD(tostring(e.FromState), tostring(e.ToState))
+    Cutscene.ResetDialogState()
+    Cutscene.HandleGameStateForAD(tostring(e.FromState), tostring(e.ToState))
     local World = BG3Access.Client.WorldUI
     if World then World.ResetState() end
     local Nav = BG3Access.Client.WorldNav
@@ -262,7 +344,9 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     -- Reset router state.
     lastWidgetRootStr = nil
     exploreLastSpoken = nil
-    lastSpokenLoadingTip = nil
+    spokenLoadingTips = {}
+    routeToWorld = false
+    worldDialogOverlayJustSpoke = false
 
     local toState = tostring(e.ToState)
     suppressSnapshots = LOADING_STATES[toState] or false
