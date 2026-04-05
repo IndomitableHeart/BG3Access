@@ -100,6 +100,68 @@ local function HandleTickSnapshot(snapshot)
         return
     end
 
+    -- =================================================================
+    -- Widget added events: process BEFORE focusedElement guard.
+    -- Widget events describe the NEW widget (dcType, dcProps), not the
+    -- focused element.  They must register the panel handler and set
+    -- routeToWorld even when focusedElement is nil (UI rebuilding).
+    -- Skip during loading suppression -- no handler routing needed.
+    -- =================================================================
+    if not suppressSnapshots
+        and snapshot.widgetAdded and snapshot.widgetData
+        and snapshot.widgetData.dcType then
+        local newDCType = snapshot.widgetData.dcType
+        Log.Debug("WIDGET EVENT: dcType=" .. newDCType)
+        -- Reset dialog state when a non-dialog widget appears.
+        if not Cutscene.IsDialogOrCutscene(newDCType) then
+            Cutscene.ResetDialogState()
+        end
+        -- Difficulty selection signals a genuine new game flow (not
+        -- Continue or Load).  The AD system uses this to decide whether
+        -- to play the opening audio description.
+        if newDCType == "gui::DCNewGameSettings" then
+            Cutscene.NotifyNewGameInitiated()
+        end
+        -- Dialog overlays (MessageBox) are handled separately with full
+        -- snapshot context to distinguish real modals from pre-loaded widgets.
+        if Menus.IsDialogOverlay(newDCType) then
+            local dialogSpoke = Menus.HandleDialogOverlay(
+                snapshot, snapshot.widgetData)
+            -- When WorldUI is active, suppress panel routing on this tick
+            -- so the dialog speech isn't immediately interrupted.
+            if dialogSpoke and routeToWorld then
+                worldDialogOverlayJustSpoke = true
+            end
+        else
+            -- CC always gets widget events (detects its own re-appearance).
+            CC.HandleWidgetAdded(snapshot.widgetData)
+
+            -- Route to WorldUI or Menus based on DC type.
+            local World = BG3Access.Client.WorldUI
+            if World and World.IsWorldDCType(newDCType) then
+                World.HandlePanelWidgetAdded(snapshot.widgetData)
+                -- Switch routing to WorldUI if not already there.
+                if not routeToWorld then
+                    Menus.ResetAllHandlers()
+                    routeToWorld = true
+                    Log.Info("Routing to WorldUI panels")
+                end
+            else
+                Menus.HandleWidgetAdded(snapshot.widgetData)
+                -- Switch routing to Menus if coming from WorldUI.
+                if routeToWorld then
+                    if World then World.ResetAllPanelHandlers() end
+                    routeToWorld = false
+                    Log.Info("Routing to Menus")
+                end
+            end
+        end
+    end
+
+    -- =================================================================
+    -- focusedElement guard: everything below needs a valid focus target.
+    -- Widget-added events (above) are processed regardless.
+    -- =================================================================
     if not focusedElement or not focusedElement.elemType then return end
 
     -- =================================================================
@@ -192,66 +254,16 @@ local function HandleTickSnapshot(snapshot)
     end
 
     -- =================================================================
-    -- Widget added events: route to the appropriate handler module,
-    -- and handle cross-cutting dialog/CC cleanup.
-    -- =================================================================
-    if snapshot.widgetAdded and snapshot.widgetData
-        and snapshot.widgetData.dcType then
-        local newDCType = snapshot.widgetData.dcType
-        Log.Debug("WIDGET EVENT: dcType=" .. newDCType)
-        -- Reset dialog state when a non-dialog widget appears.
-        if not Cutscene.IsDialogOrCutscene(newDCType) then
-            Cutscene.ResetDialogState()
-        end
-        -- Difficulty selection signals a genuine new game flow (not
-        -- Continue or Load).  The AD system uses this to decide whether
-        -- to play the opening audio description.
-        if newDCType == "gui::DCNewGameSettings" then
-            Cutscene.NotifyNewGameInitiated()
-        end
-        -- Dialog overlays (MessageBox) are handled separately with full
-        -- snapshot context to distinguish real modals from pre-loaded widgets.
-        if Menus.IsDialogOverlay(newDCType) then
-            local dialogSpoke = Menus.HandleDialogOverlay(
-                snapshot, snapshot.widgetData)
-            -- When WorldUI is active, suppress panel routing on this tick
-            -- so the dialog speech isn't immediately interrupted.
-            if dialogSpoke and routeToWorld then
-                worldDialogOverlayJustSpoke = true
-            end
-        else
-            -- CC always gets widget events (detects its own re-appearance).
-            CC.HandleWidgetAdded(snapshot.widgetData)
-
-            -- Route to WorldUI or Menus based on DC type.
-            local World = BG3Access.Client.WorldUI
-            if World and World.IsWorldDCType(newDCType) then
-                World.HandlePanelWidgetAdded(snapshot.widgetData)
-                -- Switch routing to WorldUI if not already there.
-                if not routeToWorld then
-                    Menus.ResetAllHandlers()
-                    routeToWorld = true
-                    Log.Info("Routing to WorldUI panels")
-                end
-            else
-                Menus.HandleWidgetAdded(snapshot.widgetData)
-                -- Switch routing to Menus if coming from WorldUI.
-                if routeToWorld then
-                    if World then World.ResetAllPanelHandlers() end
-                    routeToWorld = false
-                    Log.Info("Routing to Menus")
-                end
-            end
-        end
-    end
-
-    -- =================================================================
     -- HotBar (action radial) focus tracking.
     -- When focus first moves to a VMHotBar element, the action radial
-    -- has just opened — route to World for intro speech.  LB/RB page
+    -- has just opened -- route to World for intro speech.  LB/RB page
     -- switches also cause VMHotBar focus changes but are suppressed
     -- by World (inRadial flag).  When focus moves to any non-radial
     -- element, clear the flag so the next open is detected.
+    --
+    -- Only return early when NOT in WorldUI panel mode.  When a panel
+    -- is active, the radial open is still announced but the snapshot
+    -- must also reach the panel handler for state tracking.
     -- =================================================================
     if snapshot.focusChanged then
         local World = BG3Access.Client.WorldUI
@@ -259,7 +271,9 @@ local function HandleTickSnapshot(snapshot)
             if focusedElement.dcType
                 and focusedElement.dcType:find("VMHotBar") then
                 World.HandleRadialOpen()
-                return
+                if not routeToWorld then
+                    return
+                end
             else
                 World.ClearRadialFocus()
             end
@@ -282,6 +296,20 @@ local function HandleTickSnapshot(snapshot)
         end
     else
         Menus.RouteSnapshot(snapshot)
+    end
+
+    -- =================================================================
+    -- Tooltip events: speak AFTER the focus/handler speech so tooltip
+    -- text supplements the item name rather than competing with it.
+    -- Routed through the Tooltip handler for title/description ordering
+    -- and junk filtering.
+    -- =================================================================
+    if snapshot.tooltipChanged and snapshot.tooltipTexts then
+        local tooltipSpeech = Helpers.FormatTooltipTexts(snapshot.tooltipTexts)
+        if tooltipSpeech then
+            Log.Info("TOOLTIP: " .. tooltipSpeech)
+            Ext.Tolk.Speak(tooltipSpeech, false)
+        end
     end
 end
 
@@ -386,4 +414,17 @@ end)
 -- ---------------------------------------------------------------------------
 -- Startup
 -- ---------------------------------------------------------------------------
+
+-- Detect mid-session reload (SE console `reset`).
+-- During normal startup the mod loads in LoadMenu state and
+-- GameStateChanged fires to clear suppressSnapshots.  After reset,
+-- Lua reloads in Running state with no state transition.
+-- If entities with ClientControl exist, we are in gameplay.
+local resetOk, resetEntities = pcall(
+    Ext.Entity.GetAllEntitiesWithComponent, "ClientControl")
+if resetOk and resetEntities and next(resetEntities) then
+    suppressSnapshots = false
+    Log.Info("Mid-session reload detected, suppression cleared")
+end
+
 Log.Info("Accessibility ready (GlobalFocusMonitor).")

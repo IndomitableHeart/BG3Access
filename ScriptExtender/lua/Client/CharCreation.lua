@@ -1203,7 +1203,10 @@ local function IsCCSnapshot(snapshot)
     end
 
     -- Summary panel stat types (Initiative, Hit Points, Class).
-    if focusedElement.dcType and CC_SUMMARY_STAT_LABELS[focusedElement.dcType] then
+    -- Guard with inCharacterCreation: VMRangeStat also appears in the
+    -- Examine panel (Hit Points row) and must not be claimed there.
+    if ccState.inCharacterCreation and focusedElement.dcType
+        and CC_SUMMARY_STAT_LABELS[focusedElement.dcType] then
         return true
     end
 

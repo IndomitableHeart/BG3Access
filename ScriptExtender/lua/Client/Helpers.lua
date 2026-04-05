@@ -228,12 +228,25 @@ end
 -- ---------------------------------------------------------------------------
 -- FormatDCTextSplit: returns (name, value, description) as separate strings.
 -- ---------------------------------------------------------------------------
-local function FormatDCTextSplit(dcProps)
+-- Stat labels for DC types whose label comes from the XAML template
+-- parent (Tag property), not from the DataContext itself.
+local STAT_DC_TYPE_LABELS = {
+    ["ls.VMRangeStat"] = "Hit Points",
+    ["ls.VMStat"]      = "Initiative",
+}
+
+local function FormatDCTextSplit(dcProps, dcType)
     if not dcProps then return nil, nil, nil end
 
     local text = dcProps.Text
     local value = dcProps.Value
     local desc = dcProps.Description
+
+    -- Stat types whose label is in the parent template, not the DC.
+    -- Use the hardcoded label and treat Value as the value slot.
+    if not text and dcType and STAT_DC_TYPE_LABELS[dcType] then
+        text = STAT_DC_TYPE_LABELS[dcType]
+    end
 
     if not text and dcProps.Title then
         text = dcProps.Title
@@ -329,6 +342,23 @@ local function FormatDCTextSplit(dcProps)
         if type(lobbyMessage) == "string" and lobbyMessage ~= ""
             and lobbyMessage:sub(-3) ~= "..." then
             text = lobbyMessage
+        end
+    end
+    -- VMResistance (Examine panel resistance rows): DamageType is an
+    -- enum whose symbolic name is the damage type (Piercing, etc.).
+    -- Full/NonMagical/Magical give the resistance level (Resistant,
+    -- Immune, Vulnerable).  The C++ enum lookup can't resolve all
+    -- values -- 255 is Vulnerable (not in the Noesis enum mapping).
+    if not text and dcProps.DamageType then
+        text = tostring(dcProps.DamageType)
+        local resistanceLevel = dcProps.Full
+        -- Map unresolved enum values to display names.
+        if resistanceLevel == "255" then
+            resistanceLevel = "Vulnerable"
+        end
+        if type(resistanceLevel) == "string"
+            and resistanceLevel ~= "None" then
+            value = resistanceLevel
         end
     end
 
@@ -783,6 +813,63 @@ local function ExtractFromWidgetData(widgetData)
 end
 
 -- ---------------------------------------------------------------------------
+-- Tooltip text processing
+-- ---------------------------------------------------------------------------
+
+-- Short button labels that leak into tooltip TextBlocks.
+local TOOLTIP_JUNK_LABELS = {
+    ["Inspect"] = true,
+    ["Close"] = true,
+    ["OK"] = true,
+}
+
+-- Heuristic: titles are short and don't end with sentence punctuation.
+local function IsTooltipTitle(text)
+    if #text > 60 then return false end
+    if text:sub(-1) == "." or text:sub(-1) == ":" then return false end
+    return true
+end
+
+-- FormatTooltipTexts: takes the raw tooltipTexts array from C++,
+-- filters junk, identifies title vs descriptions, reorders title first.
+-- Returns a formatted speech string or nil.
+local function FormatTooltipTexts(tooltipTexts)
+    if not tooltipTexts or #tooltipTexts == 0 then return nil end
+
+    -- Filter junk
+    local filtered = {}
+    for _, text in ipairs(tooltipTexts) do
+        if text and text ~= "" and not TOOLTIP_JUNK_LABELS[text] then
+            local cleaned = StripMarkupTags(text)
+            if cleaned and cleaned ~= "" then
+                table.insert(filtered, cleaned)
+            end
+        end
+    end
+    if #filtered == 0 then return nil end
+
+    -- Drop the title -- the focus handler already speaks the name and
+    -- level (e.g. "Necrotic, Resistant").  The tooltip should only add
+    -- the description lines that give extra detail.
+    local parts = {}
+    for _, text in ipairs(filtered) do
+        if not IsTooltipTitle(text) then
+            table.insert(parts, text)
+        end
+    end
+    -- Strip trailing periods from each part before joining to avoid
+    -- double periods ("halved.. Next sentence").
+    for i, part in ipairs(parts) do
+        if part:sub(-1) == "." then
+            parts[i] = part:sub(1, -2)
+        end
+    end
+    local speech = table.concat(parts, ". ")
+    if speech == "" then return nil end
+    return speech
+end
+
+-- ---------------------------------------------------------------------------
 -- Exports
 -- ---------------------------------------------------------------------------
 BG3Access.Client.Helpers = {
@@ -806,4 +893,5 @@ BG3Access.Client.Helpers = {
     DIALOG_BUTTON_HINT           = DIALOG_BUTTON_HINT,
     ExtractFromNamedTexts        = ExtractFromNamedTexts,
     ExtractFromWidgetData        = ExtractFromWidgetData,
+    FormatTooltipTexts           = FormatTooltipTexts,
 }

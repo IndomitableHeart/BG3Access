@@ -293,8 +293,13 @@ local function CreateMenuHandler(config)
                     end
                 end
             end
-            local nsTitle, nsBodyParts = Helpers.ExtractFromNamedTexts(
-                allNamedTexts)
+            local nsTitle, nsBodyParts
+            if config.extractNamedTexts then
+                nsTitle, nsBodyParts = config.extractNamedTexts(allNamedTexts)
+            else
+                nsTitle, nsBodyParts = Helpers.ExtractFromNamedTexts(
+                    allNamedTexts)
+            end
             local widgetTitle, widgetBody, widgetActions =
                 Helpers.ExtractFromWidgetData(snapshot.widgetData)
 
@@ -393,7 +398,8 @@ local function CreateMenuHandler(config)
         local itemDesc = nil
 
         local splitName, splitValue, splitDesc, splitValueDesc =
-            Helpers.FormatDCTextSplit(focusedElement.dcProps)
+            Helpers.FormatDCTextSplit(focusedElement.dcProps,
+                focusedElement.dcType)
         if not splitName or splitName == "" then
             splitName = Helpers.ExtractTextFromData(
                 focusedElement, handlerState.lastSpokenTab, isScreenEntry)
@@ -593,6 +599,66 @@ local PauseMenuHandler = CreateMenuHandler({
     hint = false,
 })
 
+-- RT shortcuts radial: shares gui::DCGameMenu with PauseMenu but has
+-- widget name "shortcutsMenu".  Routed by widget name, not DC type.
+-- Button labels that are part of the hint, not resource info.
+local SHORTCUTS_BUTTON_LABELS = {
+    ["Quicksave"] = true,
+    ["Quickload"] = true,
+    ["Select"] = true,
+    ["Close"] = true,
+}
+
+local ShortcutsMenuHandler = CreateMenuHandler({
+    name = "ShortcutsMenu",
+    hint = "Y for quicksave. X for quickload. A to confirm. B to close",
+    onWidgetAdded = function(widgetData, handlerState)
+        -- Flag that we'll handle visual texts ourselves in formatBodyFn.
+        handlerState.shortcutsMenuActive = true
+    end,
+    -- Custom named text extractor: replaces the default
+    -- Helpers.ExtractFromNamedTexts for this handler.
+    -- Same signature: (namedTexts) -> title, bodyParts
+    extractNamedTexts = function(namedTexts)
+        if not namedTexts then return "Shortcuts Menu", {} end
+
+        -- Collect and sort visual text entries.
+        local visualKeys = {}
+        for textKey, _ in pairs(namedTexts) do
+            if textKey:find("^_visualText_") then
+                table.insert(visualKeys, textKey)
+            end
+        end
+        table.sort(visualKeys)
+
+        local visualTexts = {}
+        for _, textKey in ipairs(visualKeys) do
+            table.insert(visualTexts, namedTexts[textKey])
+        end
+
+        -- Pair labels with numeric values, filter button labels.
+        local resourceParts = {}
+        local i = 1
+        while i <= #visualTexts do
+            local text = visualTexts[i]
+            if not SHORTCUTS_BUTTON_LABELS[text] then
+                local nextText = visualTexts[i + 1]
+                if nextText and nextText:match("^%d+$") then
+                    table.insert(resourceParts, text .. " " .. nextText)
+                    i = i + 2
+                else
+                    table.insert(resourceParts, text)
+                    i = i + 1
+                end
+            else
+                i = i + 1
+            end
+        end
+
+        return "Shortcuts Menu", resourceParts
+    end,
+})
+
 local DifficultyHandler = CreateMenuHandler({
     name = "Difficulty",
     hintFn = function(screenTitle)
@@ -647,6 +713,13 @@ local DC_TYPE_HANDLERS = {
     ["gui::DCDMSettings"]        = DifficultyHandler,
 }
 
+-- Widget name overrides: when a widget name matches, use this handler
+-- instead of the DC type lookup.  Needed when multiple menus share a
+-- DC type (e.g. shortcutsMenu and pause menu both use gui::DCGameMenu).
+local WIDGET_NAME_HANDLERS = {
+    ["shortcutsMenu"] = ShortcutsMenuHandler,
+}
+
 -- Default handler for unknown DC types (simple button menus).
 local defaultHandler = MainMenuHandler
 
@@ -694,7 +767,26 @@ local function HandleWidgetAdded(widgetData)
         return
     end
 
-    local newHandler = ResolveHandler(widgetData.dcType)
+    -- Check widget name overrides first (e.g. shortcutsMenu vs pause
+    -- menu both share gui::DCGameMenu but need different handlers).
+    local newHandler = nil
+    local isExplicitMatch = false
+    if widgetData.elemName and WIDGET_NAME_HANDLERS[widgetData.elemName] then
+        newHandler = WIDGET_NAME_HANDLERS[widgetData.elemName]
+        isExplicitMatch = true
+    else
+        newHandler = ResolveHandler(widgetData.dcType)
+        isExplicitMatch = DC_TYPE_HANDLERS[widgetData.dcType] ~= nil
+    end
+
+    -- Don't let the default handler (MainMenu) overwrite a handler
+    -- that was explicitly matched by widget name or DC type.
+    -- The initial widget scan fires HandleWidgetAdded for every visible
+    -- widget, and generic ls.Widget entries would clobber the real handler.
+    if not isExplicitMatch and activeHandler
+        and activeHandler ~= defaultHandler then
+        return
+    end
 
     if newHandler ~= activeHandler then
         -- Deactivating old handler: full reset so it's clean on return
@@ -785,6 +877,21 @@ local function RouteSnapshot(snapshot)
         return
     end
 
+    -- Route by visual text source widget name when the widget scan
+    -- didn't trigger a separate widgetAdded event.  C++ tags visual
+    -- texts with the source widget name so we can route correctly
+    -- (e.g. "shortcutsMenu" shares gui::DCGameMenu with pause menu).
+    if snapshot.visualTextWidgetName
+        and WIDGET_NAME_HANDLERS[snapshot.visualTextWidgetName] then
+        local newHandler = WIDGET_NAME_HANDLERS[snapshot.visualTextWidgetName]
+        if newHandler ~= activeHandler then
+            if activeHandler then activeHandler.ResetState() end
+            activeHandler = newHandler
+            Log.Info("Active handler: " .. activeHandler.name
+                .. " (widget=" .. snapshot.visualTextWidgetName .. ")")
+        end
+    end
+
     -- If no handler is active yet (no widgetAdded event has fired),
     -- use the default handler (MainMenu -- simple button navigation).
     if not activeHandler then
@@ -802,6 +909,7 @@ local function ResetAllHandlers()
     MultiplayerHandler.ResetState()
     SaveLoadHandler.ResetState()
     PauseMenuHandler.ResetState()
+    ShortcutsMenuHandler.ResetState()
     DifficultyHandler.ResetState()
     ModManagerHandler.ResetState()
     MainMenuHandler.ResetState()

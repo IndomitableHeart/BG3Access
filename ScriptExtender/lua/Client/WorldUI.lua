@@ -30,7 +30,7 @@ local Cutscene = BG3Access.Client.Cutscene
 -- Constants
 -- ============================================================================
 
--- Spoken once when the radial first opens (first slot event after reset).
+-- Spoken once when the action radial first opens (first slot event after reset).
 local RADIAL_HINT = "A to select. X to customize. B to close."
     .. " LB and RB switch between rings"
 
@@ -586,7 +586,8 @@ local function CreatePanelHandler(config)
         local itemDesc = nil
 
         local splitName, splitValue, splitDesc, splitValueDesc =
-            Helpers.FormatDCTextSplit(focusedElement.dcProps)
+            Helpers.FormatDCTextSplit(focusedElement.dcProps,
+                focusedElement.dcType)
         if not splitName or splitName == "" then
             splitName = Helpers.ExtractTextFromData(
                 focusedElement, handlerState.lastSpokenTab, isScreenEntry)
@@ -940,46 +941,79 @@ local LobbyHandler = CreatePanelHandler({
 -- Panel DC type routing table
 -- ============================================================================
 
+-- Normalize a DC type string by stripping the namespace prefix.
+-- Runtime types use either "gui::" or "ls." depending on the class.
+local function NormalizeDCType(dcType)
+    if not dcType then return nil end
+    return dcType:gsub("^gui::", ""):gsub("^ls%.", "")
+end
+
 local DC_TYPE_HANDLERS = {
     -- Character sheet / inventory
     ["gui::DCCharacterPanels"]    = CharacterPanelHandler,
+    ["ls.DCCharacterPanels"]      = CharacterPanelHandler,
     -- Trading
     ["gui::DCTrade"]              = TradeHandler,
+    ["ls.DCTrade"]                = TradeHandler,
     -- Examine / inspect
     ["gui::DCExamine"]            = ExamineHandler,
+    ["ls.DCExamine"]              = ExamineHandler,
     -- Dice rolls and reactions
     ["gui::DCActiveRoll"]         = ActiveRollHandler,
+    ["ls.DCActiveRoll"]           = ActiveRollHandler,
     ["gui::DCReactionDecision"]   = ReactionHandler,
+    ["ls.DCReactionDecision"]     = ReactionHandler,
     -- Crafting
     ["gui::DCAlchemy"]            = AlchemyHandler,
+    ["ls.DCAlchemy"]              = AlchemyHandler,
     ["gui::DCCombine"]            = CombineHandler,
+    ["ls.DCCombine"]              = CombineHandler,
     -- Item transfer
     ["gui::DCDonate"]             = DonateHandler,
+    ["ls.DCDonate"]               = DonateHandler,
     ["gui::DCPickpocket"]         = PickpocketHandler,
+    ["ls.DCPickpocket"]           = PickpocketHandler,
     ["gui::DCLearnSpells"]        = LearnSpellsHandler,
+    ["ls.DCLearnSpells"]          = LearnSpellsHandler,
     -- Camp / rest
     ["gui::DCMakeCamp"]           = CampHandler,
+    ["ls.DCMakeCamp"]             = CampHandler,
     -- Journal
     ["gui::DCJournalQuests"]      = JournalQuestsHandler,
+    ["ls.DCJournalQuests"]        = JournalQuestsHandler,
     ["gui::DCJournalDialogues"]   = JournalDialoguesHandler,
+    ["ls.DCJournalDialogues"]     = JournalDialoguesHandler,
     -- Illithid powers
     ["gui::DCTadpolePowersTree"]  = TadpoleHandler,
+    ["ls.DCTadpolePowersTree"]    = TadpoleHandler,
     -- Selection / rewards
     ["gui::DCSelectionFlyOut"]    = SelectionFlyOutHandler,
+    ["ls.DCSelectionFlyOut"]      = SelectionFlyOutHandler,
     ["gui::DCActiveSearch"]       = SelectionFlyOutHandler,
+    ["ls.DCActiveSearch"]         = SelectionFlyOutHandler,
     ["gui::DCRewardPanel"]        = RewardHandler,
+    ["ls.DCRewardPanel"]          = RewardHandler,
     -- Popups
     ["gui::DCNewSavegamePopup"]   = SavePopupHandler,
+    ["ls.DCNewSavegamePopup"]     = SavePopupHandler,
     ["gui::DCProofOfHonour"]      = HonourHandler,
+    ["ls.DCProofOfHonour"]        = HonourHandler,
     -- Settings (in-game)
     ["gui::DCConnectivityMenu"]   = ConnectivityHandler,
+    ["ls.DCConnectivityMenu"]     = ConnectivityHandler,
     ["gui::DCSignUp"]             = SignUpHandler,
+    ["ls.DCSignUp"]               = SignUpHandler,
     ["gui::DCFirstTimeSetup"]     = FirstTimeSetupHandler,
+    ["ls.DCFirstTimeSetup"]       = FirstTimeSetupHandler,
     ["gui::DCHDRCalibration"]     = HDRHandler,
+    ["ls.DCHDRCalibration"]       = HDRHandler,
     ["gui::DCGammaCalibration"]   = GammaHandler,
+    ["ls.DCGammaCalibration"]     = GammaHandler,
     ["gui::DCReport"]             = ReportHandler,
+    ["ls.DCReport"]               = ReportHandler,
     -- Multiplayer lobby
     ["gui::DCLobby"]              = LobbyHandler,
+    ["ls.DCLobby"]                = LobbyHandler,
 }
 
 -- All handler instances for batch reset.
@@ -1061,7 +1095,18 @@ end
 --- a WorldUI panel is active.
 --- @param snapshot table  The full TickSnapshot from C++.
 local function RoutePanelSnapshot(snapshot)
-    if not activePanelHandler then return end
+    if not activePanelHandler then
+        -- Defensive: routeToWorld is true but no panel handler was set
+        -- (widget-added tick had no focusedElement, or handler lookup
+        -- failed).  Fall back to Menus so the snapshot isn't dropped.
+        Log.Warn("RoutePanelSnapshot: no active panel handler, "
+            .. "falling back to Menus")
+        local Menus = BG3Access.Client.Menus
+        if Menus then
+            Menus.RouteSnapshot(snapshot)
+        end
+        return
+    end
     activePanelHandler.HandleSnapshot(snapshot)
 end
 
