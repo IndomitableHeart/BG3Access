@@ -31,12 +31,34 @@ local Cutscene = BG3Access.Client.Cutscene
 -- ============================================================================
 
 -- Spoken once when the action radial first opens (first slot event after reset).
-local RADIAL_HINT = "A to select. X to customize. B to close."
+local RADIAL_HINT = "A to select. X to customize."
+    .. " Right stick to inspect. B to close."
     .. " LB and RB switch between rings"
 
 -- Default hint for panel handlers (false = no hint by default).
 -- Individual handlers override with specific hints.
 local DEFAULT_PANEL_HINT = false
+
+-- ============================================================================
+-- Tooltip state (above radial because radial open/close sets suppression)
+-- ============================================================================
+
+local tooltipSuppressed      = false  -- handlers set true to suppress speech
+local tooltipEnabled         = true   -- future settings toggle
+local lastTooltipSpeech      = nil    -- dedup: last spoken tooltip text
+local lastSpokenRadialTitle  = nil    -- title filter: prevent tooltip re-speaking title
+local lastRawTooltipTexts    = nil    -- full raw texts for inspect readback
+
+--- SetTooltipSuppressed: called by handlers that speak their own
+--- descriptions (radial, future settings menu, etc.).
+local function SetTooltipSuppressed(suppressed)
+    tooltipSuppressed = suppressed
+end
+
+--- SetTooltipEnabled: future settings toggle.
+local function SetTooltipEnabled(enabled)
+    tooltipEnabled = enabled
+end
 
 -- ============================================================================
 -- Radial state
@@ -257,43 +279,27 @@ end
 -- Speech output (decides what and how to speak from gathered data)
 -- ============================================================================
 
---- FormatItemStats: build a stats string from radial tag properties.
---- Returns nil if no item stats are present (spells/actions have no Gold/Count).
-local function FormatItemStats(tagProps)
-    if not tagProps then return nil end
-    local parts = {}
-
-    local count = tonumber(tagProps.Count)
-    if count and count > 1 then
-        parts[#parts + 1] = tostring(count) .. " in stock"
-    end
-
-    local gold = tonumber(tagProps.Gold)
-    if gold and gold > 0 then
-        parts[#parts + 1] = tostring(gold) .. " gold"
-    end
-
-    if #parts == 0 then return nil end
-    return table.concat(parts, ", ")
-end
-
---- SpeakRadialSlot: speak the slot title, API description, and item stats.
---- The API description is reliable (Ext.Stats lookup); tooltip TextBlocks
---- may be incomplete.  Tooltip dedup prevents double-speaking when both
---- sources have the same text.
+--- SpeakRadialSlot: speak the slot title and API description.
+--- Combat stats (dice, range, cost) come from the C++ tooltip scanner
+--- which reads them from the popup TextBlocks -- no Lua API duplication.
 --- @param slotData table  From GatherRadialSlotData.
 local function SpeakRadialSlot(slotData)
-    local speechParts = { Helpers.StripMarkupTags(slotData.title) }
+    local cleanTitle = Helpers.StripMarkupTags(slotData.title)
+    local speechParts = { cleanTitle }
 
-    -- API-sourced description (reliable, resolved from PrototypeID/PassiveName).
+    -- Track title so the tooltip can filter it (avoid double-speaking).
+    -- Reset tooltip dedup so the new slot's tooltip always speaks.
+    lastSpokenRadialTitle = cleanTitle
+    lastTooltipSpeech = nil
+
+    -- API-sourced description (spell/passive flavor text not shown in tooltip).
     if slotData.description and slotData.description ~= "" then
-        speechParts[#speechParts + 1] = Helpers.StripMarkupTags(slotData.description)
-    end
-
-    -- Append item stats from tag (gold, count) for consumables/items.
-    local itemStats = FormatItemStats(slotData.tagProps)
-    if itemStats then
-        speechParts[#speechParts + 1] = itemStats
+        local cleanedDescription = Helpers.StripMarkupTags(slotData.description)
+        -- Strip trailing period to avoid double periods when joining.
+        if cleanedDescription:sub(-1) == "." then
+            cleanedDescription = cleanedDescription:sub(1, -2)
+        end
+        speechParts[#speechParts + 1] = cleanedDescription
     end
 
     local fullText = table.concat(speechParts, ". ")
@@ -335,6 +341,7 @@ local function ClearRadialFocus()
     inRadial = false
 end
 
+
 -- ============================================================================
 -- Entry point for radial (called by EventRouter)
 -- ============================================================================
@@ -346,6 +353,141 @@ local function HandleRadialSlot(snapshot)
     if slotData then
         SpeakRadialSlot(slotData)
     end
+end
+
+-- ============================================================================
+-- Tooltip handler
+-- ============================================================================
+
+--- ProcessTooltip: called by EventRouter with tooltip snapshot data.
+--- Speaks immediately on each tooltip change.  Title filtering prevents
+--- re-speaking what the handler already said.  The subset check prevents
+--- re-speaking when a later wave has fewer texts than a previous one
+--- (tooltip collapsing as TextBlocks disappear).
+--- @param snapshot table  The full TickSnapshot from C++.
+local function ProcessTooltip(snapshot)
+    -- Reset dedup when user navigates to a new element.
+    -- Note: radial slot changes reset lastTooltipSpeech in SpeakRadialSlot
+    -- instead, since snapshot.radialSlotChanged isn't on the Lua table.
+    if snapshot.focusChanged or snapshot.selectionChanged then
+        lastTooltipSpeech = nil
+    end
+
+    -- Only process if tooltip data is present and speech is allowed.
+    if not snapshot.tooltipChanged or not snapshot.tooltipTexts then
+        return
+    end
+    if tooltipSuppressed or not tooltipEnabled then return end
+
+    -- Store the full raw texts for inspect readback (right stick).
+    lastRawTooltipTexts = snapshot.tooltipTexts
+
+    local tooltipSpeech = Helpers.FormatTooltipTexts(
+        snapshot.tooltipTexts, lastSpokenRadialTitle)
+    if not tooltipSpeech or tooltipSpeech == lastTooltipSpeech then return end
+
+    -- Skip if the new text is a subset of what was already spoken
+    -- (tooltip collapsing between waves as TextBlocks disappear).
+    if lastTooltipSpeech
+        and lastTooltipSpeech:find(tooltipSpeech, 1, true) then
+        return
+    end
+
+    lastTooltipSpeech = tooltipSpeech
+    Log.Info("TOOLTIP: " .. tooltipSpeech)
+    Ext.Tolk.Speak(tooltipSpeech, false)
+end
+
+--- HandleInspectNav: called by EventRouter when d-pad moves focus between
+--- side panels in the PinnedTooltips_c inspect widget.  Reads the focused
+--- panel's TextBlocks via C++ BFS and speaks title + description.
+local function HandleInspectNav()
+    local readOk, panelTexts = pcall(Ext.UI.ReadFocusedTextBlocks)
+    if not readOk or not panelTexts or #panelTexts == 0 then return end
+
+    -- Partition into titles (short, no periods) and details (longer/sentences).
+    -- Titles come first so the panel name is spoken before its description.
+    local titles = {}
+    local details = {}
+    for _, text in ipairs(panelTexts) do
+        if text and text ~= "" and text ~= ":" and text ~= "." then
+            local cleaned = Helpers.StripMarkupTags(text)
+            if cleaned and cleaned ~= ""
+                and cleaned ~= ":" and cleaned ~= "." then
+                -- Strip trailing colon or period.
+                if cleaned:sub(-1) == "."
+                    or cleaned:sub(-1) == ":" then
+                    cleaned = cleaned:sub(1, -2)
+                end
+                -- Bare numbers are stat values (DC 13, etc.).
+                -- Parenthesized text is modifiers like "(Tav)".
+                -- Modifier notation like "+5 (Tav)" is a stat value.
+                -- These are all details, not titles.
+                if cleaned:match("^[%d%.]+$")
+                    or cleaned:match("^%(.*%)$")
+                    or cleaned:match("^[%+%-]%d+") then
+                    table.insert(details, cleaned)
+                elseif #cleaned <= 25 and not cleaned:find("%.") then
+                    table.insert(titles, cleaned)
+                else
+                    table.insert(details, cleaned)
+                end
+            end
+        end
+    end
+
+    local parts = {}
+    for _, title in ipairs(titles) do table.insert(parts, title) end
+    for _, detail in ipairs(details) do table.insert(parts, detail) end
+
+    if #parts > 0 then
+        local speech = table.concat(parts, ". ")
+        Log.Info("INSPECT NAV: " .. speech)
+        Ext.Tolk.Speak(speech, true)
+    end
+end
+
+--- SpeakInspectData: called when PinnedTooltips_c widget appears (right
+--- stick inspect).  Reads TextBlocks directly from the inspect widget
+--- via C++ BFS (same approach as tooltip scanner but targeting a widget).
+--- This captures the side panel detail (dice, damage type, range in feet,
+--- attack modifier, cost explanation) that the tooltip popup didn't have.
+--- Falls back to stored tooltip texts if the widget read fails.
+--- @return boolean  True if inspect data was spoken, false if nothing found.
+local function SpeakInspectData()
+    -- Try reading the inspect widget directly via C++ BFS.
+    local readOk, widgetTexts = pcall(
+        Ext.UI.ReadWidgetTextBlocks, "PinnedTooltips_c")
+    if readOk and widgetTexts and #widgetTexts > 0 then
+        local inspectSpeech = Helpers.FormatInspectTexts(
+            widgetTexts, lastSpokenRadialTitle)
+        if inspectSpeech then
+            Log.Info("INSPECT (widget): " .. inspectSpeech)
+            Ext.Tolk.Speak(inspectSpeech, true)
+            return true
+        end
+    end
+
+    -- Fallback: use stored tooltip texts if widget read failed.
+    if lastRawTooltipTexts and #lastRawTooltipTexts > 0 then
+        local inspectSpeech = Helpers.FormatInspectTexts(
+            lastRawTooltipTexts, lastSpokenRadialTitle)
+        if inspectSpeech then
+            Log.Info("INSPECT (fallback): " .. inspectSpeech)
+            Ext.Tolk.Speak(inspectSpeech, true)
+            return true
+        end
+    end
+
+    return false
+end
+
+--- ResetTooltipState: clear all tooltip state (called on GameStateChanged).
+local function ResetTooltipState()
+    lastTooltipSpeech = nil
+    tooltipSuppressed = false
+    lastSpokenRadialTitle = nil
+    lastRawTooltipTexts = nil
 end
 
 -- ============================================================================
@@ -1188,6 +1330,12 @@ BG3Access.Client.WorldUI = {
     RoutePanelSnapshot         = RoutePanelSnapshot,
     ResetAllPanelHandlers      = ResetAllPanelHandlers,
     GetActivePanelHandler      = GetActivePanelHandler,
+    -- Tooltip
+    ProcessTooltip             = ProcessTooltip,
+    SpeakInspectData           = SpeakInspectData,
+    HandleInspectNav           = HandleInspectNav,
+    SetTooltipSuppressed       = SetTooltipSuppressed,
+    SetTooltipEnabled          = SetTooltipEnabled,
     -- State management
     ResetState                 = ResetState,
 }

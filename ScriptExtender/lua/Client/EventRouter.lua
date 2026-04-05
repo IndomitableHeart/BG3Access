@@ -32,6 +32,7 @@ local Menus = BG3Access.Client.Menus
 -- and no GameStateChanged fires for the initial state.
 local suppressSnapshots   = true
 local lastWidgetRootStr   = nil
+local inspectWidgetActive = false  -- true while PinnedTooltips_c has focus
 local debugExploreMode    = false
 -- Explore mode uses its own lastSpokenFullText to avoid needing a handler state.
 local exploreLastSpoken   = nil
@@ -43,8 +44,6 @@ local routeToWorld        = false
 -- True when a dialog overlay spoke on this tick while WorldUI is active.
 -- Suppresses the panel handler so dialog speech isn't interrupted.
 local worldDialogOverlayJustSpoke = false
--- Last tooltip speech string, for dedup across tooltip build waves.
-local lastTooltipSpeech = nil
 -- True on world entry (Running state) to suppress the initial burst of
 -- visual text from HUD widgets (Overlay "Examine/Context Menu/Actions",
 -- etc.).  The RS HUD reader replaces this -- user reads when ready.
@@ -90,8 +89,6 @@ local function HandleTickSnapshot(snapshot)
         local World = BG3Access.Client.WorldUI
         if World then
             World.HandleRadialSlot(snapshot)
-            -- Set title for tooltip dedup (tooltip fires on next snapshot).
-            Helpers.SetLastSpokenTitle(snapshot.radialTitleText)
         end
         return
     end
@@ -287,6 +284,7 @@ local function HandleTickSnapshot(snapshot)
     local widgetRootId = focusedElement.widgetRootId or ""
     if widgetRootId ~= "" and widgetRootId ~= lastWidgetRootStr then
         lastWidgetRootStr = widgetRootId
+        inspectWidgetActive = false  -- widget root changed, inspect closed
         Log.Info("Widget root changed to " .. widgetRootId)
         if routeToWorld then
             local World = BG3Access.Client.WorldUI
@@ -324,6 +322,31 @@ local function HandleTickSnapshot(snapshot)
     end
 
     -- =================================================================
+    -- PinnedTooltips_c: inspect panel (right stick).
+    -- On widgetAdded: speak the full tooltip data (dice, damage, etc.).
+    -- On subsequent focus changes: read the focused side panel's text
+    -- via C++ BFS and speak it (Advantage, Disadvantage, range, etc.).
+    -- =================================================================
+    if snapshot.widgetData
+        and snapshot.widgetData.elemName == "PinnedTooltips_c" then
+        inspectWidgetActive = true
+        local World = BG3Access.Client.WorldUI
+        if World then
+            World.SpeakInspectData()
+        end
+        return
+    end
+
+    -- D-pad navigation within the inspect panel: route to WorldUI.
+    if inspectWidgetActive and snapshot.focusChanged then
+        local World = BG3Access.Client.WorldUI
+        if World then
+            World.HandleInspectNav()
+        end
+        return
+    end
+
+    -- =================================================================
     -- Dispatch to the active handler module.
     -- =================================================================
     if routeToWorld then
@@ -342,28 +365,12 @@ local function HandleTickSnapshot(snapshot)
     end
 
     -- =================================================================
-    -- Tooltip events: speak AFTER the focus/handler speech so tooltip
-    -- text supplements the item name rather than competing with it.
-    -- Routed through the Tooltip handler for title/description ordering
-    -- and junk filtering.
+    -- Tooltip events: routed to WorldUI tooltip handler.
+    -- Speaks AFTER handler speech so tooltip supplements the item name.
     -- =================================================================
-    -- Reset tooltip dedup when user navigates to a new element.
-    if snapshot.focusChanged or snapshot.selectionChanged then
-        lastTooltipSpeech = nil
-        Helpers.SetLastSpokenTitle(nil)
-    end
-    if snapshot.tooltipChanged and snapshot.tooltipTexts then
-        local tooltipSpeech = Helpers.FormatTooltipTexts(snapshot.tooltipTexts)
-        if tooltipSpeech and tooltipSpeech ~= lastTooltipSpeech then
-            -- Skip if the new text is a subset of what was already spoken
-            -- (tooltip collapsing between waves as TextBlocks disappear).
-            if not lastTooltipSpeech
-                or not lastTooltipSpeech:find(tooltipSpeech, 1, true) then
-                lastTooltipSpeech = tooltipSpeech
-                Log.Info("TOOLTIP: " .. tooltipSpeech)
-                Ext.Tolk.Speak(tooltipSpeech, false)
-            end
-        end
+    local World = BG3Access.Client.WorldUI
+    if World then
+        World.ProcessTooltip(snapshot)
     end
 end
 
@@ -430,7 +437,6 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     routeToWorld = false
     worldDialogOverlayJustSpoke = false
     suppressWorldEntryVisualText = false
-    lastTooltipSpeech = nil
 
     local toState = tostring(e.ToState)
     suppressSnapshots = LOADING_STATES[toState] or false
@@ -487,5 +493,15 @@ if resetOk and resetEntities and next(resetEntities) then
     suppressSnapshots = false
     Log.Info("Mid-session reload detected, suppression cleared")
 end
+
+-- ---------------------------------------------------------------------------
+-- Exports
+-- ---------------------------------------------------------------------------
+BG3Access.Client.EventRouter = {
+    --- IsUIActive: returns true when focus is on any UI panel (radial,
+    --- inspect, menus, etc.) rather than free-world navigation.
+    --- Used by WorldNav to suppress GPS when UI consumes the right stick.
+    IsUIActive = function() return not routeToWorld or inspectWidgetActive end,
+}
 
 Log.Info("Accessibility ready (GlobalFocusMonitor).")

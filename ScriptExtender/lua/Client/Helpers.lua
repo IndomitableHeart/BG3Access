@@ -816,108 +816,300 @@ end
 -- Tooltip text processing
 -- ---------------------------------------------------------------------------
 
--- Short button labels that leak into tooltip TextBlocks.
+-- Short button labels and decorative text that leak into tooltip TextBlocks.
 local TOOLTIP_JUNK_LABELS = {
     ["Inspect"] = true,
     ["Close"] = true,
     ["OK"] = true,
+    ["."] = true,
+    [":"] = true,
+    ["You already know this spell."] = true,
+    -- Button hints from inspect panel (PinnedTooltips_c).
+    ["Select"] = true,
+    ["Close Tooltips"] = true,
+    ["Back"] = true,
+    -- Tutorial labels from inspect side panels.
+    ["Replenishable Resource"] = true,
 }
 
---- Check if a text is a bare stat value (price, weight) rendered next
---- to an icon in the tooltip.  These are standalone numbers like "100"
---- or "0.04" with no label.  The radial handler speaks them with labels
---- ("100 gold"), so the tooltip version is redundant.
---- Does NOT match strings with non-numeric content ("1~10 Damage", "60ft").
-local function IsBareStatValue(text)
-    return text:match("^[%d%.]+$") ~= nil
-end
-
--- Last spoken radial/handler title, used to dedup tooltip title.
--- Set by EventRouter before tooltip processing.
-local lastSpokenTitle = nil
-
---- FormatTooltipEntry: transform a single tooltip text entry into
---- a spoken-friendly format.  Handles bare distances, damage ranges,
---- dice notation, resource costs, and duration labels.
-local function FormatTooltipEntry(text)
-    -- "15ft" / "60ft" -> "Range 15 feet"
-    local distance = text:match("^(%d+)ft$")
-    if distance then return "Range " .. distance .. " feet" end
-
-    -- "Melee" (standalone) -> "Melee range"
-    if text == "Melee" then return "Melee range" end
-
-    -- "4~9 Damage" -> "4 to 9 Damage"
-    local damageMin, damageMax = text:match("^(%d+)~(%d+) Damage$")
-    if damageMin then return damageMin .. " to " .. damageMax .. " Damage" end
-
-    -- "Short Rest" / "Long Rest" (standalone) -> "Recharges on ..."
-    if text == "Short Rest" or text == "Long Rest" then
-        return "Recharges on " .. text
-    end
-
-    -- "Per turn" -> "Once per turn"
-    if text == "Per turn" then return "Once per turn" end
-
-    -- "1 turn" / "N turns" -> "Duration N turn(s)"
-    local turnCount = text:match("^(%d+) turns?$")
-    if turnCount then return "Duration " .. text end
-
-    -- "Action" / "Bonus Action" (standalone cost labels)
-    if text == "Action" then return "Costs Action" end
-    if text == "Bonus Action" then return "Costs Bonus Action" end
-
-    -- Everything else passes through unchanged (dice notation like
-    -- "1d6+3", category labels, descriptions, etc.)
-    return text
-end
-
---- SetLastSpokenTitle: called by EventRouter/handlers before tooltip
---- processing to let FormatTooltipTexts filter the exact item name.
-local function SetLastSpokenTitle(title)
-    lastSpokenTitle = title
-end
+-- Ability score names for inspect panel modifier grouping.
+local ABILITY_NAMES = {
+    Strength = true, Dexterity = true, Constitution = true,
+    Intelligence = true, Wisdom = true, Charisma = true,
+}
 
 -- FormatTooltipTexts: takes the raw tooltipTexts array from C++,
--- filters junk and the already-spoken title.
+-- filters to only the entries visible in the BASIC tooltip (damage
+-- range and cost).  The handler already speaks title and description.
+-- Dice, damage type, range, attack roll, and category badges are
+-- inspect-level detail (right stick) and filtered out here.
+--
+-- @param tooltipTexts table  Raw text array from C++.
+-- @param filterTitle string|nil  Title the handler already spoke; filtered
+--        from tooltip to avoid double-speaking.
 -- Returns a formatted speech string or nil.
-local function FormatTooltipTexts(tooltipTexts)
+local function FormatTooltipTexts(tooltipTexts, filterTitle)
     if not tooltipTexts or #tooltipTexts == 0 then return nil end
 
-    -- Filter junk
-    local filtered = {}
+    local normalizedTitle = filterTitle
+        and NormalizeForCompare(filterTitle) or nil
+
+    local parts = {}
+
     for _, text in ipairs(tooltipTexts) do
         if text and text ~= ""
-            and not TOOLTIP_JUNK_LABELS[text]
-            and not IsBareStatValue(text) then
+            and not TOOLTIP_JUNK_LABELS[text] then
             local cleaned = StripMarkupTags(text)
-            if cleaned and cleaned ~= ""
-                and not IsBareStatValue(cleaned) then
-                table.insert(filtered, cleaned)
+            if cleaned and cleaned ~= "" and cleaned ~= "." then
+                -- Skip if matches the handler's already-spoken title.
+                if normalizedTitle
+                    and NormalizeForCompare(cleaned) == normalizedTitle then
+                    -- already spoken by handler, skip
+
+                -- Damage range: "4~9 Damage" -> "4 to 9 Damage"
+                elseif cleaned:match("^%d+~%d+ Damage$") then
+                    local damageMin, damageMax =
+                        cleaned:match("^(%d+)~(%d+) Damage$")
+                    table.insert(parts,
+                        damageMin .. " to " .. damageMax .. " Damage")
+
+                -- Cost: "Action" / "Bonus Action"
+                elseif cleaned == "Action" then
+                    table.insert(parts, "Costs Action")
+                elseif cleaned == "Bonus Action" then
+                    table.insert(parts, "Costs Bonus Action")
+
+                -- Warning messages (red text in tooltip, e.g.
+                -- "No ranged weapon equipped.")
+                elseif cleaned:match("^No .+ equipped%.$") then
+                    local warning = cleaned
+                    if warning:sub(-1) == "." then
+                        warning = warning:sub(1, -2)
+                    end
+                    table.insert(parts, warning)
+
+                -- Everything else is inspect-level detail or already
+                -- spoken by the handler -- skip for the basic tooltip.
+                end
             end
         end
     end
-    if #filtered == 0 then return nil end
 
-    -- Drop the exact item/spell name if the handler already spoke it.
-    -- Format remaining entries for spoken clarity (ranges, damage, etc.).
-    local parts = {}
-    for _, text in ipairs(filtered) do
-        if not lastSpokenTitle
-            or NormalizeForCompare(text) ~= NormalizeForCompare(lastSpokenTitle) then
-            table.insert(parts, FormatTooltipEntry(text))
-        end
-    end
-    -- Strip trailing periods from each part before joining to avoid
-    -- double periods ("halved.. Next sentence").
-    for i, part in ipairs(parts) do
-        if part:sub(-1) == "." then
-            parts[i] = part:sub(1, -2)
-        end
-    end
     local speech = table.concat(parts, ". ")
     if speech == "" then return nil end
     return speech
+end
+
+-- ---------------------------------------------------------------------------
+-- Inspect formatter (full tooltip detail for right-stick inspect)
+-- ---------------------------------------------------------------------------
+
+-- Damage type keywords for combining with preceding dice notation.
+local DAMAGE_TYPES = {
+    Piercing = true, Slashing = true, Bludgeoning = true,
+    Fire = true, Cold = true, Lightning = true,
+    Thunder = true, Acid = true, Poison = true,
+    Necrotic = true, Radiant = true, Force = true,
+    Psychic = true,
+}
+
+--- FormatInspectTexts: formats widget BFS data for inspect readback.
+--- Filters button hints, tutorial explanations, and junk.  Keeps combat
+--- data: damage (dice + type), range (feet), attack modifier (ability +N),
+--- cost, category.  Groups related entries (dice+type, ability+modifier,
+--- range label+feet).
+--- @param widgetTexts table  Raw text array from C++ ReadWidgetTextBlocks.
+--- @param filterTitle string|nil  Title to filter (handler already spoke it).
+--- @return string|nil  Formatted speech string or nil.
+local function FormatInspectTexts(widgetTexts, filterTitle)
+    if not widgetTexts or #widgetTexts == 0 then return nil end
+
+    local normalizedTitle = filterTitle
+        and NormalizeForCompare(filterTitle) or nil
+
+    -- Collect into semantic buckets.
+    local damageRange = nil
+    local diceParts = {}
+    local damageTypes = {}
+    local rangeLabel = nil
+    local rangeFeet = nil
+    local attackType = nil
+    local attackAbility = nil
+    local attackModifier = nil
+    local costParts = {}
+    local cooldownParts = {}
+    local categoryParts = {}
+    local seen = {}  -- dedup
+
+    for _, text in ipairs(widgetTexts) do
+        if text and text ~= ""
+            and not TOOLTIP_JUNK_LABELS[text] then
+            local cleaned = StripMarkupTags(text)
+            if cleaned and cleaned ~= "" and cleaned ~= "."
+                and cleaned ~= ":" then
+                -- Skip title (handler already spoke it).
+                if normalizedTitle
+                    and NormalizeForCompare(cleaned) == normalizedTitle then
+                    -- skip
+
+                -- Skip tutorial/explanation sentences (> 30 chars).
+                elseif #cleaned > 30 then
+                    -- skip long explanatory text
+
+                -- Dedup: skip if already seen this exact text.
+                elseif seen[cleaned] then
+                    -- skip duplicate
+
+                -- Damage range: "4~9 Damage"
+                elseif cleaned:match("^%d+~%d+ Damage$") then
+                    local damageMin, damageMax =
+                        cleaned:match("^(%d+)~(%d+) Damage$")
+                    damageRange = damageMin .. " to " .. damageMax
+                    seen[cleaned] = true
+
+                -- Dice notation: "1d6+3", "+1d6"
+                elseif cleaned:match("^[%+%-]?%d*d%d+[%+%-]?%d*$") then
+                    table.insert(diceParts, cleaned)
+                    seen[cleaned] = true
+
+                -- Damage type keyword
+                elseif DAMAGE_TYPES[cleaned] then
+                    table.insert(damageTypes, cleaned)
+                    seen[cleaned] = true
+
+                -- Range: "Melee" or "Nft"
+                elseif cleaned == "Melee" then
+                    rangeLabel = "Melee range"
+                    seen[cleaned] = true
+                elseif cleaned:match("^%d+ft$") then
+                    local distance = cleaned:match("^(%d+)ft$")
+                    rangeLabel = "Range"
+                    rangeFeet = distance .. " feet"
+                    seen[cleaned] = true
+
+                -- Range detail from side panel.
+                -- Imperial: "5 feet", "18 feet"
+                -- Metric: "2 metres", "1.5 metres", "5.4m", "1.5 m"
+                elseif cleaned:match("^[%d%.%,]+ feet$")
+                    or cleaned:match("^[%d%.%,]+ metres?$")
+                    or cleaned:match("^[%d%.%,]+ meters?$")
+                    or cleaned:match("^[%d%.%,]+%s?m$") then
+                    rangeFeet = cleaned
+                    seen[cleaned] = true
+
+                -- Attack type
+                elseif cleaned == "Attack Roll"
+                    or cleaned == "Saving Throw" then
+                    attackType = cleaned
+                    seen[cleaned] = true
+
+                -- Ability name (from side panel)
+                elseif ABILITY_NAMES[cleaned] then
+                    attackAbility = cleaned
+                    seen[cleaned] = true
+
+                -- Modifier: "+5 (Tav)" or "+3"
+                elseif cleaned:match("^[%+%-]%d+") then
+                    attackModifier = cleaned
+                    seen[cleaned] = true
+
+                -- Cost
+                elseif cleaned == "Action" then
+                    table.insert(costParts, "Costs Action")
+                    seen[cleaned] = true
+                elseif cleaned == "Bonus Action" then
+                    table.insert(costParts, "Costs Bonus Action")
+                    seen[cleaned] = true
+
+                -- Cooldown
+                elseif cleaned == "Per turn" then
+                    table.insert(cooldownParts, "Once per turn")
+                    seen[cleaned] = true
+                elseif cleaned == "Short Rest"
+                    or cleaned == "Long Rest" then
+                    table.insert(cooldownParts, "Recharges on " .. cleaned)
+                    seen[cleaned] = true
+                elseif cleaned:match("^%d+ turns?$") then
+                    table.insert(cooldownParts, "Duration " .. cleaned)
+                    seen[cleaned] = true
+
+                -- Category badge
+                elseif cleaned == "Weapon Actions"
+                    or cleaned == "Class Action"
+                    or cleaned == "Cantrip"
+                    or cleaned:match("^Level %d+") then
+                    table.insert(categoryParts, "Category: " .. cleaned)
+                    seen[cleaned] = true
+
+                -- Weapon Damage (label-only, skip)
+                elseif cleaned == "Weapon Damage" then
+                    seen[cleaned] = true
+
+                -- Everything else short enough: keep as info.
+                -- (already filtered > 30 chars above)
+                end
+            end
+        end
+    end
+
+    -- Assemble damage phrase: "4 to 9 Damage, 1d6+3 Piercing"
+    local combinedDice = {}
+    for diceIndex = 1, #diceParts do
+        local diceText = diceParts[diceIndex]
+        if damageTypes[diceIndex] then
+            diceText = diceText .. " " .. damageTypes[diceIndex]
+        end
+        table.insert(combinedDice, diceText)
+    end
+    for typeIndex = #diceParts + 1, #damageTypes do
+        table.insert(combinedDice, damageTypes[typeIndex])
+    end
+
+    local damagePhrases = {}
+    if damageRange then table.insert(damagePhrases, damageRange) end
+    if #combinedDice > 0 then
+        table.insert(damagePhrases, table.concat(combinedDice, " plus "))
+    end
+    local damagePhrase = #damagePhrases > 0
+        and table.concat(damagePhrases, ", ") .. " Damage" or nil
+
+    -- Assemble range phrase: "Melee, 5 feet"
+    local rangePhrase = nil
+    if rangeLabel and rangeFeet then
+        rangePhrase = rangeLabel .. ", " .. rangeFeet
+    elseif rangeLabel then
+        rangePhrase = rangeLabel
+    elseif rangeFeet then
+        rangePhrase = rangeFeet
+    end
+
+    -- Assemble attack phrase: "Attack Roll, Dexterity +5 (Tav)"
+    local attackPhrase = nil
+    if attackType then
+        local attackDetails = {}
+        table.insert(attackDetails, attackType)
+        if attackAbility and attackModifier then
+            table.insert(attackDetails,
+                attackAbility .. " " .. attackModifier)
+        elseif attackAbility then
+            table.insert(attackDetails, attackAbility)
+        elseif attackModifier then
+            table.insert(attackDetails, attackModifier)
+        end
+        attackPhrase = table.concat(attackDetails, ", ")
+    end
+
+    -- Final assembly.
+    local parts = {}
+    if damagePhrase then table.insert(parts, damagePhrase) end
+    if rangePhrase then table.insert(parts, rangePhrase) end
+    if attackPhrase then table.insert(parts, attackPhrase) end
+    for _, entry in ipairs(costParts) do table.insert(parts, entry) end
+    for _, entry in ipairs(cooldownParts) do table.insert(parts, entry) end
+    for _, entry in ipairs(categoryParts) do table.insert(parts, entry) end
+
+    if #parts == 0 then return nil end
+    return "Inspect. " .. table.concat(parts, ". ")
 end
 
 -- ---------------------------------------------------------------------------
@@ -945,5 +1137,5 @@ BG3Access.Client.Helpers = {
     ExtractFromNamedTexts        = ExtractFromNamedTexts,
     ExtractFromWidgetData        = ExtractFromWidgetData,
     FormatTooltipTexts           = FormatTooltipTexts,
-    SetLastSpokenTitle           = SetLastSpokenTitle,
+    FormatInspectTexts           = FormatInspectTexts,
 }

@@ -1171,11 +1171,20 @@ local function OnControllerButton(event)
     -- Never prevent stick press/release events -- the game needs both
     -- press and release to keep its input state machine consistent.
     -- Preventing a release leaves the game thinking the stick is held.
+    -- Skip GPS when the action radial is open: RS click opens inspect
+    -- (PinnedTooltips_c), not GPS.  The inspect panel's settle delay
+    -- can push holdDuration past 500ms even for a quick click.
     if buttonName == "RightStick" then
         if event.Pressed then
             rightStickPressTime = now
         else
-            if rightStickPressTime and not leftStickDown then
+            -- Skip GPS when any UI panel has focus (radial, inspect,
+            -- menus, etc.).  GPS is only for free-world navigation.
+            local EventRouter = BG3Access.Client.EventRouter
+            local uiHasFocus = EventRouter
+                and EventRouter.IsUIActive and EventRouter.IsUIActive()
+            if rightStickPressTime and not leftStickDown
+                and not uiHasFocus then
                 local holdDuration = now - rightStickPressTime
                 if holdDuration >= STICK_HOLD_MS then
                     ToggleGPS()
