@@ -43,6 +43,8 @@ local routeToWorld        = false
 -- True when a dialog overlay spoke on this tick while WorldUI is active.
 -- Suppresses the panel handler so dialog speech isn't interrupted.
 local worldDialogOverlayJustSpoke = false
+-- Last tooltip speech string, for dedup across tooltip build waves.
+local lastTooltipSpeech = nil
 -- True on world entry (Running state) to suppress the initial burst of
 -- visual text from HUD widgets (Overlay "Examine/Context Menu/Actions",
 -- etc.).  The RS HUD reader replaces this -- user reads when ready.
@@ -88,6 +90,8 @@ local function HandleTickSnapshot(snapshot)
         local World = BG3Access.Client.WorldUI
         if World then
             World.HandleRadialSlot(snapshot)
+            -- Set title for tooltip dedup (tooltip fires on next snapshot).
+            Helpers.SetLastSpokenTitle(snapshot.radialTitleText)
         end
         return
     end
@@ -169,30 +173,38 @@ local function HandleTickSnapshot(snapshot)
     if not focusedElement or not focusedElement.elemType then return end
 
     -- =================================================================
-    -- World entry visual text suppression: skip the initial burst of
-    -- HUD widget visual texts (Overlay "Examine", "Context Menu", etc.)
-    -- that fire when entering Running state.  Clear once a genuine focus
-    -- event (focusChanged/selectionChanged) arrives -- that means the
-    -- player has started interacting.
+    -- World entry announcement: one-shot replacement for the junk
+    -- visual text burst (Overlay "Examine", "Context Menu", etc.).
+    -- Speaks character name + info via ReadHUDInfo instead.
     -- =================================================================
     if suppressWorldEntryVisualText then
-        if snapshot.focusChanged or snapshot.selectionChanged then
-            -- Player interacted -- clear suppression.
-            suppressWorldEntryVisualText = false
-        elseif focusedElement.namedTexts then
-            -- Check if this snapshot only has visual text entries.
-            local hasVisualText = false
+        suppressWorldEntryVisualText = false
+        -- Clear ALL namedTexts: visual texts are HUD junk, and the
+        -- remaining widget texts (ExtraInfoName, TaskDescription, etc.)
+        -- would get spoken by the fallback handler.  We speak a clean
+        -- greeting via ReadHUDInfo instead.
+        if focusedElement.namedTexts then
             for textKey, _ in pairs(focusedElement.namedTexts) do
-                if textKey:find("^_visualText_") then
-                    hasVisualText = true
-                    break
-                end
-            end
-            if hasVisualText then
-                Log.Debug("Suppressed world entry visual text")
-                return
+                focusedElement.namedTexts[textKey] = nil
             end
         end
+        -- Speak character name + info as world entry greeting.
+        local hudOk, hudInfo = pcall(Ext.UI.ReadHUDInfo)
+        if hudOk and hudInfo then
+            local parts = {}
+            if hudInfo.characterName and hudInfo.characterName ~= "" then
+                parts[#parts + 1] = hudInfo.characterName
+            end
+            if hudInfo.characterInfo and hudInfo.characterInfo ~= "" then
+                parts[#parts + 1] = hudInfo.characterInfo
+            end
+            if #parts > 0 then
+                local greeting = table.concat(parts, ". ")
+                Log.Info("WORLD ENTRY: " .. greeting)
+                Ext.Tolk.Speak(greeting, true)
+            end
+        end
+        return  -- skip handler dispatch for this snapshot
     end
 
     -- =================================================================
@@ -335,11 +347,22 @@ local function HandleTickSnapshot(snapshot)
     -- Routed through the Tooltip handler for title/description ordering
     -- and junk filtering.
     -- =================================================================
+    -- Reset tooltip dedup when user navigates to a new element.
+    if snapshot.focusChanged or snapshot.selectionChanged then
+        lastTooltipSpeech = nil
+        Helpers.SetLastSpokenTitle(nil)
+    end
     if snapshot.tooltipChanged and snapshot.tooltipTexts then
         local tooltipSpeech = Helpers.FormatTooltipTexts(snapshot.tooltipTexts)
-        if tooltipSpeech then
-            Log.Info("TOOLTIP: " .. tooltipSpeech)
-            Ext.Tolk.Speak(tooltipSpeech, false)
+        if tooltipSpeech and tooltipSpeech ~= lastTooltipSpeech then
+            -- Skip if the new text is a subset of what was already spoken
+            -- (tooltip collapsing between waves as TextBlocks disappear).
+            if not lastTooltipSpeech
+                or not lastTooltipSpeech:find(tooltipSpeech, 1, true) then
+                lastTooltipSpeech = tooltipSpeech
+                Log.Info("TOOLTIP: " .. tooltipSpeech)
+                Ext.Tolk.Speak(tooltipSpeech, false)
+            end
         end
     end
 end
@@ -407,6 +430,7 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     routeToWorld = false
     worldDialogOverlayJustSpoke = false
     suppressWorldEntryVisualText = false
+    lastTooltipSpeech = nil
 
     local toState = tostring(e.ToState)
     suppressSnapshots = LOADING_STATES[toState] or false

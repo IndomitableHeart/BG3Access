@@ -1095,7 +1095,8 @@ local function OnRSAxisInput(event)
     end
 
     -- Prevent RS movement from reaching the game (camera rotation).
-    event:PreventAction()
+    -- pcall: some contexts don't support PreventAction on axis events.
+    pcall(event.PreventAction, event)
 
     -- Determine direction.
     local direction = GetRSDirection()

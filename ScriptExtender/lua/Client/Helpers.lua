@@ -823,15 +823,63 @@ local TOOLTIP_JUNK_LABELS = {
     ["OK"] = true,
 }
 
--- Heuristic: titles are short and don't end with sentence punctuation.
-local function IsTooltipTitle(text)
-    if #text > 60 then return false end
-    if text:sub(-1) == "." or text:sub(-1) == ":" then return false end
-    return true
+--- Check if a text is a bare stat value (price, weight) rendered next
+--- to an icon in the tooltip.  These are standalone numbers like "100"
+--- or "0.04" with no label.  The radial handler speaks them with labels
+--- ("100 gold"), so the tooltip version is redundant.
+--- Does NOT match strings with non-numeric content ("1~10 Damage", "60ft").
+local function IsBareStatValue(text)
+    return text:match("^[%d%.]+$") ~= nil
+end
+
+-- Last spoken radial/handler title, used to dedup tooltip title.
+-- Set by EventRouter before tooltip processing.
+local lastSpokenTitle = nil
+
+--- FormatTooltipEntry: transform a single tooltip text entry into
+--- a spoken-friendly format.  Handles bare distances, damage ranges,
+--- dice notation, resource costs, and duration labels.
+local function FormatTooltipEntry(text)
+    -- "15ft" / "60ft" -> "Range 15 feet"
+    local distance = text:match("^(%d+)ft$")
+    if distance then return "Range " .. distance .. " feet" end
+
+    -- "Melee" (standalone) -> "Melee range"
+    if text == "Melee" then return "Melee range" end
+
+    -- "4~9 Damage" -> "4 to 9 Damage"
+    local damageMin, damageMax = text:match("^(%d+)~(%d+) Damage$")
+    if damageMin then return damageMin .. " to " .. damageMax .. " Damage" end
+
+    -- "Short Rest" / "Long Rest" (standalone) -> "Recharges on ..."
+    if text == "Short Rest" or text == "Long Rest" then
+        return "Recharges on " .. text
+    end
+
+    -- "Per turn" -> "Once per turn"
+    if text == "Per turn" then return "Once per turn" end
+
+    -- "1 turn" / "N turns" -> "Duration N turn(s)"
+    local turnCount = text:match("^(%d+) turns?$")
+    if turnCount then return "Duration " .. text end
+
+    -- "Action" / "Bonus Action" (standalone cost labels)
+    if text == "Action" then return "Costs Action" end
+    if text == "Bonus Action" then return "Costs Bonus Action" end
+
+    -- Everything else passes through unchanged (dice notation like
+    -- "1d6+3", category labels, descriptions, etc.)
+    return text
+end
+
+--- SetLastSpokenTitle: called by EventRouter/handlers before tooltip
+--- processing to let FormatTooltipTexts filter the exact item name.
+local function SetLastSpokenTitle(title)
+    lastSpokenTitle = title
 end
 
 -- FormatTooltipTexts: takes the raw tooltipTexts array from C++,
--- filters junk, identifies title vs descriptions, reorders title first.
+-- filters junk and the already-spoken title.
 -- Returns a formatted speech string or nil.
 local function FormatTooltipTexts(tooltipTexts)
     if not tooltipTexts or #tooltipTexts == 0 then return nil end
@@ -839,22 +887,25 @@ local function FormatTooltipTexts(tooltipTexts)
     -- Filter junk
     local filtered = {}
     for _, text in ipairs(tooltipTexts) do
-        if text and text ~= "" and not TOOLTIP_JUNK_LABELS[text] then
+        if text and text ~= ""
+            and not TOOLTIP_JUNK_LABELS[text]
+            and not IsBareStatValue(text) then
             local cleaned = StripMarkupTags(text)
-            if cleaned and cleaned ~= "" then
+            if cleaned and cleaned ~= ""
+                and not IsBareStatValue(cleaned) then
                 table.insert(filtered, cleaned)
             end
         end
     end
     if #filtered == 0 then return nil end
 
-    -- Drop the title -- the focus handler already speaks the name and
-    -- level (e.g. "Necrotic, Resistant").  The tooltip should only add
-    -- the description lines that give extra detail.
+    -- Drop the exact item/spell name if the handler already spoke it.
+    -- Format remaining entries for spoken clarity (ranges, damage, etc.).
     local parts = {}
     for _, text in ipairs(filtered) do
-        if not IsTooltipTitle(text) then
-            table.insert(parts, text)
+        if not lastSpokenTitle
+            or NormalizeForCompare(text) ~= NormalizeForCompare(lastSpokenTitle) then
+            table.insert(parts, FormatTooltipEntry(text))
         end
     end
     -- Strip trailing periods from each part before joining to avoid
@@ -894,4 +945,5 @@ BG3Access.Client.Helpers = {
     ExtractFromNamedTexts        = ExtractFromNamedTexts,
     ExtractFromWidgetData        = ExtractFromWidgetData,
     FormatTooltipTexts           = FormatTooltipTexts,
+    SetLastSpokenTitle           = SetLastSpokenTitle,
 }

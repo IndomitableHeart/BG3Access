@@ -227,7 +227,7 @@ end
 --- via SE APIs (API-first: Stats, Entity, then ViewModel fallback).
 ---
 --- @param snapshot table  The full TickSnapshot from C++.
---- @return table|nil  {title, description, slotType} or nil if nothing to say.
+--- @return table|nil  {title, description, slotType, tagProps} or nil if nothing to say.
 local function GatherRadialSlotData(snapshot)
     local title = snapshot.radialTitleText
     local slotType = snapshot.radialSlotType or "?"
@@ -238,17 +238,18 @@ local function GatherRadialSlotData(snapshot)
     end
 
     local description = snapshot.radialDescriptionText
+    local tagProps = ParseTagProps(snapshot.radialSlotTag)
 
     -- HotBar slots: resolve description via API.
     if slotType == "HotBar" and not IsValidText(description) then
-        local contentProps = ParseTagProps(snapshot.radialSlotTag)
-        description = LookupHotBarDescription(contentProps)
+        description = LookupHotBarDescription(tagProps)
     end
 
     return {
         title       = title,
         description = description,
         slotType    = slotType,
+        tagProps    = tagProps,
     }
 end
 
@@ -256,14 +257,46 @@ end
 -- Speech output (decides what and how to speak from gathered data)
 -- ============================================================================
 
---- SpeakRadialSlot: format and speak the gathered radial slot data.
+--- FormatItemStats: build a stats string from radial tag properties.
+--- Returns nil if no item stats are present (spells/actions have no Gold/Count).
+local function FormatItemStats(tagProps)
+    if not tagProps then return nil end
+    local parts = {}
+
+    local count = tonumber(tagProps.Count)
+    if count and count > 1 then
+        parts[#parts + 1] = tostring(count) .. " in stock"
+    end
+
+    local gold = tonumber(tagProps.Gold)
+    if gold and gold > 0 then
+        parts[#parts + 1] = tostring(gold) .. " gold"
+    end
+
+    if #parts == 0 then return nil end
+    return table.concat(parts, ", ")
+end
+
+--- SpeakRadialSlot: speak the slot title, API description, and item stats.
+--- The API description is reliable (Ext.Stats lookup); tooltip TextBlocks
+--- may be incomplete.  Tooltip dedup prevents double-speaking when both
+--- sources have the same text.
 --- @param slotData table  From GatherRadialSlotData.
 local function SpeakRadialSlot(slotData)
-    local speechParts = { slotData.title }
+    local speechParts = { Helpers.StripMarkupTags(slotData.title) }
+
+    -- API-sourced description (reliable, resolved from PrototypeID/PassiveName).
     if slotData.description and slotData.description ~= "" then
-        table.insert(speechParts, slotData.description)
+        speechParts[#speechParts + 1] = Helpers.StripMarkupTags(slotData.description)
     end
-    local fullText = Helpers.StripMarkupTags(table.concat(speechParts, ". "))
+
+    -- Append item stats from tag (gold, count) for consumables/items.
+    local itemStats = FormatItemStats(slotData.tagProps)
+    if itemStats then
+        speechParts[#speechParts + 1] = itemStats
+    end
+
+    local fullText = table.concat(speechParts, ". ")
 
     -- No Lua-side dedup for radial events.  C++ handles dedup via
     -- pointer address comparison and resets on center rest.
