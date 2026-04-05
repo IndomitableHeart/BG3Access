@@ -43,6 +43,10 @@ local routeToWorld        = false
 -- True when a dialog overlay spoke on this tick while WorldUI is active.
 -- Suppresses the panel handler so dialog speech isn't interrupted.
 local worldDialogOverlayJustSpoke = false
+-- True on world entry (Running state) to suppress the initial burst of
+-- visual text from HUD widgets (Overlay "Examine/Context Menu/Actions",
+-- etc.).  The RS HUD reader replaces this -- user reads when ready.
+local suppressWorldEntryVisualText = false
 
 -- ---------------------------------------------------------------------------
 -- HandleTickSnapshot: thin router.
@@ -163,6 +167,33 @@ local function HandleTickSnapshot(snapshot)
     -- Widget-added events (above) are processed regardless.
     -- =================================================================
     if not focusedElement or not focusedElement.elemType then return end
+
+    -- =================================================================
+    -- World entry visual text suppression: skip the initial burst of
+    -- HUD widget visual texts (Overlay "Examine", "Context Menu", etc.)
+    -- that fire when entering Running state.  Clear once a genuine focus
+    -- event (focusChanged/selectionChanged) arrives -- that means the
+    -- player has started interacting.
+    -- =================================================================
+    if suppressWorldEntryVisualText then
+        if snapshot.focusChanged or snapshot.selectionChanged then
+            -- Player interacted -- clear suppression.
+            suppressWorldEntryVisualText = false
+        elseif focusedElement.namedTexts then
+            -- Check if this snapshot only has visual text entries.
+            local hasVisualText = false
+            for textKey, _ in pairs(focusedElement.namedTexts) do
+                if textKey:find("^_visualText_") then
+                    hasVisualText = true
+                    break
+                end
+            end
+            if hasVisualText then
+                Log.Debug("Suppressed world entry visual text")
+                return
+            end
+        end
+    end
 
     -- =================================================================
     -- Loading suppression: only allow visual text (tips, splash screen).
@@ -375,9 +406,15 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     spokenLoadingTips = {}
     routeToWorld = false
     worldDialogOverlayJustSpoke = false
+    suppressWorldEntryVisualText = false
 
     local toState = tostring(e.ToState)
     suppressSnapshots = LOADING_STATES[toState] or false
+    -- Suppress visual text speech on world entry (Running state).
+    -- HUD widgets fire immediately and their visual texts (static button
+    -- prompts like "Examine", "Context Menu") are useless noise.
+    -- The RS HUD reader replaces this -- user reads info when ready.
+    suppressWorldEntryVisualText = (toState == "Running")
     SetupGlobalFocusMonitor()
 end)
 

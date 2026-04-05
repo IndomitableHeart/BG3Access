@@ -63,6 +63,15 @@ local DEGREES_PER_CLOCK_HOUR  = 30
 -- Entity category names (order matches D-pad left/right cycling).
 local CATEGORY_NAMES          = {"Items", "NPCs", "Doors"}
 
+-- RS HUD reader: dead zone and debounce.
+local RS_DEAD_ZONE            = 0.5   -- axis threshold for direction detection
+local RS_DEBOUNCE_MS          = 500   -- minimum ms between repeated HUD reads
+local RS_DIRECTION_NONE       = 0
+local RS_DIRECTION_UP         = 1
+local RS_DIRECTION_DOWN       = 2
+local RS_DIRECTION_RIGHT      = 3
+local RS_DIRECTION_LEFT       = 4
+
 -- ============================================================================
 -- State
 -- ============================================================================
@@ -95,6 +104,12 @@ local leftStickPressTime     = nil
 -- Track both sticks for explore mode combo guard (L3+R3).
 local leftStickDown          = false
 local rightStickDown         = false
+
+-- RS HUD reader state.
+local lastRSDirection        = RS_DIRECTION_NONE  -- last detected direction
+local lastRSReadTime         = 0                  -- debounce timestamp
+local rsAxisX                = 0                  -- current RS X axis value
+local rsAxisY                = 0                  -- current RS Y axis value
 
 -- Tick timing.
 local lastPositionCheckTime  = 0
@@ -897,6 +912,216 @@ local function OnTick()
 end
 
 -- ============================================================================
+-- RS HUD Reader
+-- ============================================================================
+
+--- Determine the dominant RS direction from axis values.
+--- Returns RS_DIRECTION_* constant.
+local function GetRSDirection()
+    local absX = math.abs(rsAxisX)
+    local absY = math.abs(rsAxisY)
+
+    -- Both below dead zone = no direction.
+    if absX < RS_DEAD_ZONE and absY < RS_DEAD_ZONE then
+        return RS_DIRECTION_NONE
+    end
+
+    -- Y axis dominates (up/down).  Y negative = stick pushed up (forward).
+    if absY >= absX then
+        if rsAxisY < 0 then return RS_DIRECTION_UP end
+        return RS_DIRECTION_DOWN
+    end
+
+    -- X axis dominates (left/right).
+    if rsAxisX > 0 then return RS_DIRECTION_RIGHT end
+    return RS_DIRECTION_LEFT
+end
+
+--- Format a number as integer if whole, one decimal otherwise.
+local function FormatAmount(value)
+    if value == math.floor(value) then
+        return tostring(math.floor(value))
+    end
+    return string.format("%.1f", value)
+end
+
+--- Read character info: name, race/class, HP.
+--- RS Up handler.
+local function SpeakCharacterInfo()
+    -- UI text from PartyLine_c widget.
+    local hudOk, hudInfo = pcall(Ext.UI.ReadHUDInfo)
+    local characterName = ""
+    local characterInfo = ""
+    if hudOk and hudInfo then
+        characterName = hudInfo.characterName or ""
+        characterInfo = hudInfo.characterInfo or ""
+    end
+
+    -- HP from entity API.
+    local hpText = ""
+    local playerEntity = GetPlayerEntity()
+    if playerEntity then
+        local hpOk, hpResult = pcall(function()
+            local health = playerEntity.Health
+            if health then
+                return tostring(health.Hp) .. " of " .. tostring(health.MaxHp) .. " HP"
+            end
+            return nil
+        end)
+        if hpOk and hpResult then
+            hpText = hpResult
+        end
+    end
+
+    -- Build speech string.
+    local parts = {}
+    if characterName ~= "" then parts[#parts + 1] = characterName end
+    if characterInfo ~= "" then parts[#parts + 1] = characterInfo end
+    if hpText ~= "" then parts[#parts + 1] = hpText end
+
+    if #parts > 0 then
+        Ext.Tolk.Speak(table.concat(parts, ". "), true)
+    else
+        Ext.Tolk.Speak("No character info available", true)
+    end
+end
+
+--- Read target info: what cursor is on + available action.
+--- RS Down handler.
+local function SpeakTargetInfo()
+    local hudOk, hudInfo = pcall(Ext.UI.ReadHUDInfo)
+    local targetName = ""
+    local actionText = ""
+    if hudOk and hudInfo then
+        targetName = hudInfo.targetName or ""
+        actionText = hudInfo.actionText or ""
+    end
+
+    local parts = {}
+    if targetName ~= "" then parts[#parts + 1] = targetName end
+    if actionText ~= "" then parts[#parts + 1] = actionText end
+
+    if #parts > 0 then
+        Ext.Tolk.Speak(table.concat(parts, ". "), true)
+    else
+        Ext.Tolk.Speak("No target", true)
+    end
+end
+
+--- Read action resources: action points, bonus action, spell slots.
+--- RS Right handler.
+local function SpeakActionResources()
+    local playerEntity = GetPlayerEntity()
+    if not playerEntity then
+        Ext.Tolk.Speak("No character found", true)
+        return
+    end
+
+    local parts = {}
+
+    -- Action resources from entity component.
+    local resourceOk, resourceResult = pcall(function()
+        local actionResources = playerEntity.ActionResources
+        if not actionResources or not actionResources.Resources then return end
+
+        for resourceUuid, resourceEntries in pairs(actionResources.Resources) do
+            for _, resourceEntry in pairs(resourceEntries) do
+                local resourceName = nil
+                -- Try to get a human-readable name from StaticData.
+                local nameOk, nameResult = pcall(function()
+                    local resourceDef = Ext.StaticData.Get(resourceUuid,
+                        "ActionResource")
+                    if resourceDef and resourceDef.Name then
+                        return resourceDef.Name
+                    end
+                    return nil
+                end)
+                if nameOk and nameResult then
+                    resourceName = nameResult
+                end
+
+                if resourceName then
+                    local amount = resourceEntry.Amount or 0
+                    local maxAmount = resourceEntry.MaxAmount or 0
+                    -- Only report resources with a max > 0 (filters noise).
+                    if maxAmount > 0 then
+                        parts[#parts + 1] = resourceName .. ": "
+                            .. FormatAmount(amount) .. " of "
+                            .. FormatAmount(maxAmount)
+                    end
+                end
+            end
+        end
+    end)
+
+    if #parts > 0 then
+        Ext.Tolk.Speak(table.concat(parts, ". "), true)
+    else
+        Ext.Tolk.Speak("No action resources available", true)
+    end
+end
+
+--- Handle an RS direction input.
+--- Called when a new direction is detected after debounce.
+--- Gameplay guard: no player entity = not in gameplay, stay silent.
+local function HandleRSDirection(direction)
+    if not GetPlayerEntity() then return end
+
+    if direction == RS_DIRECTION_UP then
+        SpeakCharacterInfo()
+    elseif direction == RS_DIRECTION_DOWN then
+        SpeakTargetInfo()
+    elseif direction == RS_DIRECTION_RIGHT then
+        SpeakActionResources()
+    elseif direction == RS_DIRECTION_LEFT then
+        -- Reserved for future use.
+        Ext.Tolk.Speak("Reserved", true)
+    end
+end
+
+--- Process RS axis input event.
+--- Called from the ControllerAxisInput subscription.
+local function OnRSAxisInput(event)
+    local axisName = tostring(event.Axis)
+    local value = event.Value or 0
+
+    -- Only handle right stick axes.
+    if axisName == "RightX" then
+        rsAxisX = value
+    elseif axisName == "RightY" then
+        rsAxisY = value
+    else
+        return  -- not RS, ignore
+    end
+
+    -- Prevent RS movement from reaching the game (camera rotation).
+    event:PreventAction()
+
+    -- Determine direction.
+    local direction = GetRSDirection()
+
+    -- Debounce: only fire when direction changes or enough time has passed.
+    local now = Ext.Utils.MonotonicTime()
+    if direction == RS_DIRECTION_NONE then
+        -- Stick returned to center -- reset so next deflection fires immediately.
+        lastRSDirection = RS_DIRECTION_NONE
+        return
+    end
+
+    -- Same direction still held: debounce.
+    if direction == lastRSDirection then
+        if (now - lastRSReadTime) < RS_DEBOUNCE_MS then
+            return  -- too soon, skip
+        end
+    end
+
+    -- New direction or debounce expired: fire.
+    lastRSDirection = direction
+    lastRSReadTime = now
+    HandleRSDirection(direction)
+end
+
+-- ============================================================================
 -- Controller Input
 -- ============================================================================
 
@@ -1067,6 +1292,10 @@ local function ResetState()
     leftStickPressTime = nil
     leftStickDown = false
     rightStickDown = false
+    lastRSDirection = RS_DIRECTION_NONE
+    lastRSReadTime = 0
+    rsAxisX = 0
+    rsAxisY = 0
     lastPositionCheckTime = 0
     Log.Debug("WorldNav: State reset")
 end
@@ -1101,6 +1330,13 @@ Ext.Events.ControllerButtonInput:Subscribe(function(event)
     local buttonOk, buttonErr = pcall(OnControllerButton, event)
     if not buttonOk then
         Log.Error("WorldNav button: " .. tostring(buttonErr))
+    end
+end)
+
+Ext.Events.ControllerAxisInput:Subscribe(function(event)
+    local axisOk, axisErr = pcall(OnRSAxisInput, event)
+    if not axisOk then
+        Log.Error("WorldNav RS axis: " .. tostring(axisErr))
     end
 end)
 
