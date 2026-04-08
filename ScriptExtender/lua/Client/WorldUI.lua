@@ -25,6 +25,7 @@
 local Log = BG3Access.Client.Log
 local Helpers  = BG3Access.Client.Helpers
 local Cutscene = BG3Access.Client.Cutscene
+local CharSheet = BG3Access.Client.CharSheet
 
 -- ============================================================================
 -- Constants
@@ -46,8 +47,14 @@ local DEFAULT_PANEL_HINT = false
 local tooltipSuppressed      = false  -- handlers set true to suppress speech
 local tooltipEnabled         = true   -- future settings toggle
 local lastTooltipSpeech      = nil    -- dedup: last spoken tooltip text
-local lastSpokenRadialTitle  = nil    -- title filter: prevent tooltip re-speaking title
+local lastSpokenRadialTitle  = nil    -- title filter: prevent tooltip re-speaking title (inspect pipeline)
 local lastRawTooltipTexts    = nil    -- full raw texts for inspect readback
+local lastRadialSpeechData   = nil    -- SpeechData from radial slot speech (for tooltip diff)
+
+-- Forward declarations: panel handler state needed by ProcessTooltip.
+-- These are set by HandlePanelWidgetAdded / RoutePanelSnapshot (defined later).
+local activePanelHandler     = nil
+local lastFocusedDCType      = nil
 
 --- SetTooltipSuppressed: called by handlers that speak their own
 --- descriptions (radial, future settings menu, etc.).
@@ -58,6 +65,152 @@ end
 --- SetTooltipEnabled: future settings toggle.
 local function SetTooltipEnabled(enabled)
     tooltipEnabled = enabled
+end
+
+-- ============================================================================
+-- Detail view state (RS Left virtual property list)
+-- ============================================================================
+
+local detailViewOpen                = false  -- true while navigating detail list
+local detailViewList                = nil    -- array of {label, value} entries
+local detailViewIndex               = 1     -- 1-based current position
+local detailViewButtonSubscription  = nil   -- ControllerButtonInput handle
+
+--- SpeakDetailItem: speak the current detail list entry.
+local function SpeakDetailItem()
+    if not detailViewList or not detailViewList[detailViewIndex] then return end
+    local entry = detailViewList[detailViewIndex]
+    local speech = entry.label .. ": " .. entry.value
+    Log.Info("DETAIL [" .. detailViewIndex .. "/" .. #detailViewList
+        .. "]: " .. speech)
+    Ext.Tolk.Speak(speech, true)
+end
+
+--- DetailViewNext: advance to next entry (wraps around).
+local function DetailViewNext()
+    if not detailViewList or #detailViewList == 0 then return end
+    detailViewIndex = (detailViewIndex % #detailViewList) + 1
+    SpeakDetailItem()
+end
+
+--- DetailViewPrevious: go to previous entry (wraps around).
+local function DetailViewPrevious()
+    if not detailViewList or #detailViewList == 0 then return end
+    detailViewIndex = ((detailViewIndex - 2) % #detailViewList) + 1
+    SpeakDetailItem()
+end
+
+--- CloseDetailView: tear down the detail view and unsubscribe input.
+--- @param silent boolean|nil  If true, skip the "closed" announcement.
+local function CloseDetailView(silent)
+    if not detailViewOpen then return end
+    if detailViewButtonSubscription then
+        Ext.Events.ControllerButtonInput:Unsubscribe(
+            detailViewButtonSubscription)
+        detailViewButtonSubscription = nil
+    end
+    detailViewOpen = false
+    detailViewList = nil
+    detailViewIndex = 1
+    if not silent then
+        Log.Info("DETAIL VIEW: closed")
+        Ext.Tolk.Speak("Detail view closed", true)
+    else
+        Log.Info("DETAIL VIEW: closed (silent)")
+    end
+end
+
+--- HandleDetailViewToggle: open or close the detail view.
+--- Called by WorldNav when RS Left is detected.
+--- Returns true if handled (caller should not fall through to "Reserved"),
+--- false if not handled (no panel active, caller speaks "Reserved").
+--- @return boolean
+local function HandleDetailViewToggle()
+    -- Toggle: if already open, close it.  Always handled.
+    if detailViewOpen then
+        CloseDetailView()
+        return true
+    end
+
+    -- Concrete panel-alive check: if nothing has UI focus, no panel is
+    -- open (user pressed B and returned to the world).  This is a fresh
+    -- C++ read, not cached state -- avoids stale activePanelHandler.
+    local focusCheckOk, focusedElement = pcall(Ext.UI.GetFocusedElement)
+    if not focusCheckOk or not focusedElement then
+        return false
+    end
+
+    -- Need an active panel handler with BuildDetailList.
+    if not activePanelHandler or not activePanelHandler.BuildDetailList then
+        return false  -- not handled: no panel, let caller say "Reserved"
+    end
+
+    -- Get the cached focused element data from the handler.
+    local focusedData = nil
+    if activePanelHandler.GetLastFocusedData then
+        focusedData = activePanelHandler.GetLastFocusedData()
+    end
+    if not focusedData then
+        return false
+    end
+
+    -- Build the detail list from the handler.  Pass cached tooltip
+    -- texts so consumable/spell items can include healing, damage,
+    -- roll, and action cost data from the tooltip pipeline.
+    local buildOk, builtList = pcall(
+        activePanelHandler.BuildDetailList, focusedData,
+        lastRawTooltipTexts)
+    if not buildOk then
+        Log.Error("BuildDetailList: " .. tostring(builtList))
+        return false
+    end
+    if not builtList or #builtList == 0 then
+        Ext.Tolk.Speak("No details available", true)
+        return true  -- handled: panel is active, just no details for this element
+    end
+
+    -- Open the detail view.
+    detailViewOpen = true
+    detailViewList = builtList
+    detailViewIndex = 1
+
+    -- Subscribe d-pad input for navigation.
+    -- Intercept all 4 d-pad directions: up/down navigate the list,
+    -- left/right are blocked to prevent accidental tab switches.
+    detailViewButtonSubscription =
+        Ext.Events.ControllerButtonInput:Subscribe(function(event)
+            if not event.Pressed then return end
+            local buttonName = tostring(event.Button)
+            if buttonName == "DPadDown" then
+                event:PreventAction()
+                DetailViewNext()
+            elseif buttonName == "DPadUp" then
+                event:PreventAction()
+                DetailViewPrevious()
+            elseif buttonName == "DPadLeft"
+                or buttonName == "DPadRight" then
+                -- Block left/right to prevent tab switches while
+                -- detail view is open.
+                event:PreventAction()
+            elseif buttonName == "LeftShoulder"
+                or buttonName == "RightShoulder" then
+                -- Block bumpers to prevent tab switches.
+                event:PreventAction()
+            elseif buttonName == "B" then
+                -- Do NOT prevent B: let it reach the game so it can
+                -- close the panel normally.  But auto-close the detail
+                -- view since the panel is going away.
+                CloseDetailView(true)
+            end
+        end)
+
+    -- Announce entry and speak first item.
+    local firstEntry = detailViewList[1]
+    local openSpeech = "Detail view. " .. firstEntry.label
+        .. ": " .. firstEntry.value
+    Log.Info("DETAIL VIEW: opened with " .. #detailViewList .. " items")
+    Ext.Tolk.Speak(openSpeech, true)
+    return true
 end
 
 -- ============================================================================
@@ -282,27 +435,47 @@ end
 --- SpeakRadialSlot: speak the slot title and API description.
 --- Combat stats (dice, range, cost) come from the C++ tooltip scanner
 --- which reads them from the popup TextBlocks -- no Lua API duplication.
+--- Builds SpeechData so ProcessTooltip can diff against it.
 --- @param slotData table  From GatherRadialSlotData.
 local function SpeakRadialSlot(slotData)
     local cleanTitle = Helpers.StripMarkupTags(slotData.title)
-    local speechParts = { cleanTitle }
 
-    -- Track title so the tooltip can filter it (avoid double-speaking).
-    -- Reset tooltip dedup so the new slot's tooltip always speaks.
+    -- Build SpeechData for tooltip diff.
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("title", cleanTitle, "brief")
+
+    -- Track title for inspect panel filtering (separate pipeline).
     lastSpokenRadialTitle = cleanTitle
     lastTooltipSpeech = nil
 
     -- API-sourced description (spell/passive flavor text not shown in tooltip).
     if slotData.description and slotData.description ~= "" then
         local cleanedDescription = Helpers.StripMarkupTags(slotData.description)
-        -- Strip trailing period to avoid double periods when joining.
         if cleanedDescription:sub(-1) == "." then
             cleanedDescription = cleanedDescription:sub(1, -2)
         end
-        speechParts[#speechParts + 1] = cleanedDescription
+        speechData:Add("description", cleanedDescription, "normal")
     end
 
-    local fullText = table.concat(speechParts, ". ")
+    -- HotBar item extras from tag props (gold value, stack count).
+    if slotData.tagProps and slotData.slotType == "HotBar" then
+        local goldValue = slotData.tagProps["Gold"]
+        if goldValue and goldValue ~= "" and goldValue ~= "0" then
+            speechData:Add("gold", goldValue .. " gold", "normal")
+        end
+        local stackCount = slotData.tagProps["Count"]
+        if stackCount and stackCount ~= "" and stackCount ~= "0"
+            and stackCount ~= "1" then
+            speechData:Add("count", "x" .. stackCount, "normal")
+        end
+    end
+
+    -- Store for tooltip diff (radial isn't a panel handler, so
+    -- ProcessTooltip checks this as fallback).
+    lastRadialSpeechData = speechData
+
+    local fullText = speechData:Format()
+    if not fullText then return end
 
     -- No Lua-side dedup for radial events.  C++ handles dedup via
     -- pointer address comparison and resets on center rest.
@@ -360,15 +533,14 @@ end
 -- ============================================================================
 
 --- ProcessTooltip: called by EventRouter with tooltip snapshot data.
---- Speaks immediately on each tooltip change.  Title filtering prevents
---- re-speaking what the handler already said.  The subset check prevents
---- re-speaking when a later wave has fewer texts than a previous one
---- (tooltip collapsing as TextBlocks disappear).
+--- Builds SpeechData from tooltip texts, diffs against handler's SpeechData
+--- to remove already-spoken content, then speaks the remainder.
+--- On revisit, the first tooltip wave may contain stale TextBlocks from a
+--- previous tooltip popup (Noesis binding timing).  Skip the first wave
+--- after a focus change to avoid speaking stale data.
 --- @param snapshot table  The full TickSnapshot from C++.
 local function ProcessTooltip(snapshot)
     -- Reset dedup when user navigates to a new element.
-    -- Note: radial slot changes reset lastTooltipSpeech in SpeakRadialSlot
-    -- instead, since snapshot.radialSlotChanged isn't on the Lua table.
     if snapshot.focusChanged or snapshot.selectionChanged then
         lastTooltipSpeech = nil
     end
@@ -382,9 +554,38 @@ local function ProcessTooltip(snapshot)
     -- Store the full raw texts for inspect readback (right stick).
     lastRawTooltipTexts = snapshot.tooltipTexts
 
-    local tooltipSpeech = Helpers.FormatTooltipTexts(
-        snapshot.tooltipTexts, lastSpokenRadialTitle)
-    if not tooltipSpeech or tooltipSpeech == lastTooltipSpeech then return end
+    -- Build tooltip SpeechData: per-handler or default formatter.
+    -- All formatters return SpeechData objects (or nil to suppress).
+    -- "" from customTooltipFn is a suppress sentinel.
+    local tooltipData = nil
+    if activePanelHandler and activePanelHandler.customTooltipFn then
+        tooltipData = activePanelHandler.customTooltipFn(
+            snapshot.tooltipTexts, lastFocusedDCType)
+    end
+    if tooltipData == "" then return end  -- explicit suppress
+    if not tooltipData then
+        tooltipData = Helpers.FormatTooltipTexts(snapshot.tooltipTexts)
+    end
+    if not tooltipData then return end
+
+    -- Diff against handler's SpeechData: remove fields already spoken.
+    -- Panel handlers store SpeechData via GetLastSpeechData; the radial
+    -- (not a panel handler) stores it in lastRadialSpeechData.
+    local handlerData = nil
+    if activePanelHandler and activePanelHandler.GetLastSpeechData then
+        handlerData = activePanelHandler.GetLastSpeechData()
+    end
+    if not handlerData then
+        handlerData = lastRadialSpeechData
+    end
+    if handlerData then
+        tooltipData = tooltipData:Diff(handlerData)
+    end
+
+    -- Format to string for speech and multi-wave dedup.
+    local tooltipSpeech = tooltipData:Format()
+    if not tooltipSpeech or tooltipSpeech == "" then return end
+    if tooltipSpeech == lastTooltipSpeech then return end
 
     -- Skip if the new text is a subset of what was already spoken
     -- (tooltip collapsing between waves as TextBlocks disappear).
@@ -393,55 +594,89 @@ local function ProcessTooltip(snapshot)
         return
     end
 
+    -- Superset: new wave contains everything already spoken plus more.
+    -- Interrupt the old (incomplete) speech and replace with the fuller
+    -- version so the user doesn't hear partial info repeated.
+    local shouldInterrupt = lastTooltipSpeech ~= nil
+        and tooltipSpeech:find(lastTooltipSpeech, 1, true)
+    -- Equipment slots: handler already spoke the item name.  Tooltip
+    -- appends damage details without cutting off the handler's speech.
+    if CharSheet.ShouldAppendEquipmentTooltip() then
+        shouldInterrupt = false
+    end
+
     lastTooltipSpeech = tooltipSpeech
     Log.Info("TOOLTIP: " .. tooltipSpeech)
-    Ext.Tolk.Speak(tooltipSpeech, false)
+    Ext.Tolk.Speak(tooltipSpeech, shouldInterrupt)
 end
 
 --- HandleInspectNav: called by EventRouter when d-pad moves focus between
 --- side panels in the PinnedTooltips_c inspect widget.  Reads the focused
---- panel's TextBlocks via C++ BFS and speaks title + description.
+--- panel's TextBlocks via C++ BFS and speaks using SpeechData.
+---
+--- C++ BFS order does NOT match visual order -- description paragraphs
+--- may come before headings.  Classify by content, not position:
+---   Title: shortest qualifying string (heading words like "Action",
+---          "Attack Roll", "Advantage" are always short).
+---   Subtitle: second-shortest short string (e.g., "Dexterity").
+---   Stats: modifier patterns (+5, 2 metres, Once per turn).
+---   Description: long strings with periods (explanation paragraphs).
 local function HandleInspectNav()
     local readOk, panelTexts = pcall(Ext.UI.ReadFocusedTextBlocks)
     if not readOk or not panelTexts or #panelTexts == 0 then return end
 
-    -- Partition into titles (short, no periods) and details (longer/sentences).
-    -- Titles come first so the panel name is spoken before its description.
-    local titles = {}
-    local details = {}
+    -- First pass: clean and classify all texts.
+    local shortTexts = {}   -- {text, length} for title/subtitle candidates
+    local statTexts = {}    -- modifier/distance strings
+    local longTexts = {}    -- description paragraphs
+
     for _, text in ipairs(panelTexts) do
         if text and text ~= "" and text ~= ":" and text ~= "." then
             local cleaned = Helpers.StripMarkupTags(text)
             if cleaned and cleaned ~= ""
                 and cleaned ~= ":" and cleaned ~= "." then
-                -- Strip trailing colon or period.
-                if cleaned:sub(-1) == "."
-                    or cleaned:sub(-1) == ":" then
-                    cleaned = cleaned:sub(1, -2)
-                end
-                -- Bare numbers are stat values (DC 13, etc.).
-                -- Parenthesized text is modifiers like "(Tav)".
-                -- Modifier notation like "+5 (Tav)" is a stat value.
-                -- These are all details, not titles.
-                if cleaned:match("^[%d%.]+$")
-                    or cleaned:match("^%(.*%)$")
-                    or cleaned:match("^[%+%-]%d+") then
-                    table.insert(details, cleaned)
-                elseif #cleaned <= 25 and not cleaned:find("%.") then
-                    table.insert(titles, cleaned)
+                cleaned = cleaned:gsub("[%.:%s]+$", "")
+                if cleaned == "" then goto nextInspectItem end
+
+                if cleaned:match("^[%+%-]%d+")
+                    or cleaned:match("^%d+%s*m") then
+                    statTexts[#statTexts + 1] = cleaned
+                elseif #cleaned <= 30 and not cleaned:find("%.")
+                    and not cleaned:match("^%d+$")
+                    and not cleaned:match("^%(.*%)$") then
+                    shortTexts[#shortTexts + 1] = {
+                        text = cleaned, length = #cleaned
+                    }
                 else
-                    table.insert(details, cleaned)
+                    longTexts[#longTexts + 1] = cleaned
                 end
             end
         end
+        ::nextInspectItem::
     end
 
-    local parts = {}
-    for _, title in ipairs(titles) do table.insert(parts, title) end
-    for _, detail in ipairs(details) do table.insert(parts, detail) end
+    -- Keep BFS encounter order for short texts (first encountered
+    -- = most likely the heading).  Do NOT sort by length -- "Dexterity"
+    -- is shorter than "Attack Roll" but "Attack Roll" is the title.
 
-    if #parts > 0 then
-        local speech = table.concat(parts, ". ")
+    -- Build SpeechData: title, subtitle, stats, description.
+    local speechData = Helpers.CreateSpeechData()
+
+    if #shortTexts >= 1 then
+        speechData:Add("title", shortTexts[1].text, "brief")
+    end
+    for shortIndex = 2, #shortTexts do
+        speechData:Add("subtitle", shortTexts[shortIndex].text, "normal")
+    end
+    for _, statText in ipairs(statTexts) do
+        speechData:Add("stat", statText, "brief")
+    end
+    for _, descText in ipairs(longTexts) do
+        speechData:Add("description", descText, "verbose")
+    end
+
+    local speech = speechData:Format()
+    if speech then
         Log.Info("INSPECT NAV: " .. speech)
         Ext.Tolk.Speak(speech, true)
     end
@@ -488,6 +723,7 @@ local function ResetTooltipState()
     tooltipSuppressed = false
     lastSpokenRadialTitle = nil
     lastRawTooltipTexts = nil
+    lastRadialSpeechData = nil
 end
 
 -- ============================================================================
@@ -504,15 +740,28 @@ end
 ---   onWidgetAdded (function)    -- optional: called on widgetAdded with (widgetData, handlerState)
 ---   onReset (function)          -- optional: called on full state reset
 ---   hintFn (function)           -- optional: dynamic hint based on (screenTitle, handlerState)
+---   customItemFn (function)     -- optional: custom item extraction per handler.
+---                                  Called with (focusedElement, handlerState, snapshot)
+---                                  BEFORE the generic FormatDCTextSplit pipeline.
+---                                  Returns (name, value, desc) to override, or nil
+---                                  to fall through.  Can also return a SpeechData
+---                                  object for full control over speech ordering.
+---   customTooltipFn (function)  -- optional: per-handler tooltip formatting.
+---                                  Called with (tooltipTexts, focusedDCType).
+---                                  Returns formatted speech string, or nil to
+---                                  use default FormatTooltipTexts behavior.
 ---
 --- @return table  Handler with HandleSnapshot, HandleWidgetAdded,
----                ResetState, ResetNavigation, ResetHint
+---                ResetState, ResetNavigation, ResetHint, customTooltipFn,
+---                GetLastFocusedData, BuildDetailList (if config provides it)
 local function CreatePanelHandler(config)
     local handlerState = {
         lastSpokenName       = nil,
         lastSpokenFullText   = nil,
         lastSpokenTab        = nil,
         lastSpokenTitle      = nil,
+        lastSpeechData       = nil,   -- SpeechData from last handler speech (for tooltip diff)
+        lastFocusedData      = nil,   -- last focusedElement data table (for detail view)
         tabHintSpoken        = false,
         screenEntryJustSpoke = false,
         -- Optional: set by onWidgetAdded hooks for overrides.
@@ -597,6 +846,39 @@ local function CreatePanelHandler(config)
         end
 
         if isValueOnly then
+            -- customItemFn handles value changes for special elements
+            -- (expander toggle, equipment equip/unequip, etc.).
+            if config.customItemFn then
+                local customName = config.customItemFn(
+                    focusedElement, handlerState, snapshot)
+                -- SpeechData object: compute delta against previous
+                -- SpeechData and speak only what changed.
+                if type(customName) == "table" and customName.fields then
+                    local delta = customName:Delta(
+                        handlerState.lastSpeechData)
+                    local formatted = delta:Format()
+                    if formatted and formatted ~= "" then
+                        handlerState.lastSpeechData = customName
+                        handlerState.lastSpokenFullText = customName:Format()
+                        Log.Info("VALUE [" .. config.name .. "]: "
+                            .. formatted)
+                        Ext.Tolk.Speak(formatted, true)
+                    end
+                    return
+                end
+                -- Non-empty string: speak as value change.
+                if customName and customName ~= "" then
+                    if customName ~= handlerState.lastSpokenFullText then
+                        handlerState.lastSpokenFullText = customName
+                        Log.Info("VALUE [" .. config.name .. "]: "
+                            .. customName)
+                        Ext.Tolk.Speak(customName, true)
+                    end
+                    return
+                end
+                -- nil: fall through to generic value path.
+                -- "": suppressed, but still try generic value.
+            end
             local valueText = Helpers.FormatDCValue(focusedElement.dcProps)
             if valueText and valueText ~= ""
                 and valueText ~= handlerState.lastSpokenFullText then
@@ -608,9 +890,9 @@ local function CreatePanelHandler(config)
         end
 
         -- =============================================================
-        -- Screen entry or item navigation: fill slots, speak.
+        -- Screen entry or item navigation: build SpeechData, speak.
         -- =============================================================
-        local slots = {}
+        local speechData = Helpers.CreateSpeechData()
         local tabName = nil
         local normalTab = ""
         local screenTitle = nil
@@ -618,7 +900,8 @@ local function CreatePanelHandler(config)
         if isScreenEntry then
             -- Derive tab name.
             if focusedElement.isTab then
-                tabName = focusedElement.tabName
+                tabName = Helpers.GetTranslatedStringIfHandle(
+                    focusedElement.tabName)
             end
             normalTab = tabName and Helpers.NormalizeForCompare(tabName) or ""
 
@@ -658,13 +941,14 @@ local function CreatePanelHandler(config)
             local widgetTitle, widgetBody, widgetActions =
                 Helpers.ExtractFromWidgetData(snapshot.widgetData)
 
-            -- Title.
-            screenTitle = nsTitle or widgetTitle
-            -- Synthetic title from onWidgetAdded (e.g., "Item" / "Spell"
-            -- for SelectionFlyOut where the real title is inaccessible).
-            if not screenTitle and handlerState.titleOverride then
+            -- Title.  Handler titleOverride takes priority (e.g., Container
+            -- handler sets the container name, which is more specific than
+            -- a generic tab name like "Inventory" from namedTexts).
+            if handlerState.titleOverride then
                 screenTitle = handlerState.titleOverride
                 handlerState.titleOverride = nil
+            else
+                screenTitle = nsTitle or widgetTitle
             end
             if screenTitle and normalTab ~= ""
                 and Helpers.NormalizeForCompare(screenTitle) == normalTab then
@@ -676,41 +960,39 @@ local function CreatePanelHandler(config)
             end
             if screenTitle then
                 handlerState.lastSpokenTitle = screenTitle
-                slots["title"] = screenTitle
+                speechData:Add("title", screenTitle, "brief")
             end
 
             -- Hint (once per panel visit).
-            -- Skip when customSpeakFn is configured -- the custom
-            -- function manages its own hint timing and placement.
-            if not config.customSpeakFn
-                and not handlerState.tabHintSpoken then
+            if not handlerState.tabHintSpoken then
                 handlerState.tabHintSpoken = true
                 local panelHint
-                -- hintFn(screenTitle, handlerState) allows dynamic hints.
                 if config.hintFn then
                     panelHint = config.hintFn(screenTitle, handlerState)
                 else
-                    -- nil means use default hint, false means no hint.
                     panelHint = config.hint
                     if panelHint == nil then
                         panelHint = DEFAULT_PANEL_HINT
                     end
                 end
                 if panelHint then
-                    slots["hint"] = panelHint
+                    speechData:Add("hint", panelHint, "normal")
                 end
             end
 
-            -- Tab name (suppress if title contains it).
+            -- Tab name (suppress if title contains it or unresolved handle).
             if tabName then
                 local showTabName = true
-                if screenTitle
+                if tabName:match("^h%x+g") then
+                    showTabName = false
+                end
+                if showTabName and screenTitle
                     and Helpers.NormalizeForCompare(screenTitle):find(
                         normalTab, 1, true) then
                     showTabName = false
                 end
                 if showTabName then
-                    slots["tabName"] = tabName
+                    speechData:Add("tabName", tabName, "brief")
                 end
             end
 
@@ -733,11 +1015,10 @@ local function CreatePanelHandler(config)
                     and (bodyAssembled .. ". " .. statusText) or statusText
             end
             if bodyAssembled then
-                slots["body"] = bodyAssembled
+                speechData:Add("body", bodyAssembled, "normal")
             end
-            -- Dialog button actions (e.g., "A: Yes, B: No").
             if widgetActions then
-                slots["actions"] = widgetActions
+                speechData:Add("actions", widgetActions, "normal")
             end
         else
             -- Item navigation: dedup check.
@@ -754,21 +1035,72 @@ local function CreatePanelHandler(config)
             end
         end
 
-        -- ----- Item slots -----
+        -- ----- Item fields -----
         local itemName = nil
         local itemInfo = nil
         local itemValue = nil
         local itemDesc = nil
 
-        local splitName, splitValue, splitDesc, splitValueDesc =
-            Helpers.FormatDCTextSplit(focusedElement.dcProps,
-                focusedElement.dcType)
-        if not splitName or splitName == "" then
+        -- customItemFn: handler-specific extraction before generic pipeline.
+        -- Return nil to fall through to generic extraction.
+        -- Return "" to suppress (no speech, no fallback).
+        -- Return a non-empty string to override the item name.
+        -- Return a SpeechData object for full control over speech.
+        local splitName, splitValue, splitDesc, splitValueDesc
+        local customHandled = false
+        local customSpeechData = nil
+        if config.customItemFn then
+            splitName, splitValue, splitDesc = config.customItemFn(
+                focusedElement, handlerState, snapshot)
+            -- Check if customItemFn returned a SpeechData object.
+            if type(splitName) == "table" and splitName.fields then
+                customSpeechData = splitName
+                customHandled = true
+            elseif splitName ~= nil then
+                customHandled = true
+            end
+        end
+
+        -- If customItemFn returned a full SpeechData, use it directly.
+        if customSpeechData then
+            -- Cache focused element data for detail view (RS Left).
+            handlerState.lastFocusedData = focusedElement
+            -- Merge screen entry fields (title/hint/tab) into the custom
+            -- SpeechData if this is a screen entry.
+            if isScreenEntry then
+                local merged = Helpers.CreateSpeechData()
+                -- Copy screen entry fields first.
+                for _, field in ipairs(speechData.fields) do
+                    merged:Add(field.name, field.value, field.tier)
+                end
+                -- Then custom handler fields.
+                for _, field in ipairs(customSpeechData.fields) do
+                    merged:Add(field.name, field.value, field.tier)
+                end
+                handlerState.lastSpeechData = merged
+                merged:Speak(handlerState, isScreenEntry)
+            else
+                handlerState.lastSpeechData = customSpeechData
+                customSpeechData:Speak(handlerState, isScreenEntry)
+            end
+            return
+        end
+
+        if not customHandled then
+            splitName, splitValue, splitDesc, splitValueDesc =
+                Helpers.FormatDCTextSplit(focusedElement.dcProps,
+                    focusedElement.dcType)
+        end
+        if not customHandled and (not splitName or splitName == "") then
             splitName = Helpers.ExtractTextFromData(
                 focusedElement, handlerState.lastSpokenTab, isScreenEntry)
             splitValue = nil
             splitDesc = nil
             splitValueDesc = nil
+        end
+        -- Filter unresolved LocaString handles from item names.
+        if splitName and splitName:match("^h%x+g") then
+            splitName = nil
         end
         if splitName and splitName ~= "" then
             local normalItem = Helpers.NormalizeForCompare(splitName)
@@ -782,10 +1114,6 @@ local function CreatePanelHandler(config)
             if not isDuplicate then
                 itemName = splitName
                 itemValue = splitValue
-                -- When a value has its own description (combobox options),
-                -- put the setting description before the value (itemInfo)
-                -- and the value description after it (itemDesc).
-                -- Order: name -> setting desc -> value -> value desc
                 if splitValueDesc then
                     itemInfo = splitDesc
                     itemDesc = splitValueDesc
@@ -800,16 +1128,8 @@ local function CreatePanelHandler(config)
         end
 
         if itemName then
-            slots["itemName"] = itemName
             handlerState.lastSpokenName = elemId
-            -- Only pre-set lastSpokenFullText for the default speech
-            -- path.  customSpeakFn manages its own dedup and updates
-            -- lastSpokenFullText after building the full speech string.
-            -- Pre-setting it here would defeat customSpeakFn's dedup
-            -- check (speech == lastSpokenFullText is always true).
-            if not config.customSpeakFn then
-                handlerState.lastSpokenFullText = itemName
-            end
+            handlerState.lastSpokenFullText = itemName
             Log.Info("ITEM [" .. config.name .. "]: "
                 .. tostring(focusedElement.elemType)
                 .. "  name=" .. itemName
@@ -818,19 +1138,16 @@ local function CreatePanelHandler(config)
                     and ("  desc=" .. tostring(itemDesc):sub(1, 40))
                     or ""))
         end
-        if itemInfo then slots["itemInfo"] = itemInfo end
-        if itemValue then slots["itemValue"] = itemValue end
-        if itemDesc then slots["itemDesc"] = itemDesc end
 
-        -- customSpeakFn lets a handler control speech ordering entirely.
-        -- It receives (slots, handlerState, isScreenEntry) and is
-        -- responsible for calling Ext.Tolk.Speak and updating
-        -- handlerState.lastSpokenFullText / screenEntryJustSpoke.
-        if config.customSpeakFn then
-            config.customSpeakFn(slots, handlerState, isScreenEntry)
-        else
-            Helpers.SpeakSlots(slots, handlerState, isScreenEntry)
-        end
+        speechData:Add("itemName", itemName, "brief")
+        speechData:Add("itemInfo", itemInfo, "normal")
+        speechData:Add("itemValue", itemValue, "brief")
+        speechData:Add("itemDesc", itemDesc, "verbose")
+
+        -- Cache focused element data for detail view (RS Left).
+        handlerState.lastFocusedData = focusedElement
+        handlerState.lastSpeechData = speechData
+        speechData:Speak(handlerState, isScreenEntry)
     end
 
     -- -----------------------------------------------------------------
@@ -852,6 +1169,8 @@ local function CreatePanelHandler(config)
         handlerState.lastSpokenFullText = nil
         handlerState.lastSpokenTab = nil
         handlerState.lastSpokenTitle = nil
+        handlerState.lastSpeechData = nil
+        handlerState.lastFocusedData = nil
         handlerState.tabHintSpoken = false
         handlerState.screenEntryJustSpoke = false
         handlerState.titleOverride = nil
@@ -868,6 +1187,7 @@ local function CreatePanelHandler(config)
         handlerState.lastSpokenTab = nil
         handlerState.lastSpokenTitle = nil
         handlerState.lastSpokenName = nil
+        handlerState.lastSpeechData = nil
         handlerState.screenEntryJustSpoke = false
         handlerState.titleOverride = nil
         handlerState.bodyOverride = nil
@@ -886,6 +1206,14 @@ local function CreatePanelHandler(config)
         ResetState        = ResetState,
         ResetNavigation   = ResetNavigation,
         ResetHint         = ResetHint,
+        customTooltipFn   = config.customTooltipFn,
+        GetLastSpeechData = function()
+            return handlerState.lastSpeechData
+        end,
+        GetLastFocusedData = function()
+            return handlerState.lastFocusedData
+        end,
+        BuildDetailList   = config.buildDetailList,
     }
 end
 
@@ -893,12 +1221,9 @@ end
 -- Panel handler instances
 -- ============================================================================
 
--- Character sheet / inventory / equipment (tabbed: Inventory, Character
--- Sheet, Spells, Features).
-local CharacterPanelHandler = CreatePanelHandler({
-    name = "CharacterPanel",
-    hint = "Use bumpers to switch tabs. Up and down to navigate items.",
-})
+-- Character sheet / inventory / equipment (from CharSheet.lua).
+local CharacterPanelHandler = CharSheet.CreateCharacterPanelHandler(
+    CreatePanelHandler)
 
 -- Trading / bartering dual inventory.
 local TradeHandler = CreatePanelHandler({
@@ -911,6 +1236,36 @@ local TradeHandler = CreatePanelHandler({
 local ExamineHandler = CreatePanelHandler({
     name = "Examine",
     hint = false,
+})
+
+-- Container inventory (opening a bag/pouch from the inventory).
+-- onWidgetAdded captures the container name from namedTexts and sets
+-- titleOverride so screen entry speaks "Alchemy Pouch" instead of
+-- a generic tab name like "Inventory".
+-- customItemFn suppresses item speech on screen entry: the container
+-- name IS the announcement; the focused item's description is redundant.
+local ContainerHandler = CreatePanelHandler({
+    name = "Container",
+    hint = "Up and down to browse items. Y to take all. B to close.",
+    onWidgetAdded = function(widgetData, handlerState)
+        if widgetData and widgetData.namedTexts then
+            local containerName = widgetData.namedTexts.containerName
+            if containerName and containerName ~= ""
+                and not containerName:match("^h%x+g")
+                and not containerName:find("%[ForceUpdate%]") then
+                handlerState.titleOverride = containerName
+            end
+        end
+    end,
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        -- On screen entry (selectionChanged), suppress the focused item
+        -- speech.  The container name title is the only announcement.
+        if snapshot.selectionChanged then
+            return "", nil, nil
+        end
+        -- Normal item navigation: fall through to generic pipeline.
+        return nil
+    end,
 })
 
 -- Dice roll UI for skill checks and saving throws.
@@ -984,7 +1339,8 @@ local TadpoleHandler = CreatePanelHandler({
 -- C++ post-processor extracts ObjectCollectionList[0].Title as
 -- "CollectionTitle" (e.g. "Search Results").  PanelContentType
 -- distinguishes "Item" from "Spell" for context-appropriate hints.
--- Uses customSpeakFn for speech order: title, item name, then hints.
+-- Uses customItemFn returning SpeechData for custom speech order:
+-- title, item name, value, desc, then context-appropriate hints.
 -- Speech on entry: "Search Results. Brine Bulb. A to attack. X for actions. B to close."
 -- Speech on nav:   "Brine Bulb."
 local SelectionFlyOutHandler = CreatePanelHandler({
@@ -992,8 +1348,6 @@ local SelectionFlyOutHandler = CreatePanelHandler({
     hint = false,
     onWidgetAdded = function(widgetData, handlerState)
         if widgetData.dcProps then
-            -- CollectionTitle from C++ post-processor (DCSelectionFlyOut).
-            -- Title from direct DC property (DCActiveSearch).
             handlerState.collectionTitle =
                 widgetData.dcProps.CollectionTitle
                 or widgetData.dcProps.Title
@@ -1005,50 +1359,51 @@ local SelectionFlyOutHandler = CreatePanelHandler({
         handlerState.collectionTitle = nil
         handlerState.panelContentType = nil
     end,
-    customSpeakFn = function(slots, handlerState, isScreenEntry)
-        local parts = {}
-        if isScreenEntry then
-            -- Title from C++ collection extraction (e.g. "Search Results").
-            local title = handlerState.collectionTitle
-            if title then
-                table.insert(parts, title)
-            end
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        -- Build SpeechData with custom ordering: title, item, value,
+        -- desc, then hint (hint AFTER item name, not before).
+        local speechData = Helpers.CreateSpeechData()
+
+        -- Title (screen entry only -- collection title from C++).
+        local isScreenEntry = snapshot.selectionChanged
+            or (snapshot.widgetAdded and snapshot.widgetData
+                and not handlerState.lastSpokenTab)
+            or (snapshot.focusChanged and focusedElement.isTab)
+        if isScreenEntry and handlerState.collectionTitle then
+            speechData:Add("title", handlerState.collectionTitle, "brief")
         end
-        -- Item name.
-        if slots.itemName then
-            table.insert(parts, slots.itemName)
+
+        -- Item name from generic extraction.
+        local itemName, itemValue, itemDesc =
+            Helpers.FormatDCTextSplit(focusedElement.dcProps,
+                focusedElement.dcType)
+        if not itemName or itemName == "" then
+            itemName = Helpers.ExtractTextFromData(
+                focusedElement, handlerState.lastSpokenTab, isScreenEntry)
         end
-        -- Value and description after name.
-        if slots.itemValue then
-            table.insert(parts, slots.itemValue)
+        if itemName and itemName ~= "" then
+            speechData:Add("itemName", itemName, "brief")
         end
-        if slots.itemDesc then
-            table.insert(parts, slots.itemDesc)
+        if itemValue and itemValue ~= "" then
+            speechData:Add("itemValue", itemValue, "brief")
         end
-        -- Hint on first visit only, AFTER the item name.
+        if itemDesc and itemDesc ~= "" then
+            speechData:Add("itemDesc", itemDesc, "verbose")
+        end
+
+        -- Hint AFTER item name (first visit only).
         if isScreenEntry and not handlerState.tabHintSpoken then
             handlerState.tabHintSpoken = true
+            local hintText
             if handlerState.panelContentType == "Spell" then
-                table.insert(parts, "A to cast. X for actions. B to close")
+                hintText = "A to cast. X for actions. B to close"
             else
-                table.insert(parts,
-                    "A to attack. X for actions. B to close")
+                hintText = "A to attack. X for actions. B to close"
             end
+            speechData:Add("hint", hintText, "normal")
         end
-        if #parts == 0 then return end
-        local speech = Helpers.StripMarkupTags(table.concat(parts, ". "))
-        if not speech or speech == "" then return end
-        if speech == handlerState.lastSpokenFullText
-            and not isScreenEntry then
-            return
-        end
-        Log.Info("FLYOUT [" .. (isScreenEntry and "entry" or "nav")
-            .. "]: " .. speech)
-        Ext.Tolk.Speak(speech, true)
-        handlerState.lastSpokenFullText = speech
-        if isScreenEntry then
-            handlerState.screenEntryJustSpoke = true
-        end
+
+        return speechData
     end,
 })
 
@@ -1130,6 +1485,9 @@ local DC_TYPE_HANDLERS = {
     -- Trading
     ["gui::DCTrade"]              = TradeHandler,
     ["ls.DCTrade"]                = TradeHandler,
+    -- Container inventory (bags, pouches)
+    ["gui::DCContainerInventory"] = ContainerHandler,
+    ["ls.DCContainerInventory"]   = ContainerHandler,
     -- Examine / inspect
     ["gui::DCExamine"]            = ExamineHandler,
     ["ls.DCExamine"]              = ExamineHandler,
@@ -1195,6 +1553,7 @@ local DC_TYPE_HANDLERS = {
 local ALL_PANEL_HANDLERS = {
     CharacterPanelHandler,
     TradeHandler,
+    ContainerHandler,
     ExamineHandler,
     ActiveRollHandler,
     ReactionHandler,
@@ -1224,8 +1583,15 @@ local ALL_PANEL_HANDLERS = {
 -- Panel routing (active handler tracking)
 -- ============================================================================
 
--- Currently active panel handler (set by widget events).
-local activePanelHandler = nil
+-- activePanelHandler and lastFocusedDCType are forward-declared near
+-- the top of this file (before ProcessTooltip) so that ProcessTooltip's
+-- closure captures the same locals that the routing functions set.
+
+-- Previous handler: saved when an overlay panel (Container, etc.)
+-- takes over from the base panel (CharacterPanel, Trade, etc.).
+-- Restored when the overlay disappears (widget set shrinks).
+local previousPanelHandler = nil
+
 
 --- IsWorldDCType: returns true if the given DC type belongs to an
 --- in-game panel handled by WorldUI.
@@ -1236,8 +1602,10 @@ local function IsWorldDCType(dcType)
     return DC_TYPE_HANDLERS[dcType] ~= nil
 end
 
+
 --- HandlePanelWidgetAdded: called by EventRouter when a WorldUI panel
 --- widget appears.  Updates the active handler and calls its hook.
+--- Saves the previous handler so overlays can restore it on close.
 --- @param widgetData table  The widget data from the snapshot.
 local function HandlePanelWidgetAdded(widgetData)
     if not widgetData or not widgetData.dcType then return end
@@ -1246,9 +1614,15 @@ local function HandlePanelWidgetAdded(widgetData)
     if not newHandler then return end
 
     if newHandler ~= activePanelHandler then
-        -- Deactivating old handler: full reset so it's clean on return.
+        -- Close detail view when active handler changes (overlay took over).
+        CloseDetailView(true)
         if activePanelHandler then
-            activePanelHandler.ResetState()
+            -- Save for restoration when overlay closes.
+            -- Do NOT reset the previous handler -- its state (tabHintSpoken,
+            -- lastSpokenTab, etc.) must be preserved intact so the hint
+            -- doesn't re-speak when the overlay closes and the handler is
+            -- restored.
+            previousPanelHandler = activePanelHandler
         end
         activePanelHandler = newHandler
         Log.Info("Active panel: " .. activePanelHandler.name
@@ -1271,9 +1645,6 @@ end
 --- @param snapshot table  The full TickSnapshot from C++.
 local function RoutePanelSnapshot(snapshot)
     if not activePanelHandler then
-        -- Defensive: routeToWorld is true but no panel handler was set
-        -- (widget-added tick had no focusedElement, or handler lookup
-        -- failed).  Fall back to Menus so the snapshot isn't dropped.
         Log.Warn("RoutePanelSnapshot: no active panel handler, "
             .. "falling back to Menus")
         local Menus = BG3Access.Client.Menus
@@ -1282,16 +1653,50 @@ local function RoutePanelSnapshot(snapshot)
         end
         return
     end
+
+    -- Overlay close detection: when a previous handler is saved
+    -- (overlay like Container took over from CharacterPanel) and the
+    -- widget set changes (selectionChanged on post-settle after overlay
+    -- widget removed), restore the previous handler.
+    if previousPanelHandler
+        and (snapshot.selectionChanged or snapshot.widgetAdded) then
+        -- Check if the overlay's widget DC is still being reported.
+        -- If widgetData has the overlay's DC type, the overlay is still
+        -- present.  If not (or no widgetData), the overlay closed.
+        local overlayStillPresent = false
+        if snapshot.widgetData and snapshot.widgetData.dcType then
+            local widgetHandler = DC_TYPE_HANDLERS[
+                snapshot.widgetData.dcType]
+            if widgetHandler == activePanelHandler then
+                overlayStillPresent = true
+            end
+        end
+        if not overlayStillPresent then
+            Log.Info("Overlay closed, restoring: "
+                .. previousPanelHandler.name)
+            activePanelHandler.ResetState()
+            activePanelHandler = previousPanelHandler
+            previousPanelHandler = nil
+        end
+    end
+
+    -- Track focused element dcType for customTooltipFn context.
+    if snapshot.focusedElement and snapshot.focusedElement.dcType then
+        lastFocusedDCType = snapshot.focusedElement.dcType
+    end
     activePanelHandler.HandleSnapshot(snapshot)
 end
 
 --- ResetAllPanelHandlers: called on GameStateChanged or when switching
 --- away from WorldUI panels.  Resets all handler state.
 local function ResetAllPanelHandlers()
+    -- Close detail view silently (no "closed" announcement during teardown).
+    CloseDetailView(true)
     for handlerIndex = 1, #ALL_PANEL_HANDLERS do
         ALL_PANEL_HANDLERS[handlerIndex].ResetState()
     end
     activePanelHandler = nil
+    previousPanelHandler = nil
 end
 
 --- GetActivePanelHandler: returns the currently active panel handler.
@@ -1310,8 +1715,11 @@ local function ResetState()
     -- Radial state.
     radialHintSpoken = false
     inRadial = false
+    -- Tooltip state.
+    ResetTooltipState()
     -- Panel state.
     ResetAllPanelHandlers()
+    lastFocusedDCType = nil
 end
 
 -- ============================================================================
@@ -1336,6 +1744,11 @@ BG3Access.Client.WorldUI = {
     HandleInspectNav           = HandleInspectNav,
     SetTooltipSuppressed       = SetTooltipSuppressed,
     SetTooltipEnabled          = SetTooltipEnabled,
+    -- Detail view (RS Left virtual property list)
+    HandleDetailViewToggle     = HandleDetailViewToggle,
+    CloseDetailView            = CloseDetailView,
     -- State management
     ResetState                 = ResetState,
+    -- Diagnostics (SE console: BG3Access.Client.WorldUI.DumpEquipmentStructure())
+    DumpEquipmentStructure     = CharSheet.DumpEquipmentStructure,
 }

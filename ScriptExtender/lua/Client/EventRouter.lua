@@ -48,6 +48,13 @@ local worldDialogOverlayJustSpoke = false
 -- visual text from HUD widgets (Overlay "Examine/Context Menu/Actions",
 -- etc.).  The RS HUD reader replaces this -- user reads when ready.
 local suppressWorldEntryVisualText = false
+-- True when the most recent snapshot had a focused UI element.
+-- This is the authoritative "UI is active" signal from the C++
+-- tick monitor.  In free world, the monitor reports focused=nil.
+-- In any menu/panel, a focused element exists.  GetFocusedElement
+-- on its own is unreliable because BG3's HUD has "selected" elements
+-- (party member, hotbar slot) that the focus strategies pick up.
+local snapshotHasUIFocus = false
 
 -- ---------------------------------------------------------------------------
 -- HandleTickSnapshot: thin router.
@@ -151,17 +158,56 @@ local function HandleTickSnapshot(snapshot)
                     routeToWorld = true
                     Log.Info("Routing to WorldUI panels")
                 end
-            else
+            elseif Menus.IsMenuDCType(newDCType) then
+                -- Only switch back to Menus for explicitly handled menu
+                -- DC types.  Generic types (ls.Widget, ls.DCPartyLine,
+                -- etc.) fire alongside panel widgets during initial scans
+                -- and must NOT reset WorldUI routing.
                 Menus.HandleWidgetAdded(snapshot.widgetData)
-                -- Switch routing to Menus if coming from WorldUI.
                 if routeToWorld then
                     if World then World.ResetAllPanelHandlers() end
                     routeToWorld = false
                     Log.Info("Routing to Menus")
                 end
+            else
+                -- Generic/unknown DC type: let both sides see the event
+                -- but don't change routing.
+                if routeToWorld then
+                    if World then
+                        World.HandlePanelWidgetAdded(snapshot.widgetData)
+                    end
+                else
+                    Menus.HandleWidgetAdded(snapshot.widgetData)
+                end
             end
         end
     end
+
+    -- =================================================================
+    -- Tooltip events: process BEFORE focusedElement guard.
+    -- Tooltip-only snapshots (no focus/selection change) have no
+    -- focusedElement and would be dropped by the guard below.
+    -- =================================================================
+    if not suppressSnapshots then
+        -- Process tooltip on tooltip changes, AND on focus/selection
+        -- changes (to reset dedup state so re-visiting an element
+        -- speaks its tooltip again).
+        if snapshot.tooltipChanged
+            or snapshot.focusChanged
+            or snapshot.selectionChanged then
+            local World = BG3Access.Client.WorldUI
+            if World then
+                World.ProcessTooltip(snapshot)
+            end
+        end
+    end
+
+    -- Update UI focus flag: true whenever the snapshot carries a
+    -- focused element.  This is how IsUIActive knows whether the
+    -- player is in the world (no focus) or in some UI (focused).
+    snapshotHasUIFocus = (focusedElement ~= nil
+        and focusedElement.elemType ~= nil
+        and focusedElement.elemType ~= "")
 
     -- =================================================================
     -- focusedElement guard: everything below needs a valid focus target.
@@ -349,6 +395,45 @@ local function HandleTickSnapshot(snapshot)
     -- =================================================================
     -- Dispatch to the active handler module.
     -- =================================================================
+
+    -- Late world panel detection: when the widget callback's widgetData
+    -- carried a generic DC type (ls.Widget) but a panel widget was also
+    -- present, the widget processing block above missed it.  Check the
+    -- snapshot's widgetDCTypes array (ALL DC types from this tick) and
+    -- the focused element's dcType for a WorldUI panel match.
+    if not routeToWorld
+        and (snapshot.focusChanged or snapshot.selectionChanged) then
+        local World = BG3Access.Client.WorldUI
+        if World then
+            local panelDCType = nil
+            -- Check focused element dcType first (direct match).
+            if focusedElement.dcType
+                and World.IsWorldDCType(focusedElement.dcType) then
+                panelDCType = focusedElement.dcType
+            end
+            -- Check all widget DC types from this tick.
+            if not panelDCType and snapshot.widgetDCTypes then
+                for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
+                    if World.IsWorldDCType(widgetDCType) then
+                        panelDCType = widgetDCType
+                        break
+                    end
+                end
+            end
+            if panelDCType then
+                local syntheticWidgetData = {
+                    dcType = panelDCType,
+                    elemName = focusedElement.widgetRootId,
+                }
+                World.HandlePanelWidgetAdded(syntheticWidgetData)
+                Menus.ResetAllHandlers()
+                routeToWorld = true
+                Log.Info("Routing to WorldUI (late detection: "
+                    .. panelDCType .. ")")
+            end
+        end
+    end
+
     if routeToWorld then
         -- Dialog overlay just spoke on this tick -- suppress the panel
         -- handler so it doesn't immediately interrupt the dialog speech.
@@ -364,14 +449,8 @@ local function HandleTickSnapshot(snapshot)
         Menus.RouteSnapshot(snapshot)
     end
 
-    -- =================================================================
-    -- Tooltip events: routed to WorldUI tooltip handler.
-    -- Speaks AFTER handler speech so tooltip supplements the item name.
-    -- =================================================================
-    local World = BG3Access.Client.WorldUI
-    if World then
-        World.ProcessTooltip(snapshot)
-    end
+    -- Tooltip events are processed BEFORE the focusedElement guard
+    -- (above) so tooltip-only snapshots aren't dropped.
 end
 
 -- ---------------------------------------------------------------------------
@@ -491,6 +570,10 @@ local resetOk, resetEntities = pcall(
     Ext.Entity.GetAllEntitiesWithComponent, "ClientControl")
 if resetOk and resetEntities and next(resetEntities) then
     suppressSnapshots = false
+    -- Also set routeToWorld since we're clearly in gameplay.  Without
+    -- this, IsUIActive returns true in free world because the default
+    -- routeToWorld=false is interpreted as "pre-game menus".
+    routeToWorld = true
     Log.Info("Mid-session reload detected, suppression cleared")
 end
 
@@ -498,10 +581,25 @@ end
 -- Exports
 -- ---------------------------------------------------------------------------
 BG3Access.Client.EventRouter = {
-    --- IsUIActive: returns true when focus is on any UI panel (radial,
-    --- inspect, menus, etc.) rather than free-world navigation.
-    --- Used by WorldNav to suppress GPS when UI consumes the right stick.
-    IsUIActive = function() return not routeToWorld or inspectWidgetActive end,
+    --- IsUIActive: returns true when any UI is active (pre-game menu,
+    --- WorldUI panel, dialog, inspect, etc.) and false only during
+    --- free-world navigation.
+    ---
+    --- Uses the tick monitor's authoritative focus state (cached in
+    --- snapshotHasUIFocus on every snapshot).  In free world the
+    --- monitor reports focused=nil; in any menu/panel a focused
+    --- element exists.  This avoids Ext.UI.GetFocusedElement() which
+    --- returns non-nil even in free world because BG3's HUD has
+    --- "selected" elements (party member, hotbar slot) that the
+    --- focus strategies pick up.
+    IsUIActive = function()
+        -- Pre-game menus: no gameplay running, always UI active.
+        if not routeToWorld then return true end
+        -- Inspect panel (PinnedTooltips_c) consumes RS input.
+        if inspectWidgetActive then return true end
+        -- Gameplay: check the cached focus state from the tick monitor.
+        return snapshotHasUIFocus
+    end,
 }
 
 Log.Info("Accessibility ready (GlobalFocusMonitor).")

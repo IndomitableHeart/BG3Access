@@ -63,9 +63,15 @@ local DEGREES_PER_CLOCK_HOUR  = 30
 -- Entity category names (order matches D-pad left/right cycling).
 local CATEGORY_NAMES          = {"Items", "NPCs", "Doors"}
 
--- RS HUD reader: dead zone and debounce.
-local RS_DEAD_ZONE            = 0.5   -- axis threshold for direction detection
-local RS_DEBOUNCE_MS          = 500   -- minimum ms between repeated HUD reads
+-- RS HUD reader: hysteresis thresholds.
+-- Deflect threshold: stick must exceed this to trigger a new direction.
+-- Release threshold: stick must drop below this before another trigger.
+-- Two separate thresholds prevent rapid wobble around a single cutoff
+-- from registering as multiple deflections.
+local RS_DEAD_ZONE            = 0.5   -- deflect threshold (legacy name)
+local RS_DEFLECT_THRESHOLD    = 0.4   -- must exceed to register direction
+local RS_RELEASE_THRESHOLD    = 0.15  -- must drop below to allow next
+local RS_PREVENT_THRESHOLD    = 0.1   -- below this, skip PreventAction
 local RS_DIRECTION_NONE       = 0
 local RS_DIRECTION_UP         = 1
 local RS_DIRECTION_DOWN       = 2
@@ -107,7 +113,6 @@ local rightStickDown         = false
 
 -- RS HUD reader state.
 local lastRSDirection        = RS_DIRECTION_NONE  -- last detected direction
-local lastRSReadTime         = 0                  -- debounce timestamp
 local rsAxisX                = 0                  -- current RS X axis value
 local rsAxisY                = 0                  -- current RS Y axis value
 
@@ -1067,15 +1072,34 @@ end
 local function HandleRSDirection(direction)
     if not GetPlayerEntity() then return end
 
+    -- RS Left: detail view toggle.  Delegate to WorldUI which checks
+    -- whether a panel with BuildDetailList is active.  Keep this BEFORE
+    -- the UI gate because the detail view is explicitly for menus.
+    if direction == RS_DIRECTION_LEFT then
+        local World = BG3Access.Client.WorldUI
+        if World and World.HandleDetailViewToggle then
+            local handled = World.HandleDetailViewToggle()
+            if handled then return end
+        end
+        -- World nav: reserved for future use.
+        Ext.Tolk.Speak("Reserved", true)
+        return
+    end
+
+    -- RS Up/Down/Right: HUD reader.  Only fires in free-world nav --
+    -- suppress when any UI is active (menu, panel, inspect, dialog).
+    local EventRouter = BG3Access.Client.EventRouter
+    if EventRouter and EventRouter.IsUIActive
+        and EventRouter.IsUIActive() then
+        return
+    end
+
     if direction == RS_DIRECTION_UP then
         SpeakCharacterInfo()
     elseif direction == RS_DIRECTION_DOWN then
         SpeakTargetInfo()
     elseif direction == RS_DIRECTION_RIGHT then
         SpeakActionResources()
-    elseif direction == RS_DIRECTION_LEFT then
-        -- Reserved for future use.
-        Ext.Tolk.Speak("Reserved", true)
     end
 end
 
@@ -1094,31 +1118,36 @@ local function OnRSAxisInput(event)
         return  -- not RS, ignore
     end
 
-    -- Prevent RS movement from reaching the game (camera rotation).
-    -- pcall: some contexts don't support PreventAction on axis events.
-    pcall(event.PreventAction, event)
+    -- Hysteresis: use two thresholds.  Once deflected, stick must drop
+    -- below the release threshold before another action can fire.
+    local absX = math.abs(rsAxisX)
+    local absY = math.abs(rsAxisY)
+    local maxDeflection = absX > absY and absX or absY
 
-    -- Determine direction.
-    local direction = GetRSDirection()
+    -- Only prevent RS camera movement when the stick is actually
+    -- deflected beyond the deadzone.  Calling PreventAction on every
+    -- near-zero axis event adds measurable latency to the event loop.
+    if maxDeflection >= RS_PREVENT_THRESHOLD then
+        pcall(event.PreventAction, event)
+    end
 
-    -- Debounce: only fire when direction changes or enough time has passed.
-    local now = Ext.Utils.MonotonicTime()
-    if direction == RS_DIRECTION_NONE then
-        -- Stick returned to center -- reset so next deflection fires immediately.
-        lastRSDirection = RS_DIRECTION_NONE
+    if lastRSDirection ~= RS_DIRECTION_NONE then
+        -- Already deflected: only check for release.
+        if maxDeflection < RS_RELEASE_THRESHOLD then
+            lastRSDirection = RS_DIRECTION_NONE
+        end
         return
     end
 
-    -- Same direction still held: debounce.
-    if direction == lastRSDirection then
-        if (now - lastRSReadTime) < RS_DEBOUNCE_MS then
-            return  -- too soon, skip
-        end
+    -- Not yet deflected: check for fresh trigger above deflect threshold.
+    if maxDeflection < RS_DEFLECT_THRESHOLD then
+        return
     end
 
-    -- New direction or debounce expired: fire.
+    -- Fresh deflection: determine direction and fire once.
+    local direction = GetRSDirection()
+    if direction == RS_DIRECTION_NONE then return end
     lastRSDirection = direction
-    lastRSReadTime = now
     HandleRSDirection(direction)
 end
 
@@ -1195,12 +1224,19 @@ local function OnControllerButton(event)
         return
     end
 
-    -- ----- Left Stick: only handle when GPS is on -----
-    -- GPS off = don't touch the event at all.
+    -- ----- Left Stick: only handle when GPS is on and no UI -----
+    -- GPS off = don't touch the event at all.  UI active = GPS features
+    -- disabled so LS press doesn't trigger target clear or entity list.
     if buttonName == "LeftStick" and not gpsEnabled then
         return
     end
     if buttonName == "LeftStick" and gpsEnabled then
+        local EventRouter = BG3Access.Client.EventRouter
+        local uiHasFocus = EventRouter and EventRouter.IsUIActive
+            and EventRouter.IsUIActive()
+        if uiHasFocus then
+            return
+        end
         if event.Pressed then
             -- Prevent press so the game doesn't start its own LS action.
             -- Release is always passed through to keep game state clean.
@@ -1303,7 +1339,6 @@ local function ResetState()
     leftStickDown = false
     rightStickDown = false
     lastRSDirection = RS_DIRECTION_NONE
-    lastRSReadTime = 0
     rsAxisX = 0
     rsAxisY = 0
     lastPositionCheckTime = 0
