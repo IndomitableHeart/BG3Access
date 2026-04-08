@@ -8,6 +8,9 @@
 
 local Log = BG3Access.Client.Log
 
+-- Forward declarations for functions referenced before definition.
+local ResolveDescriptionParams
+
 -- ---------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------
@@ -228,13 +231,6 @@ end
 -- ---------------------------------------------------------------------------
 -- FormatDCTextSplit: returns (name, value, description) as separate strings.
 -- ---------------------------------------------------------------------------
--- Stat labels for DC types whose label comes from the XAML template
--- parent (Tag property), not from the DataContext itself.
-local STAT_DC_TYPE_LABELS = {
-    ["ls.VMRangeStat"] = "Hit Points",
-    ["ls.VMStat"]      = "Initiative",
-}
-
 local function FormatDCTextSplit(dcProps, dcType)
     if not dcProps then return nil, nil, nil end
 
@@ -242,10 +238,16 @@ local function FormatDCTextSplit(dcProps, dcType)
     local value = dcProps.Value
     local desc = dcProps.Description
 
-    -- Stat types whose label is in the parent template, not the DC.
-    -- Use the hardcoded label and treat Value as the value slot.
-    if not text and dcType and STAT_DC_TYPE_LABELS[dcType] then
-        text = STAT_DC_TYPE_LABELS[dcType]
+    -- DC sub-objects: Text, Value, Description may be tables (LocaString,
+    -- ViewModel sub-objects) instead of strings.  Extract the string content.
+    if type(text) == "table" then
+        text = text.Str or text.Text or text.Title or text.Name or nil
+    end
+    if type(value) == "table" then
+        value = value.Str or value.Text or value.Name or nil
+    end
+    if type(desc) == "table" then
+        desc = desc.Str or desc.Text or desc.Description or nil
     end
 
     if not text and dcProps.Title then
@@ -389,11 +391,11 @@ local function FormatDCTextSplit(dcProps, dcType)
     end
 
     local descParts = {}
-    if desc and desc ~= "" then
+    if type(desc) == "string" and desc ~= "" then
         descParts[#descParts + 1] = desc
     end
     local textProperty = dcProps.TextProperty
-    if textProperty and textProperty ~= "" and textProperty ~= text then
+    if type(textProperty) == "string" and textProperty ~= "" and textProperty ~= text then
         descParts[#descParts + 1] = textProperty
     end
     -- Host indicator for character assignment player slots.
@@ -495,7 +497,8 @@ local function ExtractTextFromData(data, lastSpokenTab, tabFlushPending)
     if data.namedTexts then
         for elementName, elementText in pairs(data.namedTexts) do
             local nameLower = elementName:lower()
-            if (nameLower:find("title") or nameLower:find("header"))
+            if (nameLower:find("title") or nameLower:find("header")
+                or nameLower == "tabname")
                 and elementText and elementText ~= "" then
                 return elementText
             end
@@ -626,7 +629,7 @@ end
 --- @param stat table|nil  The stat object (for stat.DescriptionParams).
 --- @param paramsString string|nil  Direct params string override.
 --- @return string|nil  Text with params substituted.
-local function ResolveDescriptionParams(text, stat, paramsString)
+ResolveDescriptionParams = function(text, stat, paramsString)
     if not text then return nil end
     if not text:find("%[%d+%]") then return text end
 
@@ -700,57 +703,449 @@ local function ReadStatDescription(stat)
 end
 
 -- ---------------------------------------------------------------------------
+-- Description lookup caches (shared by CC, WorldUI, and any future modules).
+-- All caches build lazily on first access from game APIs.
+-- ---------------------------------------------------------------------------
+
+--- ResolveTranslatedString: resolve a TranslatedString from a cached
+--- prototype's DescriptionInfo.  Handles string, userdata, and table formats.
+--- @param translatedString any  String, userdata, or table with Handle.
+--- @return string|nil  Resolved text, or nil.
+local function ResolveTranslatedString(translatedString)
+    if not translatedString then return nil end
+    local stringType = type(translatedString)
+    if stringType == "string" and translatedString ~= "" then
+        local resolved = GetTranslatedStringIfHandle(translatedString)
+        if resolved and not resolved:match("^h%x") then return resolved end
+        return nil
+    elseif stringType == "userdata" then
+        local handleSuccess, handle = pcall(function()
+            return translatedString.Handle.Handle
+        end)
+        if handleSuccess and handle then
+            local handleStr = tostring(handle)
+            if handleStr and handleStr ~= "" then
+                local resolved = GetTranslatedStringIfHandle(handleStr)
+                if resolved and not resolved:match("^h%x") then
+                    return resolved
+                end
+            end
+        end
+        local valueSuccess, value = pcall(function()
+            return translatedString.Value
+        end)
+        if valueSuccess and type(value) == "string"
+            and value ~= "" and not value:match("^h%x") then
+            return value
+        end
+        return nil
+    elseif stringType == "table" then
+        if translatedString.Handle
+            and translatedString.Handle.Handle then
+            local resolved = GetTranslatedStringIfHandle(
+                translatedString.Handle.Handle)
+            if resolved and not resolved:match("^h%x") then
+                return resolved
+            end
+        end
+        for _, key in ipairs({"Value", "Name", "Str"}) do
+            if type(translatedString[key]) == "string"
+                and translatedString[key] ~= "" then
+                return translatedString[key]
+            end
+        end
+    end
+    return nil
+end
+
+-- Spell description cache: display name -> resolved description.
+local spellDescriptionCache = {}
+local spellCacheBuilt = false
+
+local function BuildSpellDisplayNameCache()
+    if spellCacheBuilt then return end
+    spellCacheBuilt = true
+    local success, allSpellIds = pcall(Ext.Stats.GetStats, "SpellData")
+    if not success or not allSpellIds then return end
+    for _, statId in ipairs(allSpellIds) do
+        pcall(function()
+            local cached = Ext.Stats.GetCachedSpell(statId)
+            if not cached or not cached.Description then return end
+            local displayName = ResolveTranslatedString(
+                cached.Description.DisplayName)
+            if not displayName then return end
+            local normalizedName = displayName:lower()
+            if spellDescriptionCache[normalizedName] then return end
+            local description = ResolveTranslatedString(
+                cached.Description.Description)
+            if not description then return end
+            local descParams = cached.Description.DescriptionParams
+            if descParams and descParams ~= "" then
+                description = ResolveDescriptionParams(
+                    description, nil, descParams)
+            end
+            spellDescriptionCache[normalizedName] = description
+        end)
+    end
+end
+
+--- LookupSpellDescription: resolve a spell's description by display name.
+--- @param spellName string  The spell's display name.
+--- @return string|nil  Resolved description, or nil.
+local function LookupSpellDescription(spellName)
+    if not spellName or spellName == "" then return nil end
+    BuildSpellDisplayNameCache()
+    return spellDescriptionCache[spellName:lower()]
+end
+
+-- Passive description cache: display name -> resolved description.
+local passiveDescriptionCache = {}
+local passiveCacheBuilt = false
+
+local function BuildPassiveDisplayNameCache()
+    if passiveCacheBuilt then return end
+    passiveCacheBuilt = true
+    local success, allPassiveIds = pcall(Ext.Stats.GetStats, "PassiveData")
+    if not success or not allPassiveIds then return end
+    for _, statId in ipairs(allPassiveIds) do
+        pcall(function()
+            local cached = Ext.Stats.GetCachedPassive(statId)
+            if not cached or not cached.Description then return end
+            local displayName = ResolveTranslatedString(
+                cached.Description.DisplayName)
+            if not displayName then return end
+            local normalizedName = displayName:lower()
+            if passiveDescriptionCache[normalizedName] then return end
+            local description = ResolveTranslatedString(
+                cached.Description.Description)
+            if not description then return end
+            local descParams = cached.Description.DescriptionParams
+            if descParams and descParams ~= "" then
+                description = ResolveDescriptionParams(
+                    description, nil, descParams)
+            end
+            passiveDescriptionCache[normalizedName] = description
+        end)
+    end
+end
+
+-- Progression description cache: display name -> description.
+local progressionDescriptionCache = {}
+local progressionCacheBuilt = false
+
+local function BuildProgressionDescriptionCache()
+    if progressionCacheBuilt then return end
+    progressionCacheBuilt = true
+    local guidsSuccess, guids = pcall(
+        Ext.StaticData.GetAll, "ProgressionDescription")
+    if not guidsSuccess or not guids then return end
+    for _, guid in ipairs(guids) do
+        pcall(function()
+            local entry = Ext.StaticData.Get(guid, "ProgressionDescription")
+            if not entry then return end
+            if entry.Hidden then return end
+            local displayName = ResolveTranslatedString(entry.DisplayName)
+            if not displayName then return end
+            local description = ResolveTranslatedString(entry.Description)
+            if not description then return end
+            description = StripMarkupTags(description)
+            local normalizedName = displayName:lower()
+            if not progressionDescriptionCache[normalizedName] then
+                progressionDescriptionCache[normalizedName] = description
+            end
+        end)
+    end
+end
+
+-- StaticData description cache: keyed by type, then display name.
+local staticDataDescriptionCaches = {}
+local staticDataCacheBuilt = {}
+
+local function BuildStaticDataDescriptionCache(staticDataType)
+    if staticDataCacheBuilt[staticDataType] then return end
+    staticDataCacheBuilt[staticDataType] = true
+    staticDataDescriptionCaches[staticDataType] = {}
+    local cache = staticDataDescriptionCaches[staticDataType]
+    local guidsSuccess, guids = pcall(
+        Ext.StaticData.GetAll, staticDataType)
+    if not guidsSuccess or not guids then return end
+    for _, guid in ipairs(guids) do
+        pcall(function()
+            local entry = Ext.StaticData.Get(guid, staticDataType)
+            if not entry then return end
+            local displayName = ResolveTranslatedString(entry.DisplayName)
+            if not displayName then return end
+            local description = ResolveTranslatedString(entry.Description)
+            if not description then return end
+            description = StripMarkupTags(description)
+            local normalizedName = displayName:lower()
+            if not cache[normalizedName] then
+                cache[normalizedName] = description
+            end
+        end)
+    end
+end
+
+--- LookupStaticDataDescription: look up description by display name
+--- from a StaticData type cache (Race, ClassDescription, Background, etc.).
+--- @param staticDataType string  The StaticData type name.
+--- @param displayName string  The entry's display name.
+--- @return string|nil  Description text, or nil.
+local function LookupStaticDataDescription(staticDataType, displayName)
+    if not staticDataType or not displayName or displayName == "" then
+        return nil
+    end
+    BuildStaticDataDescriptionCache(staticDataType)
+    local cache = staticDataDescriptionCaches[staticDataType]
+    if not cache then return nil end
+    return cache[displayName:lower()]
+end
+
+--- LookupFeatureDescription: cascading lookup for passive features.
+--- Searches passive cache (with fuzzy matching for proficiency variants),
+--- then spell cache, then progression descriptions.
+--- @param featureName string  The feature's display name.
+--- @return string|nil  Resolved description, or nil.
+local function LookupFeatureDescription(featureName)
+    if not featureName or featureName == "" then return nil end
+    BuildPassiveDisplayNameCache()
+    local normalizedLookup = featureName:lower()
+    local cached = passiveDescriptionCache[normalizedLookup]
+    if cached then return cached end
+
+    -- Fuzzy match: summary panel uses short names ("Rapiers") while
+    -- the passive cache has "Rapier Proficiency".  Try variations.
+    local singular = featureName:gsub("s$", "")
+    local withoutProf = featureName:gsub(" Proficiency$", "")
+    local variations = {
+        featureName .. " Proficiency",
+        singular .. " Proficiency",
+        singular,
+        withoutProf,
+    }
+    for _, variant in ipairs(variations) do
+        local variantDesc = passiveDescriptionCache[variant:lower()]
+        if variantDesc then return variantDesc end
+    end
+
+    -- Spell lookup for spell-type features (Rage, Produce Flame).
+    local spellDesc = LookupSpellDescription(featureName)
+    if spellDesc then return spellDesc end
+
+    -- Progression descriptions: category proficiencies, saving throws.
+    BuildProgressionDescriptionCache()
+    local progressionDesc = progressionDescriptionCache[normalizedLookup]
+    if progressionDesc then return progressionDesc end
+
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
 -- Speech slot assembly (shared by all menu handlers and CC).
 -- ---------------------------------------------------------------------------
 
 -- Slot names in the order they should be spoken.
-local SLOT_ORDER = { "title", "hint", "tabName", "body", "actions", "itemName", "itemInfo", "itemValue", "itemDesc" }
-
 -- Standard DCMessageBox button hint.  Noesis Indie SDK crashes when
 -- enumerating the Actions IList collection from C++, so we handle
 -- button hints in Lua based on the dialog DC type.
 local DIALOG_BUTTON_HINT = "Press A to confirm, or B to cancel"
 
---- SpeakSlots: assemble slots in order, apply interrupt logic, speak.
---- @param slots table  Keyed by slot name (title, hint, tabName, etc.).
---- @param handlerState table  Handler's isolated state table.  Must have
----     screenEntryJustSpoke (bool) and lastSpokenFullText (string|nil).
---- @param isScreenEntry boolean  Whether this is a screen entry event.
-local function SpeakSlots(slots, handlerState, isScreenEntry)
-    local parts = {}
-    for _, slotName in ipairs(SLOT_ORDER) do
-        local slotValue = slots[slotName]
-        if slotValue and slotValue ~= "" then
-            table.insert(parts, (slotValue:gsub("[%.%s]+$", "")))
-        end
-    end
-    if #parts == 0 then return end
-    local assembled = StripMarkupTags(table.concat(parts, ". "))
-    if not assembled or assembled == "" then return end
+-- Verbosity tier ranks.  Lower = more essential.
+-- "brief" fields are always spoken.  "normal" adds context.
+-- "verbose" adds descriptions and secondary details.
+local TIER_RANK = {brief = 1, normal = 2, verbose = 3}
 
-    local interrupt = true
-    if handlerState.screenEntryJustSpoke and not isScreenEntry then
-        interrupt = false
-        handlerState.screenEntryJustSpoke = false
-    end
-    -- Visual text (loading tips, splash screen) should always append.
-    -- These arrive from the initial widget scan with no title, tab, hint,
-    -- or item -- just body text.  Appending lets tips queue naturally
-    -- instead of cutting each other off.
-    local isVisualTextOnly = slots["body"] and not slots["title"]
-        and not slots["tabName"] and not slots["hint"]
-        and not slots["itemName"]
-    if isVisualTextOnly then
-        interrupt = false
-    end
-    if isScreenEntry then
-        handlerState.screenEntryJustSpoke = true
-    end
+--- CreateSpeechData: creates an ordered speech data builder.
+--- Each field has a name (for debugging/identification), a value (the
+--- text to speak), and a verbosity tier (brief/normal/verbose).
+--- Fields are spoken in the order they are added.
+---
+--- Usage:
+---   local speech = Helpers.CreateSpeechData()
+---   speech:Add("itemName", "Shortsword", "brief")
+---   speech:Add("damage", "4 to 9 Piercing damage", "brief")
+---   speech:Add("description", "A common sword...", "verbose")
+---   speech:Speak(handlerState, isScreenEntry)
+---
+--- @return table  Speech data object with :Add(), :Format(), :Speak().
+local function CreateSpeechData()
+    return {
+        fields = {},
 
-    local Log = BG3Access.Client.Log
-    Log.Info("SPEAK" .. (interrupt and "" or " (append)") .. ": " .. assembled)
-    Ext.Tolk.Speak(assembled, interrupt)
-    handlerState.lastSpokenFullText = assembled
+        --- Add a labeled field with verbosity tier.
+        --- @param self table  The SpeechData object.
+        --- @param fieldName string  Field name (for identification).
+        --- @param fieldValue string|nil  Text to speak.  Nil/empty skipped.
+        --- @param tier string|nil  "brief", "normal", or "verbose" (default "normal").
+        Add = function(self, fieldName, fieldValue, tier)
+            if fieldValue and fieldValue ~= "" then
+                self.fields[#self.fields + 1] = {
+                    name = fieldName,
+                    value = fieldValue,
+                    tier = tier or "normal",
+                }
+            end
+        end,
+
+        --- HasField: check if a named field has been added.
+        --- @param self table  The SpeechData object.
+        --- @param fieldName string  The field name to check.
+        --- @return boolean
+        HasField = function(self, fieldName)
+            for _, field in ipairs(self.fields) do
+                if field.name == fieldName then return true end
+            end
+            return false
+        end,
+
+        --- Delta: return a new SpeechData with only the fields that are
+        --- new, changed, or removed compared to `previous`.  Used by the
+        --- isValueOnly path to speak only what changed (e.g., "Equipped"
+        --- -> "Unequipped") instead of repeating the full item speech.
+        --- A field present in previous but absent in self is added as
+        --- the negation (e.g., equipped was "Equipped", now absent ->
+        --- "Unequipped").
+        --- @param self table  The new SpeechData.
+        --- @param previous table|nil  The previous SpeechData to compare.
+        --- @return table  New SpeechData with only changed/new fields.
+        Delta = function(self, previous)
+            if not previous or not previous.fields or #previous.fields == 0 then
+                return self
+            end
+            local result = CreateSpeechData()
+
+            -- Build lookup of previous field values by name.
+            local prevByName = {}
+            for _, field in ipairs(previous.fields) do
+                prevByName[field.name] = field.value
+            end
+
+            -- Build lookup of current field values by name.
+            local currByName = {}
+            for _, field in ipairs(self.fields) do
+                currByName[field.name] = field.value
+            end
+
+            -- Fields in self that are new or changed.
+            for _, field in ipairs(self.fields) do
+                local prevValue = prevByName[field.name]
+                if not prevValue then
+                    -- New field.
+                    result:Add(field.name, field.value, field.tier)
+                elseif NormalizeForCompare(field.value)
+                    ~= NormalizeForCompare(prevValue) then
+                    -- Changed value.
+                    result:Add(field.name, field.value, field.tier)
+                end
+            end
+
+            -- Fields removed from previous: "equipped" was present, now
+            -- absent means "Unequipped".
+            if prevByName["equipped"] and not currByName["equipped"] then
+                result:Add("equipped", "Unequipped", "brief")
+            end
+
+            return result
+        end,
+
+        --- Diff: return a new SpeechData with only the fields whose values
+        --- are NOT already present in `other`.  Matching is by normalized
+        --- value (case-insensitive, whitespace/punctuation stripped).
+        --- Substring matching requires >5 chars to prevent false positives
+        --- from short strings like "AC" or "14".
+        --- @param self table  The tooltip SpeechData.
+        --- @param other table|nil  The handler's SpeechData to diff against.
+        --- @return table  New SpeechData with unmatched fields only.
+        Diff = function(self, other)
+            if not other or not other.fields or #other.fields == 0 then
+                return self
+            end
+            local result = CreateSpeechData()
+            for _, field in ipairs(self.fields) do
+                local fieldNorm = NormalizeForCompare(field.value)
+                local matched = false
+                for _, otherField in ipairs(other.fields) do
+                    local otherNorm = NormalizeForCompare(otherField.value)
+                    if fieldNorm == otherNorm then
+                        matched = true
+                        break
+                    end
+                    if #fieldNorm > 5 and #otherNorm > 5 then
+                        if otherNorm:find(fieldNorm, 1, true)
+                            or fieldNorm:find(otherNorm, 1, true) then
+                            matched = true
+                            break
+                        end
+                    end
+                end
+                if not matched then
+                    result:Add(field.name, field.value, field.tier)
+                end
+            end
+            return result
+        end,
+
+        --- Format: assemble fields into a speech string, filtered by
+        --- verbosity.  Fields with tier rank <= verbosity rank are included.
+        --- @param self table  The SpeechData object.
+        --- @param verbosity string|nil  "brief", "normal", or "verbose".
+        ---     Default "verbose" (all fields spoken).
+        --- @return string|nil  Assembled speech, or nil if empty.
+        Format = function(self, verbosity)
+            verbosity = verbosity or "verbose"
+            local maxRank = TIER_RANK[verbosity] or 3
+            local parts = {}
+            for _, field in ipairs(self.fields) do
+                local fieldRank = TIER_RANK[field.tier] or 2
+                if fieldRank <= maxRank then
+                    -- Strip trailing punctuation/whitespace before joining.
+                    local cleaned = field.value:gsub("[%.%s]+$", "")
+                    if cleaned ~= "" then
+                        parts[#parts + 1] = cleaned
+                    end
+                end
+            end
+            if #parts == 0 then return nil end
+            return StripMarkupTags(table.concat(parts, ". "))
+        end,
+
+        --- Speak: format and speak the assembled text with interrupt logic.
+        --- Handles: screen entry append vs interrupt, visual-text-only
+        --- append, dedup via lastSpokenFullText, and Tolk output.
+        --- @param self table  The SpeechData object.
+        --- @param handlerState table  Handler's isolated state.
+        --- @param isScreenEntry boolean  Whether this is a screen entry.
+        --- @param verbosity string|nil  Verbosity level (default "verbose").
+        Speak = function(self, handlerState, isScreenEntry, verbosity)
+            local assembled = self:Format(verbosity)
+            if not assembled or assembled == "" then return end
+
+            local interrupt = true
+            if handlerState.screenEntryJustSpoke
+                and not isScreenEntry then
+                interrupt = false
+                handlerState.screenEntryJustSpoke = false
+            end
+            -- Visual text (loading tips): body-only, no title/tab/hint/item.
+            -- Always append so tips queue naturally.
+            if self:HasField("body") and not self:HasField("title")
+                and not self:HasField("tabName")
+                and not self:HasField("hint")
+                and not self:HasField("itemName") then
+                interrupt = false
+            end
+            if isScreenEntry then
+                handlerState.screenEntryJustSpoke = true
+            end
+
+            local Log = BG3Access.Client.Log
+            Log.Info("SPEAK"
+                .. (interrupt and "" or " (append)")
+                .. ": " .. assembled)
+            Ext.Tolk.Speak(assembled, interrupt)
+            handlerState.lastSpokenFullText = assembled
+        end,
+    }
 end
 
 --- ExtractFromNamedTexts: extract title and body parts from named text entries.
@@ -761,8 +1156,15 @@ local function ExtractFromNamedTexts(namedTexts)
     local titleText = nil
     local bodyParts = {}
     for elementName, elementText in pairs(namedTexts) do
+        -- Skip unresolved LocaString handles and ForceUpdate placeholders.
+        if elementText:match("^h%x+g")
+            or elementText:find("%[ForceUpdate%]")
+            or elementText:find("s_HandleUnknown") then
+            goto nextNamedText
+        end
         local nameLower = elementName:lower()
-        if nameLower:find("title") or nameLower:find("header") then
+        if nameLower:find("title") or nameLower:find("header")
+            or nameLower == "tabname" then
             if not titleText then titleText = elementText end
         elseif nameLower:find("body") or nameLower:find("description")
             or nameLower:find("message") or nameLower:find("warning")
@@ -776,6 +1178,7 @@ local function ExtractFromNamedTexts(namedTexts)
                 table.insert(bodyParts, elementText)
             end
         end
+        ::nextNamedText::
     end
     return titleText, bodyParts
 end
@@ -833,51 +1236,63 @@ local TOOLTIP_JUNK_LABELS = {
 }
 
 -- Ability score names for inspect panel modifier grouping.
-local ABILITY_NAMES = {
-    Strength = true, Dexterity = true, Constitution = true,
-    Intelligence = true, Wisdom = true, Charisma = true,
-}
+-- Built from game enums so modded abilities are included.
+local ABILITY_NAMES = {}
+if Ext.Enums and Ext.Enums.Ability then
+    for abilityLabel, _ in pairs(Ext.Enums.Ability) do
+        if type(abilityLabel) == "string" then
+            ABILITY_NAMES[abilityLabel] = true
+        end
+    end
+end
 
--- FormatTooltipTexts: takes the raw tooltipTexts array from C++,
--- filters to only the entries visible in the BASIC tooltip (damage
--- range and cost).  The handler already speaks title and description.
--- Dice, damage type, range, attack roll, and category badges are
--- inspect-level detail (right stick) and filtered out here.
---
--- @param tooltipTexts table  Raw text array from C++.
--- @param filterTitle string|nil  Title the handler already spoke; filtered
---        from tooltip to avoid double-speaking.
--- Returns a formatted speech string or nil.
-local function FormatTooltipTexts(tooltipTexts, filterTitle)
+-- Damage type keywords for filtering tooltip detail and grouping in inspect.
+-- Built from game enums so modded damage types are included.
+local DAMAGE_TYPES = {}
+if Ext.Enums and Ext.Enums.DamageType then
+    for damageLabel, _ in pairs(Ext.Enums.DamageType) do
+        if type(damageLabel) == "string" then
+            DAMAGE_TYPES[damageLabel] = true
+        end
+    end
+end
+
+--- FormatTooltipTexts: default tooltip formatter for radial and generic
+--- panel tooltips.  Classifies raw texts into SpeechData fields (damage,
+--- cost, usage, warning).  Title/description dedup is handled by the
+--- SpeechData.Diff mechanism in ProcessTooltip.
+--- @param tooltipTexts table  Raw text array from C++.
+--- @return table|nil  SpeechData object, or nil if empty.
+local function FormatTooltipTexts(tooltipTexts)
     if not tooltipTexts or #tooltipTexts == 0 then return nil end
 
-    local normalizedTitle = filterTitle
-        and NormalizeForCompare(filterTitle) or nil
-
-    local parts = {}
+    local speechData = CreateSpeechData()
 
     for _, text in ipairs(tooltipTexts) do
         if text and text ~= ""
             and not TOOLTIP_JUNK_LABELS[text] then
             local cleaned = StripMarkupTags(text)
             if cleaned and cleaned ~= "" and cleaned ~= "." then
-                -- Skip if matches the handler's already-spoken title.
-                if normalizedTitle
-                    and NormalizeForCompare(cleaned) == normalizedTitle then
-                    -- already spoken by handler, skip
-
                 -- Damage range: "4~9 Damage" -> "4 to 9 Damage"
-                elseif cleaned:match("^%d+~%d+ Damage$") then
-                    local damageMin, damageMax =
-                        cleaned:match("^(%d+)~(%d+) Damage$")
-                    table.insert(parts,
-                        damageMin .. " to " .. damageMax .. " Damage")
+                -- Healing range: "4~10 Healing" -> "4 to 10 Healing"
+                if cleaned:match("^%d+~%d+ %a+$") then
+                    local rangeMin, rangeMax, rangeType =
+                        cleaned:match("^(%d+)~(%d+) (%a+)$")
+                    if rangeType == "Damage" or rangeType == "Healing" then
+                        speechData:Add("damage",
+                            rangeMin .. " to " .. rangeMax
+                            .. " " .. rangeType, "brief")
+                    end
 
                 -- Cost: "Action" / "Bonus Action"
                 elseif cleaned == "Action" then
-                    table.insert(parts, "Costs Action")
+                    speechData:Add("cost", "Costs Action", "normal")
                 elseif cleaned == "Bonus Action" then
-                    table.insert(parts, "Costs Bonus Action")
+                    speechData:Add("cost", "Costs Bonus Action", "normal")
+
+                -- Usage: "Single Use" (consumables, scrolls)
+                elseif cleaned == "Single Use" then
+                    speechData:Add("usage", "Single Use", "normal")
 
                 -- Warning messages (red text in tooltip, e.g.
                 -- "No ranged weapon equipped.")
@@ -886,7 +1301,7 @@ local function FormatTooltipTexts(tooltipTexts, filterTitle)
                     if warning:sub(-1) == "." then
                         warning = warning:sub(1, -2)
                     end
-                    table.insert(parts, warning)
+                    speechData:Add("warning", warning, "brief")
 
                 -- Everything else is inspect-level detail or already
                 -- spoken by the handler -- skip for the basic tooltip.
@@ -895,23 +1310,13 @@ local function FormatTooltipTexts(tooltipTexts, filterTitle)
         end
     end
 
-    local speech = table.concat(parts, ". ")
-    if speech == "" then return nil end
-    return speech
+    if #speechData.fields == 0 then return nil end
+    return speechData
 end
 
 -- ---------------------------------------------------------------------------
 -- Inspect formatter (full tooltip detail for right-stick inspect)
 -- ---------------------------------------------------------------------------
-
--- Damage type keywords for combining with preceding dice notation.
-local DAMAGE_TYPES = {
-    Piercing = true, Slashing = true, Bludgeoning = true,
-    Fire = true, Cold = true, Lightning = true,
-    Thunder = true, Acid = true, Poison = true,
-    Necrotic = true, Radiant = true, Force = true,
-    Psychic = true,
-}
 
 --- FormatInspectTexts: formats widget BFS data for inspect readback.
 --- Filters button hints, tutorial explanations, and junk.  Keeps combat
@@ -1113,6 +1518,349 @@ local function FormatInspectTexts(widgetTexts, filterTitle)
 end
 
 -- ---------------------------------------------------------------------------
+-- Character sheet tooltip formatters (generic, usable by any menu handler)
+-- ---------------------------------------------------------------------------
+
+-- Junk labels filtered from full tooltip speech.
+local CHARSHEET_TOOLTIP_JUNK = {
+    ["Inspect"] = true, ["Close"] = true, ["OK"] = true,
+    ["."] = true, [":"] = true, [""] = true,
+}
+
+--- FormatFullTooltip: builds SpeechData from all tooltip texts except junk.
+--- Each text becomes a "detail" field.  Diff handles dedup against handler.
+--- @param tooltipTexts table  Raw tooltip text array from C++.
+--- @return table|nil  SpeechData object, or nil if empty.
+local function FormatFullTooltip(tooltipTexts)
+    local speechData = CreateSpeechData()
+    local seen = {}
+    for _, text in ipairs(tooltipTexts) do
+        if text and text ~= "" and not CHARSHEET_TOOLTIP_JUNK[text] then
+            if text:match("^[%d%.]+$")
+                or text:find("s_HandleUnknown")
+                or text:find("%[ForceUpdate%]")
+                or text:match("^h%x+g") then
+                -- skip
+            else
+                local cleaned = StripMarkupTags(text)
+                if cleaned and cleaned ~= "" then
+                    cleaned = cleaned:gsub("[%.:%s]+$", "")
+                    cleaned = cleaned:gsub("(%d+)~(%d+)", "%1 to %2")
+                    if cleaned ~= "" then
+                        local normalizedKey = cleaned:lower()
+                        if not seen[normalizedKey] then
+                            seen[normalizedKey] = true
+                            speechData:Add("detail", cleaned, "normal")
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if #speechData.fields == 0 then return nil end
+    return speechData
+end
+
+--- FormatStatTooltip: structured tooltip for stat DC types (VMStat,
+--- VMRangeStat).  Pairs breakdown numbers with their source labels.
+--- @param tooltipTexts table  Raw tooltip text array from C++.
+--- @return table|nil  SpeechData object, or nil if empty.
+local function FormatStatTooltip(tooltipTexts)
+    local descriptions = {}
+    local breakdownRaw = {}
+
+    for _, text in ipairs(tooltipTexts) do
+        if text and text ~= ""
+            and not CHARSHEET_TOOLTIP_JUNK[text]
+            and not text:find("s_HandleUnknown")
+            and not text:find("%[ForceUpdate%]")
+            and not text:match("^h%x+g") then
+            local cleaned = StripMarkupTags(text)
+            if cleaned and cleaned ~= "" then
+                cleaned = cleaned:gsub("[%.:%s]+$", "")
+                cleaned = cleaned:gsub("(%d+)~(%d+)", "%1 to %2")
+                if cleaned ~= "" then
+                    if cleaned:match("%(%u+%)") then
+                        -- skip title
+                    elseif cleaned:match("^[%d%+%-/]") then
+                        breakdownRaw[#breakdownRaw + 1] = cleaned
+                    elseif cleaned:match("^[Ff]rom ")
+                        or cleaned:lower() == "base" then
+                        breakdownRaw[#breakdownRaw + 1] = cleaned
+                    elseif #cleaned > 30 then
+                        descriptions[#descriptions + 1] = cleaned
+                    end
+                end
+            end
+        end
+    end
+
+    local breakdownPairs = {}
+    local pendingValue = nil
+    for _, item in ipairs(breakdownRaw) do
+        local isSource = item:match("^[Ff]rom ")
+            or item:lower() == "base"
+        if isSource then
+            if pendingValue then
+                breakdownPairs[#breakdownPairs + 1] =
+                    pendingValue .. " " .. item
+                pendingValue = nil
+            else
+                breakdownPairs[#breakdownPairs + 1] = item
+            end
+        else
+            pendingValue = item
+        end
+    end
+
+    local speechData = CreateSpeechData()
+    if #breakdownPairs > 0 then
+        speechData:Add("breakdown",
+            table.concat(breakdownPairs, ", "), "normal")
+    end
+    for _, description in ipairs(descriptions) do
+        speechData:Add("description", description, "verbose")
+    end
+
+    if #speechData.fields == 0 then return nil end
+    return speechData
+end
+
+--- FormatAbilityTooltip: structured tooltip for ability scores (ls.VMAbility).
+--- Keeps effect texts and description, skips noise.
+--- @param tooltipTexts table  Raw tooltip text array from C++.
+--- @return table|nil  SpeechData object, or nil if empty.
+local function FormatAbilityTooltip(tooltipTexts)
+    local effects = {}
+    local descriptions = {}
+
+    for _, text in ipairs(tooltipTexts) do
+        if not text or text == "" or CHARSHEET_TOOLTIP_JUNK[text] then
+            goto nextAbilityText
+        end
+        if text:find("s_HandleUnknown") or text:find("%[ForceUpdate%]")
+            or text:match("^h%x+g") then
+            goto nextAbilityText
+        end
+        local cleaned = StripMarkupTags(text)
+        if not cleaned or cleaned == "" then goto nextAbilityText end
+        cleaned = cleaned:gsub("[%.:%s]+$", "")
+        if cleaned == "" then goto nextAbilityText end
+
+        if cleaned:match("^%(%d+%)$") then goto nextAbilityText end
+        if cleaned:match("^[%-+]?%d+$") then goto nextAbilityText end
+        if cleaned:match("^[Ff]rom ") then goto nextAbilityText end
+        if cleaned:find("Ability Points") then goto nextAbilityText end
+        if #cleaned <= 20 and not cleaned:match("%d") then
+            goto nextAbilityText
+        end
+
+        if cleaned:match("^%-?%d+ to ") then
+            effects[#effects + 1] = cleaned
+        elseif #cleaned > 30 then
+            descriptions[#descriptions + 1] = cleaned
+        end
+
+        ::nextAbilityText::
+    end
+
+    local speechData = CreateSpeechData()
+    for _, effect in ipairs(effects) do
+        speechData:Add("effect", effect, "normal")
+    end
+    for _, description in ipairs(descriptions) do
+        speechData:Add("description", description, "verbose")
+    end
+
+    if #speechData.fields == 0 then return nil end
+    return speechData
+end
+
+--- FormatCombatStatTooltip: structured tooltip for combat stats
+--- (gui::VMCharacterStats -- melee/ranged damage, attack bonus).
+--- @param tooltipTexts table  Raw tooltip text array from C++.
+--- @return table|nil  SpeechData object, or nil if empty.
+local function FormatCombatStatTooltip(tooltipTexts)
+    local items = {}
+    for _, text in ipairs(tooltipTexts) do
+        if text and text ~= ""
+            and not CHARSHEET_TOOLTIP_JUNK[text]
+            and not text:find("s_HandleUnknown")
+            and not text:find("%[ForceUpdate%]")
+            and not text:match("^h%x+g") then
+            local cleaned = StripMarkupTags(text)
+            if cleaned and cleaned ~= "" then
+                cleaned = cleaned:gsub("[%.:%s]+$", "")
+                cleaned = cleaned:gsub("(%d+)~(%d+)", "%1 to %2")
+                if cleaned ~= "" then
+                    items[#items + 1] = cleaned
+                end
+            end
+        end
+    end
+
+    local rollExpression = nil
+    local damageType = nil
+    local modifiers = {}
+    local descriptionTexts = {}
+    local itemIndex = 1
+
+    while itemIndex <= #items do
+        local item = items[itemIndex]
+
+        if #item > 50 then
+            descriptionTexts[#descriptionTexts + 1] = item
+            itemIndex = itemIndex + 1
+        elseif item:match("%d+d%d+") then
+            local totalRoll = item:match("Total Damage (%d+d%d+)")
+            if totalRoll then
+                rollExpression = totalRoll
+            else
+                local weaponDice, dtype =
+                    item:match("(%d+d%d+)%s+(%a+)$")
+                if dtype then
+                    damageType = dtype
+                end
+                if not rollExpression and weaponDice then
+                    rollExpression = weaponDice
+                end
+            end
+            itemIndex = itemIndex + 1
+        elseif itemIndex + 2 <= #items
+            and (items[itemIndex + 1] == "+"
+                or items[itemIndex + 1] == "-")
+            and items[itemIndex + 2]:match("^%d+$") then
+            modifiers[#modifiers + 1] = items[itemIndex + 1]
+                .. items[itemIndex + 2] .. " from " .. item
+            itemIndex = itemIndex + 3
+        elseif (item == "+" or item == "-")
+            and itemIndex + 1 <= #items
+            and items[itemIndex + 1]:match("^%d+$") then
+            modifiers[#modifiers + 1] = item .. items[itemIndex + 1]
+            itemIndex = itemIndex + 2
+        else
+            itemIndex = itemIndex + 1
+        end
+    end
+
+    local speechData = CreateSpeechData()
+
+    local rollParts = {}
+    if rollExpression then
+        rollParts[#rollParts + 1] = rollExpression
+    end
+    for _, modifier in ipairs(modifiers) do
+        rollParts[#rollParts + 1] = modifier
+    end
+    if #rollParts > 0 then
+        speechData:Add("roll",
+            "Roll: " .. table.concat(rollParts, ", "), "normal")
+    end
+
+    if damageType then
+        speechData:Add("type", "Type: " .. damageType, "normal")
+    end
+
+    for _, description in ipairs(descriptionTexts) do
+        speechData:Add("description", description, "verbose")
+    end
+
+    if #speechData.fields == 0 then return nil end
+    return speechData
+end
+
+--- FormatItemTooltip: structured tooltip for inventory items (ls.VMItem).
+--- Classifies each tooltip text into semantic fields.  Diff against the
+--- handler's SpeechData (in ProcessTooltip) removes duplicates.
+--- @param tooltipTexts table  Raw tooltip text array from C++.
+--- @return table|nil  SpeechData object, or nil if empty.
+local function FormatItemTooltip(tooltipTexts)
+    local speechData = CreateSpeechData()
+    local seen = {}
+    -- First non-name short text is typically the category (e.g., "Light
+    -- Armour", "Potion", "Scroll").  Classify at normal tier for the
+    -- structured brief/normal/verbose pattern.
+    local categoryAssigned = false
+    for _, text in ipairs(tooltipTexts) do
+        if not text or text == "" or CHARSHEET_TOOLTIP_JUNK[text] then
+            goto nextItemText
+        end
+        if text:find("s_HandleUnknown") or text:find("%[ForceUpdate%]")
+            or text:match("^h%x+g") then
+            goto nextItemText
+        end
+        local cleaned = StripMarkupTags(text)
+        if not cleaned or cleaned == "" then goto nextItemText end
+        cleaned = cleaned:gsub("[%.:%s]+$", "")
+        if cleaned == "" then goto nextItemText end
+
+        local lowerCleaned = cleaned:lower()
+        if seen[lowerCleaned] then goto nextItemText end
+
+        -- Bare numbers: skip.  Weight and gold come from dcProps/entity
+        -- API (set by the VMItem handler), not tooltip parsing.
+        -- AC value after "Armour Class" label is also skipped -- entity
+        -- API provides it via ReadItemStats.
+        if cleaned:match("^[%d%.]+$") then
+            goto nextItemText
+        end
+        -- "Equipped by X": include as status field.
+        if cleaned:find("^Equipped by") then
+            speechData:Add("equipped", cleaned, "brief")
+            goto nextItemText
+        end
+        -- Skip "Inspect".
+        if cleaned == "Inspect" then goto nextItemText end
+        -- Skip "Proficiency with" labels.
+        if cleaned:find("^Proficiency with") then goto nextItemText end
+        -- "Armour Class" label: suppress.  AC comes from entity API.
+        if lowerCleaned == "armour class" or lowerCleaned == "armor class" then
+            goto nextItemText
+        end
+
+        seen[lowerCleaned] = true
+
+        -- Classify into semantic fields.
+        cleaned = cleaned:gsub("(%d+)~(%d+)", "%1 to %2")
+
+        -- Damage/healing range: key stat, normal tier.
+        if cleaned:match("^%d+ to %d+%s+%a+$")
+            or cleaned:match("^%d+ to %d+$") then
+            speechData:Add("damage", cleaned, "normal")
+        -- Dice roll: detail, verbose tier.
+        elseif cleaned:match("^%d+d%d+") then
+            speechData:Add("roll", cleaned, "verbose")
+        -- Cost: practical info, normal tier.
+        elseif cleaned == "Action" then
+            speechData:Add("cost", "Costs Action", "normal")
+        elseif cleaned == "Bonus Action" then
+            speechData:Add("cost", "Costs Bonus Action", "normal")
+        -- Usage: practical info, normal tier.
+        elseif cleaned == "Single Use" then
+            speechData:Add("usage", "Single Use", "normal")
+        -- Short text: first one is typically the category (e.g., "Light
+        -- Armour", "Potion", "Scroll") at normal tier.  Subsequent short
+        -- texts are labels or properties at normal tier.
+        elseif #cleaned <= 30 then
+            if not categoryAssigned then
+                categoryAssigned = true
+                speechData:Add("category", cleaned, "normal")
+            else
+                speechData:Add("shortText", cleaned, "normal")
+            end
+        -- Long text (description or effect explanation): verbose tier.
+        else
+            speechData:Add("description", cleaned, "verbose")
+        end
+
+        ::nextItemText::
+    end
+
+    if #speechData.fields == 0 then return nil end
+    return speechData
+end
+
+-- ---------------------------------------------------------------------------
 -- Exports
 -- ---------------------------------------------------------------------------
 BG3Access.Client.Helpers = {
@@ -1131,11 +1879,19 @@ BG3Access.Client.Helpers = {
     ParseDescriptionParam        = ParseDescriptionParam,
     ResolveDescriptionParams     = ResolveDescriptionParams,
     ReadStatDescription          = ReadStatDescription,
-    SpeakSlots                   = SpeakSlots,
-    SLOT_ORDER                   = SLOT_ORDER,
+    ResolveTranslatedString      = ResolveTranslatedString,
+    LookupSpellDescription       = LookupSpellDescription,
+    LookupFeatureDescription     = LookupFeatureDescription,
+    LookupStaticDataDescription  = LookupStaticDataDescription,
+    CreateSpeechData             = CreateSpeechData,
     DIALOG_BUTTON_HINT           = DIALOG_BUTTON_HINT,
     ExtractFromNamedTexts        = ExtractFromNamedTexts,
     ExtractFromWidgetData        = ExtractFromWidgetData,
     FormatTooltipTexts           = FormatTooltipTexts,
     FormatInspectTexts           = FormatInspectTexts,
+    FormatFullTooltip            = FormatFullTooltip,
+    FormatStatTooltip            = FormatStatTooltip,
+    FormatAbilityTooltip         = FormatAbilityTooltip,
+    FormatCombatStatTooltip      = FormatCombatStatTooltip,
+    FormatItemTooltip            = FormatItemTooltip,
 }

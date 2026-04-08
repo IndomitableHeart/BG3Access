@@ -248,9 +248,9 @@ local function CreateMenuHandler(config)
         end
 
         -- =============================================================
-        -- Screen entry or item navigation: fill slots, speak.
+        -- Screen entry or item navigation: build SpeechData, speak.
         -- =============================================================
-        local slots = {}
+        local speechData = Helpers.CreateSpeechData()
         local tabName = nil
         local normalTab = ""
         local screenTitle = nil
@@ -258,7 +258,8 @@ local function CreateMenuHandler(config)
         if isScreenEntry then
             -- Derive tab name.
             if focusedElement.isTab then
-                tabName = focusedElement.tabName
+                tabName = Helpers.GetTranslatedStringIfHandle(
+                    focusedElement.tabName)
             end
             normalTab = tabName and Helpers.NormalizeForCompare(tabName) or ""
 
@@ -315,39 +316,40 @@ local function CreateMenuHandler(config)
             end
             if screenTitle then
                 handlerState.lastSpokenTitle = screenTitle
-                slots["title"] = screenTitle
+                speechData:Add("title", screenTitle, "brief")
             end
 
             -- Hint (once per menu visit).
             if not handlerState.tabHintSpoken then
                 handlerState.tabHintSpoken = true
                 local menuHint
-                -- hintFn(screenTitle, handlerState) allows dynamic hints
-                -- based on screen context (e.g., save vs. load mode).
                 if config.hintFn then
                     menuHint = config.hintFn(screenTitle, handlerState)
                 else
-                    -- nil means use default hint, false means no hint.
                     menuHint = config.hint
                     if menuHint == nil then
                         menuHint = DEFAULT_HINT
                     end
                 end
                 if menuHint then
-                    slots["hint"] = menuHint
+                    speechData:Add("hint", menuHint, "normal")
                 end
             end
 
-            -- Tab name (suppress if title contains it).
+            -- Tab name (suppress if title contains it or unresolved handle).
             if tabName then
                 local showTabName = true
-                if screenTitle
+                -- Filter unresolved LocaString handles.
+                if tabName:match("^h%x+g") then
+                    showTabName = false
+                end
+                if showTabName and screenTitle
                     and Helpers.NormalizeForCompare(screenTitle):find(
                         normalTab, 1, true) then
                     showTabName = false
                 end
                 if showTabName then
-                    slots["tabName"] = tabName
+                    speechData:Add("tabName", tabName, "brief")
                 end
             end
 
@@ -370,11 +372,10 @@ local function CreateMenuHandler(config)
                     and (bodyAssembled .. ". " .. statusText) or statusText
             end
             if bodyAssembled then
-                slots["body"] = bodyAssembled
+                speechData:Add("body", bodyAssembled, "normal")
             end
-            -- Dialog button actions (e.g., "A: Yes, B: No").
             if widgetActions then
-                slots["actions"] = widgetActions
+                speechData:Add("actions", widgetActions, "normal")
             end
         else
             -- Item navigation: dedup check.
@@ -391,7 +392,7 @@ local function CreateMenuHandler(config)
             end
         end
 
-        -- ----- Item slots -----
+        -- ----- Item fields -----
         local itemName = nil
         local itemInfo = nil
         local itemValue = nil
@@ -407,6 +408,10 @@ local function CreateMenuHandler(config)
             splitDesc = nil
             splitValueDesc = nil
         end
+        -- Filter unresolved LocaString handles from item names.
+        if splitName and splitName:match("^h%x+g") then
+            splitName = nil
+        end
         if splitName and splitName ~= "" then
             local normalItem = Helpers.NormalizeForCompare(splitName)
             local normalTitle = screenTitle
@@ -419,10 +424,6 @@ local function CreateMenuHandler(config)
             if not isDuplicate then
                 itemName = splitName
                 itemValue = splitValue
-                -- When a value has its own description (combobox options),
-                -- put the setting description before the value (itemInfo)
-                -- and the value description after it (itemDesc).
-                -- Order: name -> setting desc -> value -> value desc
                 if splitValueDesc then
                     itemInfo = splitDesc
                     itemDesc = splitValueDesc
@@ -437,7 +438,6 @@ local function CreateMenuHandler(config)
         end
 
         if itemName then
-            slots["itemName"] = itemName
             handlerState.lastSpokenName = elemId
             handlerState.lastSpokenFullText = itemName
             Log.Info("ITEM [" .. config.name .. "]: "
@@ -448,11 +448,13 @@ local function CreateMenuHandler(config)
                     and ("  desc=" .. tostring(itemDesc):sub(1, 40))
                     or ""))
         end
-        if itemInfo then slots["itemInfo"] = itemInfo end
-        if itemValue then slots["itemValue"] = itemValue end
-        if itemDesc then slots["itemDesc"] = itemDesc end
 
-        Helpers.SpeakSlots(slots, handlerState, isScreenEntry)
+        speechData:Add("itemName", itemName, "brief")
+        speechData:Add("itemInfo", itemInfo, "normal")
+        speechData:Add("itemValue", itemValue, "brief")
+        speechData:Add("itemDesc", itemDesc, "verbose")
+
+        speechData:Speak(handlerState, isScreenEntry)
     end
 
     -- -----------------------------------------------------------------
@@ -711,6 +713,15 @@ local function IsDialogOverlay(dcType)
     return dcType:find("MessageBox") ~= nil
 end
 
+--- IsMenuDCType: returns true if the given DC type is explicitly handled
+--- by the Menus module (used by EventRouter to decide whether to switch
+--- routing from WorldUI back to Menus).  Generic types like "ls.Widget"
+--- return false -- they should NOT cause a routing switch.
+local function IsMenuDCType(dcType)
+    if not dcType then return false end
+    return DC_TYPE_HANDLERS[dcType] ~= nil
+end
+
 --- HandleWidgetAdded: called by the Manager when a non-CC, non-cutscene
 --- widget is added.  Updates the active handler and calls its hook.
 --- @param widgetData table  The widget data from the snapshot.
@@ -930,6 +941,7 @@ BG3Access.Client.Menus = {
     HandleDialogOverlay     = HandleDialogOverlay,
     HandleWidgetRootChanged = HandleWidgetRootChanged,
     IsDialogOverlay         = IsDialogOverlay,
+    IsMenuDCType            = IsMenuDCType,
     ResetAllHandlers        = ResetAllHandlers,
     GetActiveHandler        = GetActiveHandler,
     UnsubscribeControllerInput = UnsubscribeControllerInput,

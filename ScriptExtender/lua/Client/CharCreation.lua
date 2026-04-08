@@ -32,17 +32,16 @@ local CC_SECTION_LABELS = {
     ["ls.VMSelectableFeat"]           = "Feat",
     ["ls.VMCharacterCreationSkill"]   = "Skills",
     ["ls.VMSpellReference"]           = "Spell",
-    -- Item-level DC types (individual items within pages, not page headers).
-    -- These ensure IsCCSnapshot recognizes them so the CC handler processes
-    -- skill proficiency cycling, ability bonus cycling, etc.
-    ["ls.VMSkill"]                    = "Skills",
-    ["ls.VMAbility"]                  = "Abilities",
 }
 
 -- DC types that are CC-specific but only when inCharacterCreation is true.
--- These types may also appear in non-CC contexts (e.g. Options sliders).
+-- These types may also appear in non-CC contexts (e.g. Options sliders,
+-- character sheet ability/skill views).  VMAbility and VMSkill moved here
+-- from CC_SECTION_LABELS to prevent false CC detection in the character sheet.
 local CC_CONTEXT_TYPES = {
     ["gui::VMSliderSetting"]          = "Appearance",
+    ["ls.VMSkill"]                    = "Skills",
+    ["ls.VMAbility"]                  = "Abilities",
 }
 
 -- Body type display names.  Keys are lowercase versions of the
@@ -233,29 +232,6 @@ local function GetPageInstructionText(tabName)
     return nil
 end
 
--- Cache: display name -> stat description.  Built on first miss from
--- Ext.Stats.GetStats("SpellData").  nil sentinel means "no match found".
-local spellDescriptionCache = {}
-local spellCacheBuilt = false
-
--- Cache: display name -> stat description for passives/features.
--- Built on first lookup from Ext.Stats.GetStats("PassiveData").
-local passiveDescriptionCache = {}
-local passiveCacheBuilt = false
-
--- Cache: display name -> description for progression boosts.
--- Built from Ext.StaticData ProgressionDescription resources.
--- Covers category proficiencies, saving throws, and other boosts
--- that don't exist in PassiveData.
-local progressionDescriptionCache = {}
-local progressionCacheBuilt = false
-
--- Unified StaticData description cache.
--- Maps StaticData type -> { normalizedDisplayName -> description }.
--- Built lazily per type on first lookup.
-local staticDataDescriptionCaches = {}
-local staticDataCacheBuilt = {}
-
 -- DC types that represent race/class features and passives.
 -- These need stat-based description lookup.
 local CC_FEATURE_DC_TYPES = {
@@ -310,300 +286,7 @@ local ParseDescriptionParam = Helpers.ParseDescriptionParam
 local ResolveDescriptionParams = Helpers.ResolveDescriptionParams
 local ReadStatDescription = Helpers.ReadStatDescription
 
--- Resolve a TranslatedString from a cached prototype's DescriptionInfo.
--- Handles string, userdata (tostring resolves it), and table formats.
-local function ResolveTranslatedString(translatedString)
-    if not translatedString then return nil end
-    local stringType = type(translatedString)
-    if stringType == "string" and translatedString ~= "" then
-        local resolved = Helpers.GetTranslatedStringIfHandle(translatedString)
-        if resolved and not resolved:match("^h%x") then return resolved end
-        return nil
-    elseif stringType == "userdata" then
-        -- TranslatedString userdata from cached prototypes.
-        -- tostring() returns "TranslatedString (0x...)", not the text.
-        -- Access Handle.Handle and resolve via localization.
-        local handleSuccess, handle = pcall(function()
-            return translatedString.Handle.Handle
-        end)
-        if handleSuccess and handle then
-            local handleStr = tostring(handle)
-            if handleStr and handleStr ~= "" then
-                local resolved = Helpers.GetTranslatedStringIfHandle(handleStr)
-                if resolved and not resolved:match("^h%x") then
-                    return resolved
-                end
-            end
-        end
-        -- Fallback: try .Value property.
-        local valueSuccess, value = pcall(function()
-            return translatedString.Value
-        end)
-        if valueSuccess and type(value) == "string"
-            and value ~= "" and not value:match("^h%x") then
-            return value
-        end
-        return nil
-    elseif stringType == "table" then
-        -- Try Handle.Handle first.
-        if translatedString.Handle
-            and translatedString.Handle.Handle then
-            local resolved = Helpers.GetTranslatedStringIfHandle(
-                translatedString.Handle.Handle)
-            if resolved and not resolved:match("^h%x") then
-                return resolved
-            end
-        end
-        -- Try common string fields.
-        for _, key in ipairs({"Value", "Name", "Str"}) do
-            if type(translatedString[key]) == "string"
-                and translatedString[key] ~= "" then
-                return translatedString[key]
-            end
-        end
-    end
-    return nil
-end
-
--- Build a display-name -> description cache from all SpellData stats.
--- Uses GetCachedSpell for safe access to SpellPrototype.Description.
--- Called once on first cache miss.
-local function BuildSpellDisplayNameCache()
-    if spellCacheBuilt then return end
-    spellCacheBuilt = true
-    local success, allSpellIds = pcall(Ext.Stats.GetStats, "SpellData")
-    if not success or not allSpellIds then
-        Log.Info("SPELL CACHE: failed to enumerate SpellData stats")
-        return
-    end
-    Log.Info("SPELL CACHE: building from " .. #allSpellIds .. " spell stats")
-    for _, statId in ipairs(allSpellIds) do
-        local entrySuccess, entryError = pcall(function()
-            local cached = Ext.Stats.GetCachedSpell(statId)
-            if not cached or not cached.Description then return end
-            local displayName = ResolveTranslatedString(
-                cached.Description.DisplayName)
-            if not displayName then return end
-            local normalizedName = displayName:lower()
-            if spellDescriptionCache[normalizedName] then return end
-            local description = ResolveTranslatedString(
-                cached.Description.Description)
-            if not description then return end
-            local descParams = cached.Description.DescriptionParams
-            if descParams and descParams ~= "" then
-                description = ResolveDescriptionParams(
-                    description, nil, descParams)
-            end
-            spellDescriptionCache[normalizedName] = description
-        end)
-        -- Same as passives: junk entries throw, pcall catches.
-    end
-    local count = 0
-    for _ in pairs(spellDescriptionCache) do count = count + 1 end
-    Log.Info("SPELL CACHE: " .. count .. " display names cached")
-end
-
-local function GetSpellDescription(spellName)
-    if not spellName or spellName == "" then return nil end
-
-    -- Use the display name cache exclusively.  It's built from
-    -- Ext.Stats.GetStats("SpellData") which enumerates every spell
-    -- with its correct stat ID.  No prefix guessing needed.
-    BuildSpellDisplayNameCache()
-    local normalizedLookup = spellName:lower()
-    local cached = spellDescriptionCache[normalizedLookup]
-    if cached then
-        Log.Debug("SPELL CACHE HIT: " .. spellName)
-        return cached
-    end
-
-    Log.Debug("SPELL MISS: '" .. spellName .. "'")
-    return nil
-end
-
--- Read Description from a passive stat.  Passive stats only have
--- Build a display-name -> description cache from all PassiveData stats.
--- Uses GetCachedPassive for safe access to PassivePrototype.Description.
--- Called once on first lookup.
-local function BuildPassiveDisplayNameCache()
-    if passiveCacheBuilt then return end
-    passiveCacheBuilt = true
-    local success, allPassiveIds = pcall(Ext.Stats.GetStats, "PassiveData")
-    if not success or not allPassiveIds then
-        Log.Info("PASSIVE CACHE: failed to enumerate PassiveData stats")
-        return
-    end
-    Log.Info("PASSIVE CACHE: building from " .. #allPassiveIds .. " passive stats")
-    for _, statId in ipairs(allPassiveIds) do
-        local entrySuccess, entryError = pcall(function()
-            local cached = Ext.Stats.GetCachedPassive(statId)
-            if not cached or not cached.Description then return end
-            local displayName = ResolveTranslatedString(
-                cached.Description.DisplayName)
-            if not displayName then return end
-            local normalizedName = displayName:lower()
-            if passiveDescriptionCache[normalizedName] then return end
-            local description = ResolveTranslatedString(
-                cached.Description.Description)
-            if not description then return end
-            local descParams = cached.Description.DescriptionParams
-            if descParams and descParams ~= "" then
-                description = ResolveDescriptionParams(
-                    description, nil, descParams)
-            end
-            passiveDescriptionCache[normalizedName] = description
-        end)
-        -- Junk entries (%%% technical, broken TranslatedStrings) throw
-        -- C++ exceptions caught by pcall.  Harmless; debugger may break
-        -- on first-chance exception but game continues normally.
-    end
-    local count = 0
-    for _ in pairs(passiveDescriptionCache) do count = count + 1 end
-    Log.Info("PASSIVE CACHE: " .. count .. " display names cached")
-end
-
--- Build a display-name -> description cache from ProgressionDescription
--- resources.  These cover category proficiencies (Simple Weapons, Light
--- Armour, etc.), saving throw proficiencies, and other boost descriptions
--- that don't exist in PassiveData or SpellData.
-local function BuildProgressionDescriptionCache()
-    if progressionCacheBuilt then return end
-    progressionCacheBuilt = true
-    local guidsSuccess, guids = pcall(
-        Ext.StaticData.GetAll, "ProgressionDescription")
-    if not guidsSuccess or not guids then
-        Log.Info("PROGRESSION CACHE: failed to enumerate resources")
-        return
-    end
-    Log.Info("PROGRESSION CACHE: building from "
-        .. #guids .. " progression descriptions")
-    for _, guid in ipairs(guids) do
-        local entrySuccess, entryError = pcall(function()
-            local entry = Ext.StaticData.Get(guid, "ProgressionDescription")
-            if not entry then return end
-            if entry.Hidden then return end
-            local displayName = ResolveTranslatedString(entry.DisplayName)
-            if not displayName then return end
-            local description = ResolveTranslatedString(entry.Description)
-            if not description then return end
-            description = Helpers.StripMarkupTags(description)
-            local normalizedName = displayName:lower()
-            if not progressionDescriptionCache[normalizedName] then
-                progressionDescriptionCache[normalizedName] = description
-            end
-        end)
-        -- Skip broken entries silently.
-    end
-    local count = 0
-    for _ in pairs(progressionDescriptionCache) do count = count + 1 end
-    Log.Info("PROGRESSION CACHE: " .. count .. " descriptions cached")
-end
-
--- Build a display-name -> description cache for a StaticData type.
--- Generic: works for Race, ClassDescription, Background, God, Origin, etc.
--- Called once per type on first lookup.
-local function BuildStaticDataDescriptionCache(staticDataType)
-    if staticDataCacheBuilt[staticDataType] then return end
-    staticDataCacheBuilt[staticDataType] = true
-    staticDataDescriptionCaches[staticDataType] = {}
-    local cache = staticDataDescriptionCaches[staticDataType]
-
-    local guidsSuccess, guids = pcall(
-        Ext.StaticData.GetAll, staticDataType)
-    if not guidsSuccess or not guids then
-        Log.Info("STATIC CACHE [" .. staticDataType
-            .. "]: failed to enumerate")
-        return
-    end
-    Log.Info("STATIC CACHE [" .. staticDataType
-        .. "]: building from " .. #guids .. " entries")
-    for _, guid in ipairs(guids) do
-        pcall(function()
-            local entry = Ext.StaticData.Get(guid, staticDataType)
-            if not entry then return end
-            local displayName = ResolveTranslatedString(entry.DisplayName)
-            if not displayName then return end
-            local description = ResolveTranslatedString(entry.Description)
-            if not description then return end
-            description = Helpers.StripMarkupTags(description)
-            local normalizedName = displayName:lower()
-            if not cache[normalizedName] then
-                cache[normalizedName] = description
-            end
-        end)
-    end
-    local count = 0
-    for _ in pairs(cache) do count = count + 1 end
-    Log.Info("STATIC CACHE [" .. staticDataType
-        .. "]: " .. count .. " descriptions cached")
-end
-
--- Look up a description by display name from a StaticData type cache.
--- Returns description string or nil.
-local function GetStaticDataDescription(staticDataType, displayName)
-    if not staticDataType or not displayName or displayName == "" then
-        return nil
-    end
-    BuildStaticDataDescriptionCache(staticDataType)
-    local cache = staticDataDescriptionCaches[staticDataType]
-    if not cache then return nil end
-    return cache[displayName:lower()]
-end
-
--- Look up a feature/passive description by display name.
--- Returns description string or nil.
-local function GetFeatureDescription(featureName, dcType)
-    if not featureName or featureName == "" then return nil end
-    BuildPassiveDisplayNameCache()
-    local normalizedLookup = featureName:lower()
-    local cached = passiveDescriptionCache[normalizedLookup]
-    if cached then
-        Log.Debug("PASSIVE HIT: " .. featureName)
-        return cached
-    end
-
-    -- Fuzzy match: summary panel uses short names ("Rapiers") while
-    -- the passive cache has "Rapier Proficiency".  Try variations
-    -- to find the real game text before falling back to anything else.
-    local singular = featureName:gsub("s$", "")
-    -- Also try removing " Proficiency" suffix (e.g., "Light Armour Proficiency"
-    -- stored as "Light Armour" in the UI).
-    local withoutProf = featureName:gsub(" Proficiency$", "")
-    local variations = {
-        featureName .. " Proficiency",
-        singular .. " Proficiency",
-        singular,
-        withoutProf,
-    }
-    for _, variant in ipairs(variations) do
-        local variantDesc = passiveDescriptionCache[variant:lower()]
-        if variantDesc then
-            Log.Debug("PASSIVE FUZZY HIT: " .. featureName
-                .. " via " .. variant)
-            return variantDesc
-        end
-    end
-
-    -- Spell lookup for spell-type features (Rage, Produce Flame).
-    local spellDesc = GetSpellDescription(featureName)
-    if spellDesc then
-        Log.Debug("FEATURE SPELL HIT: " .. featureName)
-        return spellDesc
-    end
-
-    -- Progression descriptions: category proficiencies, saving throws,
-    -- and other boost descriptions that don't exist in PassiveData.
-    -- Built dynamically from Ext.StaticData ProgressionDescription resources.
-    BuildProgressionDescriptionCache()
-    local progressionDesc = progressionDescriptionCache[normalizedLookup]
-    if progressionDesc then
-        Log.Debug("PROGRESSION HIT: " .. featureName)
-        return progressionDesc
-    end
-
-    Log.Debug("FEATURE MISS: '" .. featureName .. "'")
-    return nil
-end
+local ResolveTranslatedString = Helpers.ResolveTranslatedString
 
 local function GetSectionLabel(data)
     if not data or not data.dcType then return nil end
@@ -693,7 +376,7 @@ local function GetGodObjectDescription(dcProps, tabName, itemName)
 
     -- 1. StaticData API by display name (primary).
     if staticDataType and itemName and itemName ~= "" then
-        local apiDesc = GetStaticDataDescription(staticDataType, itemName)
+        local apiDesc = Helpers.LookupStaticDataDescription(staticDataType, itemName)
         if apiDesc then return apiDesc end
     end
 
@@ -707,7 +390,7 @@ local function GetGodObjectDescription(dcProps, tabName, itemName)
                 local subName = subTable.Name or subTable.DisplayName
                     or subTable.Title
                 if subName and subName ~= "" then
-                    local apiDesc = GetStaticDataDescription(
+                    local apiDesc = Helpers.LookupStaticDataDescription(
                         staticDataType, subName)
                     if apiDesc then return apiDesc end
                 end
@@ -761,7 +444,7 @@ local function GetGodObjectDescription(dcProps, tabName, itemName)
     if itemName and itemName ~= "" then
         for fallbackTab, fallbackType in pairs(CC_TAB_STATIC_DATA_TYPE) do
             if fallbackType ~= staticDataType then
-                local fallbackDesc = GetStaticDataDescription(
+                local fallbackDesc = Helpers.LookupStaticDataDescription(
                     fallbackType, itemName)
                 if fallbackDesc then return fallbackDesc end
             end
@@ -1094,7 +777,7 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
         local effectiveMainTab = ccState.lastMainTab
         if effectiveMainTab
             and not CC_TAB_STATIC_DATA_TYPE[effectiveMainTab]
-            and GetStaticDataDescription("God", effectiveMainTab) then
+            and Helpers.LookupStaticDataDescription("God", effectiveMainTab) then
             effectiveMainTab = "Deity"
         end
 
@@ -1117,12 +800,12 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
             end
         end
 
-        -- B. Feature/passive API via GetFeatureDescription.
+        -- B. Feature/passive API via Helpers.LookupFeatureDescription.
         --    Covers race/class features, proficiencies, Darkvision, etc.
         if not itemDescription and focusedElement.dcType
             and CC_FEATURE_DC_TYPES[focusedElement.dcType] then
             local featureSuccess, featureDescription = pcall(
-                GetFeatureDescription, itemName, focusedElement.dcType)
+                Helpers.LookupFeatureDescription, itemName)
             if featureSuccess and featureDescription then
                 itemDescription = featureDescription
                 Log.Debug("GetCCItemData: feature desc: " .. itemName
@@ -1130,7 +813,7 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
             end
         end
 
-        -- C. Spell API via GetSpellDescription.
+        -- C. Spell API via Helpers.LookupSpellDescription.
         --    Covers spell buttons (Fire Bolt, etc.).
         if not itemDescription and itemName
             and focusedElement.elemType
@@ -1138,7 +821,7 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
                 or focusedElement.elemType:find("spellButton", 1, true))
             and itemName ~= "spell" then
             local spellSuccess, spellDescription = pcall(
-                GetSpellDescription, itemName)
+                Helpers.LookupSpellDescription, itemName)
             if spellSuccess and spellDescription then
                 itemDescription = spellDescription
                 Log.Debug("GetCCItemData: spell desc: " .. itemName
@@ -1726,7 +1409,7 @@ local function HandleCCSnapshot(snapshot)
         -- Deity detection: tab name is a deity name, not "Deity".
         if effectiveTab
             and not CC_TAB_STATIC_DATA_TYPE[effectiveTab]
-            and GetStaticDataDescription("God", effectiveTab) then
+            and Helpers.LookupStaticDataDescription("God", effectiveTab) then
             effectiveTab = "Deity"
             ccState.lastMainTab = "Deity"
         end
@@ -1805,7 +1488,7 @@ local function HandleCCSnapshot(snapshot)
     -- =================================================================
     -- Screen entry or item navigation.
     -- =================================================================
-    local slots = {}
+    local speechData = Helpers.CreateSpeechData()
     local tabName = nil
 
     if isScreenEntry then
@@ -1886,7 +1569,7 @@ local function HandleCCSnapshot(snapshot)
         -- cache.  If so, this is the deity page.
         if ccState.lastMainTab
             and not CC_TAB_STATIC_DATA_TYPE[ccState.lastMainTab]
-            and GetStaticDataDescription("God", ccState.lastMainTab) then
+            and Helpers.LookupStaticDataDescription("God", ccState.lastMainTab) then
             ccState.lastMainTab = "Deity"
             if tabName and not CC_TAB_STATIC_DATA_TYPE[tabName] then
                 tabName = "Deity"
@@ -1911,13 +1594,13 @@ local function HandleCCSnapshot(snapshot)
         end
         if screenTitle then
             ccState.lastSpokenTitle = screenTitle
-            slots["title"] = screenTitle
+            speechData:Add("title", screenTitle, "brief")
         end
 
         -- ----- Hint -----
         if not ccState.tabHintSpoken then
             ccState.tabHintSpoken = true
-            slots["hint"] = "Use bumpers to switch tabs."
+            speechData:Add("hint", "Use bumpers to switch tabs.", "normal")
         end
 
         -- ----- Tab name -----
@@ -1927,11 +1610,14 @@ local function HandleCCSnapshot(snapshot)
                 showTabName = false
             end
             if showTabName then
-                slots["tabName"] = tabName
+                speechData:Add("tabName", tabName, "brief")
             end
         end
 
         -- Abilities page: speak points remaining and first-time rules hint.
+        -- Body text: ability info or tab hint (tab hint overwrites ability
+        -- info when both are present).
+        local screenBody = nil
         if tabName == "Abilities" and focusedElement.dcProps then
             local bodyParts = {}
             if not ccState.abilityHintSpoken then
@@ -1944,7 +1630,7 @@ local function HandleCCSnapshot(snapshot)
                 table.insert(bodyParts, unusedPoints .. " points remaining")
             end
             if #bodyParts > 0 then
-                slots["body"] = table.concat(bodyParts, ". ")
+                screenBody = table.concat(bodyParts, ". ")
             end
         end
 
@@ -1964,40 +1650,49 @@ local function HandleCCSnapshot(snapshot)
             local hint = CC_TAB_HINTS[hintKey]
             if hint then
                 ccState.tabHintsSpoken[hintKey] = true
-                slots["body"] = hint
+                screenBody = hint  -- overwrites ability info
                 Log.Info("TAB HINT: " .. hintKey .. " -> " .. hint:sub(1, 60))
             end
         end
 
         -- First CC entry: natural introduction speech.
+        -- Overrides title/hint/body with a custom introduction.
         if not previousTab then
+            -- Reset speechData for the introduction (discard any
+            -- title/hint/tabName added above).
+            speechData = Helpers.CreateSpeechData()
             if namingScreenWasSpoken then
                 -- Guardian character creation entry (from naming screen).
-                slots["title"] = "Guardian Appearance"
-                slots["hint"] = "Choose your guardian's appearance."
+                speechData:Add("title", "Guardian Appearance", "brief")
+                speechData:Add("hint",
+                    "Choose your guardian's appearance."
                     .. " D-pad up and down to browse options."
                     .. " D-pad left and right to change values."
                     .. " Press Y to venture forth and start the game."
-                    .. " Press B to return to character naming."
-                slots["tabName"] = nil
-                slots["body"] = nil  -- suppress regular Race tab hint
+                    .. " Press B to return to character naming.", "normal")
                 ccState.lastSpokenTitle = "Guardian Appearance"
                 namingScreenWasSpoken = false
                 Log.Info("CC SLOTS: guardian entry")
             else
                 -- Main character creation entry.
-                slots["title"] = "Character Creation"
-                slots["hint"] = "You are on the " .. (tabName or "origin")
-                    .. " page. Use bumpers to switch tabs."
-                slots["tabName"] = nil
+                speechData:Add("title", "Character Creation", "brief")
+                speechData:Add("hint", "You are on the "
+                    .. (tabName or "origin")
+                    .. " page. Use bumpers to switch tabs.", "normal")
                 ccState.lastSpokenTitle = "Character Creation"
                 Log.Info("CC SLOTS: first entry, tab=" .. tostring(tabName))
             end
             ccState.tabHintSpoken = true
             ccState.lastMainTab = detectedSectionLabel or tabName
             ccState.lastSpokenName = elemId
-            Helpers.SpeakSlots(slots, ccState, true)
+            speechData:Speak(ccState, true)
             return
+        end
+
+        -- Add body text (ability info or tab hint) for non-first-entry
+        -- screen entries.
+        if screenBody then
+            speechData:Add("body", screenBody, "normal")
         end
     end
 
@@ -2125,7 +1820,6 @@ local function HandleCCSnapshot(snapshot)
 
     if itemName then
         ccState.lastSpokenItemName = itemName
-        slots["itemName"] = itemName
         ccState.lastSpokenName = elemId
         ccState.lastSpokenFullText = itemName
         Log.Info("ITEM: " .. tostring(focusedElement.elemType)
@@ -2133,8 +1827,9 @@ local function HandleCCSnapshot(snapshot)
             .. (itemValue and ("  val=" .. itemValue) or "")
             .. (itemDesc and ("  desc=" .. tostring(itemDesc):sub(1, 40)) or ""))
     end
-    if itemValue then slots["itemValue"] = itemValue end
-    if itemDesc then slots["itemDesc"] = itemDesc end
+    speechData:Add("itemName", itemName, "brief")
+    speechData:Add("itemValue", itemValue, "brief")
+    speechData:Add("itemDesc", itemDesc, "verbose")
 
     -- DIAG: log when all extraction paths produced nothing (silent element).
     if not itemName and not itemValue and not itemDesc then
@@ -2153,7 +1848,7 @@ local function HandleCCSnapshot(snapshot)
         end
     end
 
-    Helpers.SpeakSlots(slots, ccState, isScreenEntry)
+    speechData:Speak(ccState, isScreenEntry)
 end
 
 -- ============================================================================
