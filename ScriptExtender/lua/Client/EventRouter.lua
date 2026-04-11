@@ -420,39 +420,16 @@ local function HandleTickSnapshot(snapshot)
 
     -- Late world panel detection: when the widget callback's widgetData
     -- carried a generic DC type (ls.Widget) but a panel widget was also
-    -- present, the widget processing block above missed it.  Check the
-    -- snapshot's widgetDCTypes array (ALL DC types from this tick) and
-    -- the focused element's dcType for a WorldUI panel match.
+    -- present, the widget processing block above missed it.  WorldUI
+    -- owns the detection logic (checking focused/selected/widget DC
+    -- types against its handler table).
     if not routeToWorld
         and (snapshot.focusChanged or snapshot.selectionChanged) then
         local World = BG3Access.Client.WorldUI
-        if World then
-            local panelDCType = nil
-            -- Check focused element dcType first (direct match).
-            if focusedElement.dcType
-                and World.IsWorldDCType(focusedElement.dcType) then
-                panelDCType = focusedElement.dcType
-            end
-            -- Check all widget DC types from this tick.
-            if not panelDCType and snapshot.widgetDCTypes then
-                for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-                    if World.IsWorldDCType(widgetDCType) then
-                        panelDCType = widgetDCType
-                        break
-                    end
-                end
-            end
-            if panelDCType then
-                local syntheticWidgetData = {
-                    dcType = panelDCType,
-                    elemName = focusedElement.widgetRootId,
-                }
-                World.HandlePanelWidgetAdded(syntheticWidgetData)
-                Menus.ResetAllHandlers()
-                routeToWorld = true
-                Log.Info("Routing to WorldUI (late detection: "
-                    .. panelDCType .. ")")
-            end
+        if World and World.TryActivateFromSnapshot(snapshot) then
+            Menus.ResetAllHandlers()
+            routeToWorld = true
+            Log.Info("Routing to WorldUI (late detection)")
         end
     end
 

@@ -26,6 +26,7 @@ local Log = BG3Access.Client.Log
 local Helpers  = BG3Access.Client.Helpers
 local Cutscene = BG3Access.Client.Cutscene
 local CharSheet = BG3Access.Client.CharSheet
+local SpellBook = BG3Access.Client.SpellBook
 
 -- ============================================================================
 -- Constants
@@ -1225,6 +1226,10 @@ end
 local CharacterPanelHandler = CharSheet.CreateCharacterPanelHandler(
     CreatePanelHandler)
 
+-- Spell book / actions panel (from SpellBook.lua).
+local SpellBookHandler = SpellBook.CreateSpellBookHandler(
+    CreatePanelHandler)
+
 -- Trading / bartering dual inventory.
 local TradeHandler = CreatePanelHandler({
     name = "Trade",
@@ -1327,6 +1332,182 @@ local JournalQuestsHandler = CreatePanelHandler({
     name = "JournalQuests",
     hint = "Use bumpers to switch categories."
         .. " Up and down to browse entries.",
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local dcType = focusedElement.dcType
+        local dcProps = focusedElement.dcProps
+        local elemId = focusedElement.elemId or ""
+
+        -- Tab ListBoxItem: suppress as item.
+        if elemId:find("^ListBoxItem::") then
+            return "", nil, nil
+        end
+
+        -- Quest category expander (ls.QuestCategoryContainer):
+        -- QuestCategory sub-object has Description property.
+        if dcType == "ls.QuestCategoryContainer" and dcProps then
+            local categoryName = nil
+            if type(dcProps.QuestCategory) == "table" then
+                categoryName = dcProps.QuestCategory.Description
+            end
+            if not categoryName or categoryName == "" then
+                -- Fallback: read text blocks from the expander.
+                local readOk, headerTexts = pcall(
+                    Ext.UI.ReadFocusedTextBlocks)
+                if readOk and headerTexts and #headerTexts > 0 then
+                    categoryName = Helpers.StripMarkupTags(
+                        headerTexts[1])
+                end
+            end
+            if categoryName and categoryName ~= "" then
+                categoryName = Helpers.GetTranslatedStringIfHandle(
+                    categoryName)
+                if categoryName and categoryName ~= "" then
+                    local isChecked = focusedElement.isChecked
+                    if isChecked == true then
+                        categoryName = categoryName .. ", expanded"
+                    elseif isChecked == false then
+                        categoryName = categoryName .. ", collapsed"
+                    end
+                    return categoryName, nil, nil
+                end
+            end
+            return "", nil, nil
+        end
+
+        -- Quest entry expander (ls.QuestView):
+        -- Quest sub-object has Title, IsDisabled properties.
+        if dcType == "ls.QuestView" and dcProps then
+            local questTitle = nil
+            local questCompleted = false
+            if type(dcProps.Quest) == "table" then
+                questTitle = dcProps.Quest.Title
+                questCompleted = dcProps.Quest.IsDisabled == "True"
+                    or dcProps.Quest.IsDisabled == true
+            end
+            if not questTitle or questTitle == "" then
+                questTitle = dcProps.Text or dcProps.Name
+                    or dcProps.Title
+                if type(questTitle) == "table" then
+                    questTitle = questTitle.Str or questTitle.Text
+                        or questTitle.Name or nil
+                end
+            end
+            if not questTitle or questTitle == "" then
+                -- Fallback: read text blocks.
+                local readOk, headerTexts = pcall(
+                    Ext.UI.ReadFocusedTextBlocks)
+                if readOk and headerTexts and #headerTexts > 0 then
+                    questTitle = Helpers.StripMarkupTags(
+                        headerTexts[1])
+                end
+            end
+            if questTitle and questTitle ~= "" then
+                questTitle = Helpers.GetTranslatedStringIfHandle(
+                    questTitle)
+                if questTitle and questTitle ~= "" then
+                    if questCompleted then
+                        questTitle = questTitle .. ", completed"
+                    end
+                    -- Update indicator.
+                    local hasUpdate = dcProps.HasPlayerSeenLastUpdate
+                    if hasUpdate == "False" or hasUpdate == false then
+                        questTitle = questTitle .. ", new update"
+                    end
+                    local isChecked = focusedElement.isChecked
+                    if isChecked == true then
+                        questTitle = questTitle .. ", expanded"
+                    elseif isChecked == false then
+                        questTitle = questTitle .. ", collapsed"
+                    end
+                    return questTitle, nil, nil
+                end
+            end
+            return "", nil, nil
+        end
+
+        -- Quest objective (ls.QuestObjective):
+        -- Has Description property directly.
+        if dcType == "ls.QuestObjective" and dcProps then
+            local objectiveText = dcProps.Description
+            if type(objectiveText) == "table" then
+                objectiveText = objectiveText.Str or objectiveText.Text
+                    or nil
+            end
+            if objectiveText and objectiveText ~= "" then
+                objectiveText = Helpers.GetTranslatedStringIfHandle(
+                    objectiveText)
+                objectiveText = Helpers.StripMarkupTags(objectiveText)
+                return "Objective: " .. objectiveText, nil, nil
+            end
+            -- Fallback: text blocks.
+            local readOk, texts = pcall(
+                Ext.UI.ReadFocusedTextBlocks)
+            if readOk and texts and #texts > 0 then
+                local text = Helpers.StripMarkupTags(texts[1])
+                if text and text ~= "" then
+                    return "Objective: " .. text, nil, nil
+                end
+            end
+            return "", nil, nil
+        end
+
+        -- Quest step (ls.QuestStep):
+        -- Has Description and IsCompleted properties.
+        if dcType == "ls.QuestStep" and dcProps then
+            local stepText = dcProps.Description
+            if type(stepText) == "table" then
+                stepText = stepText.Str or stepText.Text or nil
+            end
+            if stepText and stepText ~= "" then
+                stepText = Helpers.GetTranslatedStringIfHandle(
+                    stepText)
+                stepText = Helpers.StripMarkupTags(stepText)
+                local isCompleted = dcProps.IsCompleted == "True"
+                    or dcProps.IsCompleted == true
+                if isCompleted then
+                    stepText = stepText .. ", completed"
+                end
+                return stepText, nil, nil
+            end
+            return "", nil, nil
+        end
+
+        -- Generic expander button fallback.
+        if elemId:find("ExpanderButton") then
+            local readOk, headerTexts = pcall(
+                Ext.UI.ReadFocusedTextBlocks)
+            if readOk and headerTexts and #headerTexts > 0 then
+                local headerName = Helpers.StripMarkupTags(
+                    headerTexts[1])
+                if headerName and headerName ~= "" then
+                    local isChecked = focusedElement.isChecked
+                    if isChecked == true then
+                        headerName = headerName .. ", expanded"
+                    elseif isChecked == false then
+                        headerName = headerName .. ", collapsed"
+                    end
+                    return headerName, nil, nil
+                end
+            end
+            return "", nil, nil
+        end
+
+        -- Fall through to generic pipeline.
+        return nil
+    end,
+    customTooltipFn = function(tooltipTexts, focusedDCType)
+        -- Quest entries: full tooltip for objective/description detail.
+        if focusedDCType == "ls.QuestView" then
+            return Helpers.FormatFullTooltip(tooltipTexts)
+        end
+        -- Categories and objectives: suppress (already spoken).
+        if focusedDCType == "ls.QuestCategoryContainer"
+            or focusedDCType == "ls.QuestObjective"
+            or focusedDCType == "ls.QuestStep" then
+            return ""
+        end
+        return nil
+    end,
 })
 
 -- Dialogue history with portraits.
@@ -1514,6 +1695,9 @@ local DC_TYPE_HANDLERS = {
     ["ls.DCPickpocket"]           = PickpocketHandler,
     ["gui::DCLearnSpells"]        = LearnSpellsHandler,
     ["ls.DCLearnSpells"]          = LearnSpellsHandler,
+    -- Spell book / actions
+    ["gui::VMSpellBook"]          = SpellBookHandler,
+    ["ls.VMSpellBook"]            = SpellBookHandler,
     -- Camp / rest
     ["gui::DCMakeCamp"]           = CampHandler,
     ["ls.DCMakeCamp"]             = CampHandler,
@@ -1558,6 +1742,7 @@ local DC_TYPE_HANDLERS = {
 -- All handler instances for batch reset.
 local ALL_PANEL_HANDLERS = {
     CharacterPanelHandler,
+    SpellBookHandler,
     TradeHandler,
     ContainerHandler,
     ExamineHandler,
@@ -1651,13 +1836,43 @@ end
 --- @param snapshot table  The full TickSnapshot from C++.
 local function RoutePanelSnapshot(snapshot)
     if not activePanelHandler then
-        Log.Warn("RoutePanelSnapshot: no active panel handler, "
-            .. "falling back to Menus")
-        local Menus = BG3Access.Client.Menus
-        if Menus then
-            Menus.RouteSnapshot(snapshot)
+        -- Attempt handler discovery from snapshot data before falling
+        -- back to Menus.  This handles panels whose widget DC type is
+        -- generic (ls.Widget) but whose selected/focused element DC type
+        -- identifies the panel (e.g., ls.VMSpellBook on the tab).
+        local discoveredHandler = nil
+        if snapshot.focusedElement and snapshot.focusedElement.dcType then
+            discoveredHandler = DC_TYPE_HANDLERS[
+                snapshot.focusedElement.dcType]
         end
-        return
+        -- Selected element: tab ListBoxItems carry the panel DC type
+        -- (e.g., ls.VMSpellBook) even when the focused element is a
+        -- child action (ls.VMActionGroup, ls.VMCharacterAction).
+        if not discoveredHandler
+            and snapshot.selectedElement
+            and snapshot.selectedElement.dcType then
+            discoveredHandler = DC_TYPE_HANDLERS[
+                snapshot.selectedElement.dcType]
+        end
+        if not discoveredHandler and snapshot.widgetDCTypes then
+            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
+                discoveredHandler = DC_TYPE_HANDLERS[widgetDCType]
+                if discoveredHandler then break end
+            end
+        end
+        if discoveredHandler then
+            activePanelHandler = discoveredHandler
+            Log.Info("Active panel (discovered): "
+                .. activePanelHandler.name)
+        else
+            Log.Warn("RoutePanelSnapshot: no active panel handler, "
+                .. "falling back to Menus")
+            local Menus = BG3Access.Client.Menus
+            if Menus then
+                Menus.RouteSnapshot(snapshot)
+            end
+            return
+        end
     end
 
     -- Overlay close detection: when a previous handler is saved
@@ -1705,6 +1920,52 @@ local function ResetAllPanelHandlers()
     previousPanelHandler = nil
 end
 
+--- TryActivateFromSnapshot: attempt to discover and activate a panel
+--- handler from snapshot data.  Called by EventRouter's late detection
+--- when the widget DC type was generic (ls.Widget) and no handler was
+--- activated through the normal widget event path.  All detection logic
+--- lives here so EventRouter stays a dumb router.
+--- @param snapshot table  The full TickSnapshot from C++.
+--- @return boolean  True if a handler was activated.
+local function TryActivateFromSnapshot(snapshot)
+    local panelDCType = nil
+    -- Check focused element dcType.
+    if snapshot.focusedElement and snapshot.focusedElement.dcType then
+        if DC_TYPE_HANDLERS[snapshot.focusedElement.dcType] then
+            panelDCType = snapshot.focusedElement.dcType
+        end
+    end
+    -- Check selected element dcType: tab ListBoxItems carry the panel
+    -- DC type (e.g., ls.VMSpellBook) even when the focused element is
+    -- a child (ls.VMActionGroup, ls.VMCharacterAction).
+    if not panelDCType
+        and snapshot.selectedElement
+        and snapshot.selectedElement.dcType then
+        if DC_TYPE_HANDLERS[snapshot.selectedElement.dcType] then
+            panelDCType = snapshot.selectedElement.dcType
+        end
+    end
+    -- Check all widget DC types from this tick.
+    if not panelDCType and snapshot.widgetDCTypes then
+        for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
+            if DC_TYPE_HANDLERS[widgetDCType] then
+                panelDCType = widgetDCType
+                break
+            end
+        end
+    end
+    if panelDCType then
+        local syntheticWidgetData = {
+            dcType = panelDCType,
+            elemName = snapshot.focusedElement
+                and snapshot.focusedElement.widgetRootId or nil,
+        }
+        HandlePanelWidgetAdded(syntheticWidgetData)
+        return activePanelHandler ~= nil
+    end
+    return false
+end
+
 --- GetActivePanelHandler: returns the currently active panel handler.
 --- @return table|nil  The active handler instance, or nil.
 local function GetActivePanelHandler()
@@ -1742,6 +2003,7 @@ BG3Access.Client.WorldUI = {
     HandlePanelWidgetAdded     = HandlePanelWidgetAdded,
     HandlePanelWidgetRootChanged = HandlePanelWidgetRootChanged,
     RoutePanelSnapshot         = RoutePanelSnapshot,
+    TryActivateFromSnapshot    = TryActivateFromSnapshot,
     ResetAllPanelHandlers      = ResetAllPanelHandlers,
     GetActivePanelHandler      = GetActivePanelHandler,
     -- Tooltip

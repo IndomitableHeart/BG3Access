@@ -4,6 +4,7 @@ BG3Access.Shared.RequireFiles("Client/", {
 "CharCreation",
 "Cutscene",
 "CharSheet",
+"SpellBook",
 "WorldUI",
 "Menus",
 "WorldNav",
