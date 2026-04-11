@@ -1258,12 +1258,18 @@ local ContainerHandler = CreatePanelHandler({
         end
     end,
     customItemFn = function(focusedElement, handlerState, snapshot)
-        -- On screen entry (selectionChanged), suppress the focused item
-        -- speech.  The container name title is the only announcement.
-        if snapshot.selectionChanged then
-            return "", nil, nil
+        -- Widget navigation fake elements are empty slots in the grid
+        -- (same pattern as CharSheet inventory).  Announce them so the
+        -- user knows they landed on a real slot that happens to be
+        -- empty, rather than thinking the mod has gone silent.
+        local elemId = focusedElement.elemId or ""
+        if elemId:find("WidgetNavigationPrimaryFakeElement")
+            or elemId:find("WidgetNavigationSecondaryFakeElement") then
+            return "Empty slot", nil, nil
         end
-        -- Normal item navigation: fall through to generic pipeline.
+        -- Real item: fall through to the generic pipeline.  On screen
+        -- entry (selectionChanged), this means the initial focused
+        -- item is spoken right after the container title and hint.
         return nil
     end,
 })

@@ -118,8 +118,27 @@ end
 -- ============================================================================
 
 -- Process dialog properties from a dialog widget.
--- dcProps should contain BodyText, ShowAnswers, etc.
+-- Always marks us as in-dialog whenever the widget event fires --
+-- the narrator text may be voice-acted (empty BodyText) but the
+-- answer-choice poller still needs to run.
 local function HandleDialogWidget(dcProps)
+    -- Any DCDialogue event means we are in a dialog.  Set the flag
+    -- unconditionally so answer detection activates even for
+    -- voice-acted narrator lines that carry no BodyText.
+    dialogState.inDialog = true
+    -- Clear the last spoken answer so re-entering the same dialog
+    -- with the same first choice still speaks it.
+    dialogState.lastAnswerText = nil
+
+    -- Re-arm the C++ focus monitor's Strategy 3 (IsSelected tree
+    -- walk) so it runs on the next tick.  On dialog re-entry the
+    -- widget set count may not change (BG3 reuses the widget), so
+    -- the normal "widgetCount increased" reset doesn't fire and
+    -- Strategy 3 stays gated by initialSelectionDone_.
+    -- ForceGlobalFocusUpdate sets forceNext_ AND resets
+    -- initialSelectionDone_ (see ForceNextFire in Module.inl).
+    pcall(Ext.UI.ForceGlobalFocusUpdate)
+
     if not dcProps then return end
 
     local bodyText = dcProps.BodyText
@@ -127,13 +146,114 @@ local function HandleDialogWidget(dcProps)
     if bodyText == dialogState.lastBodyText then return end
 
     dialogState.lastBodyText = bodyText
-    dialogState.inDialog = true
 
     local cleanBody = Helpers.StripMarkupTags(bodyText)
     if not cleanBody or cleanBody == "" then return end
 
     Log.Info("DIALOG: " .. cleanBody:sub(1, 80))
     Ext.Tolk.Speak(cleanBody, true)
+end
+
+-- ============================================================================
+-- Dialog answer handler (snapshot-driven)
+-- ============================================================================
+--
+-- D-pad navigation inside a DCDialogue does NOT fire Noesis keyboard
+-- focus events.  Dialogue_c.xaml binds UIUp / UIDown to custom
+-- SelectorUpCommand / SelectorDownCommand handlers that mutate
+-- ActiveDialogue.LocalHighlightedAnswer on the view model.  The
+-- answerList ls:LSListBox then updates its SelectedItem via a data
+-- binding, which flips IsSelected=true on the corresponding
+-- LSListBoxItem.
+--
+-- The C++ global focus monitor's Strategy 3 (IsSelected tree walk,
+-- FindSelectedTabInTree) DOES detect this selection change and
+-- delivers it via the snapshot pipeline with:
+--
+--     snapshot.focusedElement.elemId = "ls.LSListBoxItem@0x..."
+--     snapshot.focusedElement.dcType = "gui::VMDialogueAnswer"
+--
+-- EventRouter intercepts snapshots with that dcType and routes them
+-- here instead of letting them fall through to the default MainMenu
+-- handler (which would extract only the "1." AnswerTextPrefix).
+--
+-- To read the full answer text we call Ext.UI.ReadFocusedTextBlocks()
+-- -- a C++, SEH-guarded helper that walks the focused element's
+-- visual subtree for all TextBlocks and returns their rendered text
+-- (via ReadTextBlockText, which already handles the Inlines / Run
+-- decomposition that CtxTransStringRunGeneratorBehavior produces).
+-- For a dialog answer LSListBoxItem the returned array contains the
+-- AnswerTextPrefix ("1.") and the AnswerText ("Reach toward the
+-- pool.") in some order.
+--
+-- This module never touches Noesis directly -- the rule is "all
+-- visual-tree walking lives in C++ under SEH".  ReadFocusedTextBlocks
+-- satisfies that.
+
+--- Read the dialog answer directly from the focused element's
+--- ViewModel dcProps.  The data layer IS the single source of truth
+--- for answer text — the rendered TextBlocks are populated by a
+--- CtxTransStringRunGeneratorBehavior that creates Runs with bound
+--- Text values the C++ Inlines walker cannot fully extract.
+---
+--- dcProps keys for gui::VMDialogueAnswer:
+---   BodyText:   "<i>Investigate the pool.</i>" (HTML, full answer)
+---   AnswerIdx:  "1" (0-based)
+---   AnswerTags: table (tag collection, contains "[INVESTIGATION]" etc.)
+---   CtxAnswer:  table (TranslatedString context, complex)
+---   Enabled, HighlightedByHost, BoundEvent, PollResult* ... (metadata)
+---
+--- Also checks ReadFocusedTextBlocks for bracket-tagged prefixes
+--- like "[INVESTIGATION]" that are rendered as styled Runs in the
+--- AnswerText TextBlock (those DO come through the Inlines walker
+--- because the ParamRunStyle's StringFormat binding is resolved).
+local function HandleDialogAnswerSnapshot(snapshot)
+    dialogState.inDialog = true
+
+    local focusedElement = snapshot.focusedElement
+    if not focusedElement then return end
+    local dcProps = focusedElement.dcProps
+    if type(dcProps) ~= "table" then return end
+
+    -- Body text from the ViewModel (the actual answer string).
+    local bodyText = dcProps.BodyText
+    if not bodyText or bodyText == "" then return end
+    local cleanBody = Helpers.StripMarkupTags(bodyText)
+    if not cleanBody or cleanBody == "" then return end
+
+    -- Number prefix from 0-based AnswerIdx.
+    local numberPrefix = ""
+    local answerIndex = tonumber(dcProps.AnswerIdx)
+    if answerIndex then
+        numberPrefix = tostring(answerIndex + 1) .. ". "
+    end
+
+    -- Tag prefix: "[INVESTIGATION]", "[PERSUASION]", etc.  The tag
+    -- text comes through ReadFocusedTextBlocks because it's a styled
+    -- Run whose StringFormat binding is evaluated.  Look for any
+    -- entry that starts with "[" and contains uppercase letters --
+    -- that's the D&D skill/ability tag the player needs to know.
+    local tagPrefix = ""
+    if Ext.UI.ReadFocusedTextBlocks then
+        local okFocusedTexts, focusedTexts = pcall(
+            Ext.UI.ReadFocusedTextBlocks)
+        if okFocusedTexts and type(focusedTexts) == "table" then
+            for _, text in ipairs(focusedTexts) do
+                if type(text) == "string"
+                    and text:match("^%[%u") then
+                    tagPrefix = text .. " "
+                    break
+                end
+            end
+        end
+    end
+
+    local combined = numberPrefix .. tagPrefix .. cleanBody
+    if combined == dialogState.lastAnswerText then return end
+    dialogState.lastAnswerText = combined
+
+    Log.Info("DIALOG ANSWER: " .. combined:sub(1, 160))
+    Ext.Tolk.Speak(combined, true)
 end
 
 -- Handle focus on a dialog answer choice (player navigating answers).
@@ -310,12 +430,13 @@ end
 -- ============================================================================
 
 BG3Access.Client.Cutscene = {
-    IsDialogOrCutscene        = IsDialogOrCutscene,
-    IsDialogWidget            = IsDialogWidget,
-    IsOverheadWidget          = IsOverheadWidget,
-    HandleDialogWidgetEvent   = HandleDialogWidgetEvent,
-    HandleDialogAnswerFocus   = HandleDialogAnswerFocus,
-    HandleGameStateForAD      = HandleGameStateForAD,
-    NotifyNewGameInitiated    = NotifyNewGameInitiated,
-    ResetDialogState          = ResetDialogState,
+    IsDialogOrCutscene         = IsDialogOrCutscene,
+    IsDialogWidget             = IsDialogWidget,
+    IsOverheadWidget           = IsOverheadWidget,
+    HandleDialogWidgetEvent    = HandleDialogWidgetEvent,
+    HandleDialogAnswerFocus    = HandleDialogAnswerFocus,
+    HandleDialogAnswerSnapshot = HandleDialogAnswerSnapshot,
+    HandleGameStateForAD       = HandleGameStateForAD,
+    NotifyNewGameInitiated     = NotifyNewGameInitiated,
+    ResetDialogState           = ResetDialogState,
 }

@@ -79,6 +79,28 @@ local function HandleTickSnapshot(snapshot)
     local focusedElement = snapshot.focusedElement
 
     -- =================================================================
+    -- Dialog answer selection: D-pad through answer choices in a
+    -- DCDialogue fires snapshots where the selected LSListBoxItem has
+    -- dcType = "gui::VMDialogueAnswer".  Noesis keyboard focus never
+    -- moves during dialog navigation (the XAML binds UIUp/UIDown to
+    -- custom SelectorUpCommand / SelectorDownCommand handlers that
+    -- mutate ActiveDialogue.LocalHighlightedAnswer directly), so the
+    -- global focus monitor reports it as a selection change via
+    -- Strategy 3 (IsSelected tree walk).
+    --
+    -- Without this interception the snapshot falls through to the
+    -- default MainMenu handler, which extracts only the
+    -- AnswerTextPrefix TextBlock ("1.", "2.", "3.") because the
+    -- generic text extraction does not walk deep enough for the full
+    -- AnswerText inside the ListBoxItem template.  Route to Cutscene
+    -- instead so the full answer text is spoken.
+    if focusedElement
+        and focusedElement.dcType == "gui::VMDialogueAnswer" then
+        Cutscene.HandleDialogAnswerSnapshot(snapshot)
+        return
+    end
+
+    -- =================================================================
     -- CC dispatch (early): CC snapshots may lack elemType during rapid
     -- focus bounces (e.g. guardian page entry).  Route to CC handler
     -- before the elemType filter so they aren't dropped.
@@ -513,7 +535,6 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     lastWidgetRootStr = nil
     exploreLastSpoken = nil
     spokenLoadingTips = {}
-    routeToWorld = false
     worldDialogOverlayJustSpoke = false
     suppressWorldEntryVisualText = false
 
@@ -524,6 +545,14 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     -- prompts like "Examine", "Context Menu") are useless noise.
     -- The RS HUD reader replaces this -- user reads info when ready.
     suppressWorldEntryVisualText = (toState == "Running")
+    -- Seed routeToWorld from the target state.  Entering Running means
+    -- the player is in gameplay and the HUD is the default: the RS
+    -- HUD reader, GPS cycle, and other world-mode features must be
+    -- active immediately, without waiting for a world-type panel
+    -- (Examine, Container, etc.) to appear and flip the flag.  Any
+    -- other target state (Menu, LoadSession, etc.) resets to false
+    -- so the panel routing logic below can observe fresh transitions.
+    routeToWorld = (toState == "Running")
     SetupGlobalFocusMonitor()
 end)
 

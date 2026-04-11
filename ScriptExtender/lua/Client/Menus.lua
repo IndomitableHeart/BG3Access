@@ -353,14 +353,15 @@ local function CreateMenuHandler(config)
                 end
             end
 
-            -- Body.
+            -- Body.  bodyOverride (set by onWidgetAdded for controller
+            -- hints, etc.) takes priority over NameScope-extracted body
+            -- parts -- it is an explicit override, not a fallback.
             local bodyAssembled = nil
-            if nsBodyParts and #nsBodyParts > 0 then
-                bodyAssembled = table.concat(nsBodyParts, ". ")
-            end
-            if not bodyAssembled and handlerState.bodyOverride then
+            if handlerState.bodyOverride then
                 bodyAssembled = handlerState.bodyOverride
                 handlerState.bodyOverride = nil
+            elseif nsBodyParts and #nsBodyParts > 0 then
+                bodyAssembled = table.concat(nsBodyParts, ". ")
             end
             if not bodyAssembled and widgetBody then
                 bodyAssembled = widgetBody
@@ -494,7 +495,11 @@ local function CreateMenuHandler(config)
         handlerState.lastSpokenTitle = nil
         handlerState.lastSpokenName = nil
         handlerState.screenEntryJustSpoke = false
-        handlerState.bodyOverride = nil
+        -- NOTE: bodyOverride is NOT cleared here.  It is set by
+        -- onWidgetAdded (which fires BEFORE ResetNavigation on
+        -- tab switches) and consumed by HandleSnapshot on the
+        -- same tick.  Clearing it here would wipe the override
+        -- before the snapshot can use it.
     end
 
     --- ResetHint: reset tabHintSpoken so the hint speaks on next visit.
