@@ -57,7 +57,10 @@ local function SpeakControllerBinding(dcKey)
     local displayName = BUTTON_DISPLAY_NAMES[dcKey] or dcKey
     local functionality = Helpers.CleanControllerFunctionality(binding.Functionality)
     if not functionality or functionality == "" then return false end
-    local speech = displayName .. ": " .. functionality
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("bindingName", displayName, "brief")
+    speechData:Add("bindingAction", functionality, "brief")
+    local speech = speechData:Format()
     Log.Info("Controller binding -> " .. speech)
     Ext.Tolk.Speak(speech, true)
     return true
@@ -209,10 +212,9 @@ local function CreateMenuHandler(config)
             local updateText = widgetBody or widgetActions
             if updateText and updateText ~= ""
                 and updateText ~= handlerState.lastSpokenFullText then
-                handlerState.lastSpokenFullText = updateText
-                Log.Info("WIDGET UPDATE [" .. config.name .. "]: "
-                    .. updateText)
-                Ext.Tolk.Speak(updateText, true)
+                local updateSpeech = Helpers.CreateSpeechData()
+                updateSpeech:Add("widgetUpdate", updateText, "brief")
+                updateSpeech:Speak(handlerState, false)
                 return
             end
         end
@@ -228,10 +230,9 @@ local function CreateMenuHandler(config)
         if isCarouselOnly then
             local carouselValue = snapshot.inlineCarouselValue
             if carouselValue ~= handlerState.lastSpokenFullText then
-                handlerState.lastSpokenFullText = carouselValue
-                Log.Info("CAROUSEL [" .. config.name .. "]: "
-                    .. carouselValue)
-                Ext.Tolk.Speak(carouselValue, true)
+                local carouselSpeech = Helpers.CreateSpeechData()
+                carouselSpeech:Add("carouselValue", carouselValue, "brief")
+                carouselSpeech:Speak(handlerState, false)
             end
             return
         end
@@ -240,9 +241,9 @@ local function CreateMenuHandler(config)
             local valueText = Helpers.FormatDCValue(focusedElement.dcProps)
             if valueText and valueText ~= ""
                 and valueText ~= handlerState.lastSpokenFullText then
-                handlerState.lastSpokenFullText = valueText
-                Log.Info("VALUE [" .. config.name .. "]: " .. valueText)
-                Ext.Tolk.Speak(valueText, true)
+                local valueSpeech = Helpers.CreateSpeechData()
+                valueSpeech:Add("value", valueText, "brief")
+                valueSpeech:Speak(handlerState, false)
             end
             return
         end
@@ -825,7 +826,17 @@ local function HandleDialogOverlay(snapshot, widgetData)
     if bodyText then table.insert(parts, bodyText) end
     if actionsText then table.insert(parts, actionsText) end
     if #parts > 0 then
-        local speech = Helpers.StripMarkupTags(table.concat(parts, ". "))
+        local dialogSpeech = Helpers.CreateSpeechData()
+        if titleText then
+            dialogSpeech:Add("dialogTitle", titleText, "brief")
+        end
+        if bodyText then
+            dialogSpeech:Add("dialogBody", bodyText, "brief")
+        end
+        if actionsText then
+            dialogSpeech:Add("dialogActions", actionsText, "normal")
+        end
+        local speech = dialogSpeech:Format()
         Log.Info("DIALOG OVERLAY: " .. speech)
         Ext.Tolk.Speak(speech, true)
         -- Suppress the active Menus handler on this tick so the dialog

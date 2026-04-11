@@ -128,8 +128,10 @@ local function HandleTickSnapshot(snapshot)
     if snapshot.contextMenuChanged then
         local itemText = snapshot.contextMenuItemText
         if itemText and itemText ~= "" then
+            local contextSpeech = Helpers.CreateSpeechData()
+            contextSpeech:Add("contextItem", itemText, "brief")
             Log.Info("CONTEXT MENU: " .. itemText)
-            Ext.Tolk.Speak(itemText, true)
+            Ext.Tolk.Speak(contextSpeech:Format(), true)
         end
         return
     end
@@ -264,7 +266,16 @@ local function HandleTickSnapshot(snapshot)
                 parts[#parts + 1] = hudInfo.characterInfo
             end
             if #parts > 0 then
-                local greeting = table.concat(parts, ". ")
+                local greetingSpeech = Helpers.CreateSpeechData()
+                if hudInfo.characterName and hudInfo.characterName ~= "" then
+                    greetingSpeech:Add("characterName",
+                        hudInfo.characterName, "brief")
+                end
+                if hudInfo.characterInfo and hudInfo.characterInfo ~= "" then
+                    greetingSpeech:Add("characterInfo",
+                        hudInfo.characterInfo, "normal")
+                end
+                local greeting = greetingSpeech:Format()
                 Log.Info("WORLD ENTRY: " .. greeting)
                 Ext.Tolk.Speak(greeting, true)
             end
@@ -294,8 +305,10 @@ local function HandleTickSnapshot(snapshot)
                     and not visualText:match("^%d+%%?$")
                     and not spokenLoadingTips[visualText] then
                     spokenLoadingTips[visualText] = true
+                    local tipSpeech = Helpers.CreateSpeechData()
+                    tipSpeech:Add("loadingTip", visualText, "normal")
                     Log.Info("LOADING TIP: " .. visualText)
-                    Ext.Tolk.Speak(visualText, false)
+                    Ext.Tolk.Speak(tipSpeech:Format(), false)
                 end
             end
         end
@@ -340,8 +353,10 @@ local function HandleTickSnapshot(snapshot)
         local speech = Helpers.StripMarkupTags(table.concat(parts, " | "))
         if speech ~= "" and speech ~= exploreLastSpoken then
             exploreLastSpoken = speech
+            local exploreSpeech = Helpers.CreateSpeechData()
+            exploreSpeech:Add("exploreInfo", speech, "brief")
             Log.Info("EXPLORE: " .. speech)
-            Ext.Tolk.Speak(speech, true)
+            Ext.Tolk.Speak(exploreSpeech:Format(), true)
         end
         return
     end
@@ -540,7 +555,9 @@ function BG3Access.Client.ToggleExploreMode()
     debugExploreMode = not debugExploreMode
     local modeState = debugExploreMode and "ON" or "OFF"
     Log.Info("Explore mode: " .. modeState)
-    Ext.Tolk.Speak("Explore mode " .. modeState, true)
+    local modeSpeech = Helpers.CreateSpeechData()
+    modeSpeech:Add("exploreToggle", "Explore mode " .. modeState, "brief")
+    Ext.Tolk.Speak(modeSpeech:Format(), true)
 end
 
 local exploreComboState = { leftStickHeld = false, rightStickHeld = false }

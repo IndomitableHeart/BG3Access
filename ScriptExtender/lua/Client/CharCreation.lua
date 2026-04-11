@@ -1137,8 +1137,12 @@ local function SpeakNamingScreen()
     ccState.lastMainTab = "Naming"
     namingScreenWasSpoken = true
 
-    local speech = "Enter Character Name. " .. characterName
-        .. ". Press A to rename. Press Y to choose guardian"
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("namingTitle", "Enter Character Name", "brief")
+    speechData:Add("characterName", characterName, "brief")
+    speechData:Add("namingHint",
+        "Press A to rename. Press Y to choose guardian", "normal")
+    local speech = speechData:Format()
     Log.Info("NAMING SCREEN: " .. speech)
     Ext.Tolk.Speak(speech, true)
     ccState.lastSpokenFullText = speech
@@ -1294,8 +1298,10 @@ local function HandleCCSnapshot(snapshot)
         if instruction then
             if ccState.activeInstruction ~= focusedElement.elemName then
                 ccState.activeInstruction = focusedElement.elemName
+                local instructionSpeech = Helpers.CreateSpeechData()
+                instructionSpeech:Add("instruction", instruction, "brief")
                 Log.Info("CC INSTRUCTION: " .. focusedElement.elemName)
-                Ext.Tolk.Speak(instruction, true)
+                Ext.Tolk.Speak(instructionSpeech:Format(), true)
             end
             return
         else
@@ -1442,6 +1448,7 @@ local function HandleCCSnapshot(snapshot)
     -- =================================================================
     if isCarouselOnly then
         local carouselValue = snapshot.inlineCarouselValue
+        local carouselDescription = nil
 
         -- Append description via StaticData API for tabs that have one.
         local effectiveTab = ccState.lastMainTab or ccState.lastSpokenTab
@@ -1459,16 +1466,23 @@ local function HandleCCSnapshot(snapshot)
             local carouselDesc = GetGodObjectDescription(
                 focusedElement.dcProps, effectiveTab, carouselValue)
             if carouselDesc and carouselDesc ~= "" then
-                carouselValue = carouselValue .. ". " .. carouselDesc
+                carouselDescription = carouselDesc
             end
         end
 
         if carouselValue ~= ccState.lastSpokenFullText then
-            ccState.lastSpokenFullText = carouselValue
             ccState.lastSpokenName = elemId
             ccState.lastCarouselTick = Ext.Utils.MonotonicTime()
-                    Log.Info("CAROUSEL: " .. carouselValue)
-            Ext.Tolk.Speak(carouselValue, true)
+            local carouselSpeech = Helpers.CreateSpeechData()
+            carouselSpeech:Add("carouselValue", carouselValue, "brief")
+            if carouselDescription then
+                carouselSpeech:Add("carouselDesc",
+                    carouselDescription, "normal")
+            end
+            local carouselFormatted = carouselSpeech:Format()
+            ccState.lastSpokenFullText = carouselFormatted
+            Log.Info("CAROUSEL: " .. carouselFormatted)
+            Ext.Tolk.Speak(carouselFormatted, true)
         end
         return
     end
@@ -1494,28 +1508,31 @@ local function HandleCCSnapshot(snapshot)
         -- Slider settings: speak only the changing number, not the name.
         -- The name was already spoken when focus arrived (isItemNav path).
         -- Repeating it on every left/right press is too verbose.
-        local fullText
+        local valueSpeech = Helpers.CreateSpeechData()
         if focusedElement.dcType == "gui::VMSliderSetting"
             and valueValue and valueValue ~= "" then
-            fullText = valueValue
+            valueSpeech:Add("itemValue", valueValue, "brief")
         else
-            local parts = {}
             if valueName and valueName ~= "" then
-                table.insert(parts, (valueName:gsub("%s+$", "")))
+                valueSpeech:Add("itemName",
+                    Helpers.StripMarkupTags(
+                        valueName:gsub("%s+$", "")), "brief")
             end
             if valueValue and valueValue ~= "" then
-                table.insert(parts, (valueValue:gsub("%s+$", "")))
+                valueSpeech:Add("itemValue",
+                    Helpers.StripMarkupTags(
+                        valueValue:gsub("%s+$", "")), "brief")
             end
             if valueDescription and valueDescription ~= "" then
-                table.insert(parts, (valueDescription:gsub("%s+$", "")))
+                valueSpeech:Add("itemDesc",
+                    Helpers.StripMarkupTags(
+                        valueDescription:gsub("%s+$", "")), "verbose")
             end
-            fullText = table.concat(parts, ". ")
         end
 
-        -- Strip markup for comparison and speech so raw LSTag text
-        -- doesn't bypass dedup against the already-spoken stripped version.
-        fullText = Helpers.StripMarkupTags(fullText)
-        if fullText ~= "" and fullText ~= ccState.lastSpokenFullText then
+        local fullText = valueSpeech:Format()
+        if fullText and fullText ~= ""
+            and fullText ~= ccState.lastSpokenFullText then
             ccState.lastSpokenFullText = fullText
             ccState.lastSpokenName = elemId
             if valueName and valueName ~= "" then
@@ -1877,8 +1894,10 @@ local function HandleCCSnapshot(snapshot)
         ccState.lastSpokenFullText = itemValue
         ccState.lastSpokenName = elemId
         ccState.lastSpokenItemName = itemName
-            Log.Info("VALUE CYCLE: " .. itemValue)
-        Ext.Tolk.Speak(itemValue, true)
+        local cycleSpeech = Helpers.CreateSpeechData()
+        cycleSpeech:Add("cycleValue", itemValue, "brief")
+        Log.Info("VALUE CYCLE: " .. itemValue)
+        Ext.Tolk.Speak(cycleSpeech:Format(), true)
         return
     end
 

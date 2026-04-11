@@ -569,6 +569,23 @@ local function GetCameraEntity()
     return nil
 end
 
+--- Check if the player entity is in turn-based combat.
+--- In combat the left stick moves a targeting cursor, not the character,
+--- so GPS pathfinding and navigation are meaningless.
+---
+--- CombatParticipant always exists on player characters.  Outside combat
+--- CombatHandle is nil and InitiativeRoll is -100.  In active combat
+--- CombatHandle is a non-nil Entity userdata.
+local function IsInCombat(playerEntity)
+    if not playerEntity then return false end
+    local ok, inCombat = pcall(function()
+        local participant = playerEntity.CombatParticipant
+        if not participant then return false end
+        return participant.CombatHandle ~= nil
+    end)
+    return ok and inCombat
+end
+
 --- Resolve a TranslatedString to a plain Lua string.
 --- TranslatedString userdata has .Handle.Handle containing the loca key.
 local function ResolveTranslatedString(translatedString)
@@ -2112,14 +2129,50 @@ local GPS_HAZARD_WARNING_M    = 12.0
 --- pathfinder actually aimed for -- tight (~1.5m, interaction
 --- range) when a walkable tile exists that close, loose (~3.5m,
 --- BG3's default move-to range) when it does not.
+-- Minimum player movement (meters) before recomputing the path.
+-- BeginPathfindingImmediate is a synchronous A* call that takes 8-12ms,
+-- so running it every 300ms tick wastes CPU and floods the log with
+-- BG3SE timing warnings.  1.0m is enough to detect meaningful position
+-- changes while skipping idle ticks where the player is standing still
+-- or barely drifting.
+local GPS_RECOMPUTE_MOVEMENT_M = 1.0
+
+-- Position of the player at the last path recompute.
+local lastRecomputePosition = nil
+
 local function RecalculatePath(playerPosition)
     if not trackingTarget then return end
+
+    -- Skip recompute if the player has not moved significantly since
+    -- the last one.  Always recompute on the very first tick
+    -- (lastRecomputePosition is nil) and when the target entity has
+    -- moved (NPC targets can reposition between ticks).
+    local targetMoved = false
     local playerEntity = GetPlayerEntity()
     if not playerEntity then return end
     local refreshedPosition = GetEntityPosition(trackingTarget.entity)
     if refreshedPosition then
+        if trackingTarget.position then
+            local targetDelta = DistanceXZ(
+                refreshedPosition, trackingTarget.position)
+            if targetDelta >= GPS_RECOMPUTE_MOVEMENT_M then
+                targetMoved = true
+            end
+        end
         trackingTarget.position = refreshedPosition
     end
+
+    if lastRecomputePosition and not targetMoved then
+        local playerDelta = DistanceXZ(
+            playerPosition, lastRecomputePosition)
+        if playerDelta < GPS_RECOMPUTE_MOVEMENT_M then
+            return  -- no significant movement, skip expensive pathfind
+        end
+    end
+
+    lastRecomputePosition = {
+        playerPosition[1], playerPosition[2], playerPosition[3]
+    }
     local path, threshold = ComputePath(
         playerEntity, playerPosition, trackingTarget.position)
     currentPath = path
@@ -2619,8 +2672,10 @@ local function UpdateTrackingState(playerPosition)
             Log.Info(string.format(
                 "GPS: no path to %s", trackingTarget.name))
             if not noPathAnnounced then
-                Ext.Tolk.Speak(
-                    "No path to " .. trackingTarget.name, true)
+                local noPathSpeech = Helpers.CreateSpeechData()
+                noPathSpeech:Add("gpsStatus",
+                    "No path to " .. trackingTarget.name, "brief")
+                Ext.Tolk.Speak(noPathSpeech:Format(), true)
                 noPathAnnounced = true
             end
         end
@@ -2783,9 +2838,11 @@ local function UpdateTrackingState(playerPosition)
             Log.Info(string.format(
                 "GPS: hazard ahead -- %s at %.1fm",
                 hazardText, hazardDistance))
-            Ext.Tolk.Speak(
-                "Stop. " .. hazardText .. " "
-                    .. distanceRounded .. " meters ahead", true)
+            local hazardSpeech = Helpers.CreateSpeechData()
+            hazardSpeech:Add("hazardWarning", "Stop", "brief")
+            hazardSpeech:Add("hazardDetail", hazardText .. " "
+                .. distanceRounded .. " meters ahead", "brief")
+            Ext.Tolk.Speak(hazardSpeech:Format(), true)
         end
         lastHazardAnnouncedLabel = hazardLabel
         -- Reset stability counter: the 12m-window warning says
@@ -2894,9 +2951,11 @@ local function UpdateTrackingState(playerPosition)
                                     .. "(was %.1fm, now %.1fm)",
                                 hazardClearTickCount, lengthDelta,
                                 lastPathLength, newPathLength))
-                            Ext.Tolk.Speak(
+                            local rerouteSpeech = Helpers.CreateSpeechData()
+                            rerouteSpeech:Add("rerouteInfo",
                                 "Rerouting around " .. hazardText
-                                    .. directionText, true)
+                                    .. directionText, "brief")
+                            Ext.Tolk.Speak(rerouteSpeech:Format(), true)
                             -- Reset the guidance movement baseline
                             -- so subsequent throttled guidance
                             -- measures from the announcement point,
@@ -2984,7 +3043,9 @@ local function SpeakTrackingGuidance(playerPosition)
         .. " guide=" .. clockHour .. "h" .. moveInfo
         .. " nodes=" .. #currentPath)
 
-    Ext.Tolk.Speak(guidance, true)
+    local guidanceSpeech = Helpers.CreateSpeechData()
+    guidanceSpeech:Add("gpsGuidance", guidance, "brief")
+    Ext.Tolk.Speak(guidanceSpeech:Format(), true)
 end
 
 -- ============================================================================
@@ -3065,7 +3126,9 @@ local function ProcessProximityUpdate(playerPosition)
                 -- tier 2 on the way out.
                 tier2Latched[entry.entityKey] = true
                 Log.Info("Proximity Tier 1: " .. entry.name)
-                Ext.Tolk.Speak(entry.name, false)
+                local proxSpeech = Helpers.CreateSpeechData()
+                proxSpeech:Add("entityName", entry.name, "brief")
+                Ext.Tolk.Speak(proxSpeech:Format(), false)
             end
         elseif distance > GPS_PROXIMITY_TIER1_EXIT_M
             and distance <= GPS_PROXIMITY_TIER2_ENTER_M then
@@ -3083,7 +3146,15 @@ local function ProcessProximityUpdate(playerPosition)
                     table.insert(
                         parts, clockHour .. " o'clock")
                 end
-                local speech = table.concat(parts, ". ")
+                local proxSpeech2 = Helpers.CreateSpeechData()
+                proxSpeech2:Add("entityName", entry.name, "brief")
+                proxSpeech2:Add("distance",
+                    distanceRounded .. " meters", "brief")
+                if clockHour then
+                    proxSpeech2:Add("direction",
+                        clockHour .. " o'clock", "normal")
+                end
+                local speech = proxSpeech2:Format()
                 Log.Info("Proximity Tier 2: " .. speech)
                 Ext.Tolk.Speak(speech, false)
             end
@@ -3145,6 +3216,7 @@ local function ClearGPSState()
     blockedAnnounced = false
     lastHazardAnnouncedLabel = nil
     lastPathLength = 0
+    lastRecomputePosition = nil
     lastLoggedDetourLabel = nil
     lastLoggedPathHazardKey = nil
     hazardClearTickCount = 0
@@ -3159,7 +3231,9 @@ local function EnterOffMode()
     gpsMode = GPS_MODE_OFF
     ClearGPSState()
     Log.Info("GPS: Off")
-    Ext.Tolk.Speak("GPS off", true)
+    local offSpeech = Helpers.CreateSpeechData()
+    offSpeech:Add("gpsStatus", "GPS off", "brief")
+    Ext.Tolk.Speak(offSpeech:Format(), true)
 end
 
 --- Enter Exploration mode: proximity announcements for nearby entities.
@@ -3181,7 +3255,9 @@ function EnterExplorationMode(introText)
     tier2Latched = {}
     lastProximityPosition = nil
     Log.Info("GPS: Exploration mode")
-    Ext.Tolk.Speak(introText or "Exploration mode", true)
+    local exploSpeech = Helpers.CreateSpeechData()
+    exploSpeech:Add("gpsStatus", introText or "Exploration mode", "brief")
+    Ext.Tolk.Speak(exploSpeech:Format(), true)
 
     -- Immediate proximity scan.
     local playerEntity = GetPlayerEntity()
@@ -3240,6 +3316,15 @@ end
 
 --- Cycle GPS mode: Off -> Exploration -> Routing -> Off.
 local function CycleGPSMode()
+    -- GPS is disabled during combat: the left stick moves a targeting
+    -- cursor, not the character, so navigation is meaningless.
+    if IsInCombat(GetPlayerEntity()) then
+        local combatSpeech = Helpers.CreateSpeechData()
+        combatSpeech:Add("gpsStatus",
+            "GPS not available in combat", "brief")
+        Ext.Tolk.Speak(combatSpeech:Format(), true)
+        return
+    end
     if gpsMode == GPS_MODE_OFF then
         EnterExplorationMode()
     elseif gpsMode == GPS_MODE_EXPLORATION then
@@ -3257,12 +3342,24 @@ local function StartTracking(targetEntry)
 
     local playerEntity = GetPlayerEntity()
     if not playerEntity then
-        Ext.Tolk.Speak("Cannot find player", true)
+        local noPlayerSpeech = Helpers.CreateSpeechData()
+        noPlayerSpeech:Add("gpsError", "Cannot find player", "brief")
+        Ext.Tolk.Speak(noPlayerSpeech:Format(), true)
+        return
+    end
+    if IsInCombat(playerEntity) then
+        local combatSpeech = Helpers.CreateSpeechData()
+        combatSpeech:Add("gpsStatus",
+            "GPS not available in combat", "brief")
+        Ext.Tolk.Speak(combatSpeech:Format(), true)
+        Log.Info("GPS: tracking blocked (in combat)")
         return
     end
     local playerPosition = GetEntityPosition(playerEntity)
     if not playerPosition then
-        Ext.Tolk.Speak("Cannot get position", true)
+        local noPosSpeech = Helpers.CreateSpeechData()
+        noPosSpeech:Add("gpsError", "Cannot get position", "brief")
+        Ext.Tolk.Speak(noPosSpeech:Format(), true)
         return
     end
 
@@ -3284,6 +3381,7 @@ local function StartTracking(targetEntry)
     blockedAnnounced = false
     lastHazardAnnouncedLabel = nil
     lastPathLength = 0
+    lastRecomputePosition = nil
     lastLoggedDetourLabel = nil
     lastLoggedPathHazardKey = nil
     hazardClearTickCount = 0
@@ -3300,8 +3398,13 @@ local function StartTracking(targetEntry)
     local distanceRounded = math.floor(distanceToTarget + 0.5)
 
     if not currentPath then
-        Ext.Tolk.Speak("Tracking " .. trackingTarget.name .. ". "
-            .. distanceRounded .. " meters. No path", true)
+        local noPathTrackSpeech = Helpers.CreateSpeechData()
+        noPathTrackSpeech:Add("trackingTarget",
+            "Tracking " .. trackingTarget.name, "brief")
+        noPathTrackSpeech:Add("distance",
+            distanceRounded .. " meters", "brief")
+        noPathTrackSpeech:Add("pathStatus", "No path", "brief")
+        Ext.Tolk.Speak(noPathTrackSpeech:Format(), true)
         Log.Info("GPS: Tracking " .. trackingTarget.name
             .. " (" .. distanceRounded .. "m, no path)")
         -- StartTracking owns the initial no-path announcement;
@@ -3362,9 +3465,18 @@ local function StartTracking(targetEntry)
             end
         end
 
-        Ext.Tolk.Speak("Tracking " .. trackingTarget.name .. ". "
-            .. distanceRounded .. " meters" .. directionText
-            .. hazardText, true)
+        local trackSpeech = Helpers.CreateSpeechData()
+        trackSpeech:Add("trackingTarget",
+            "Tracking " .. trackingTarget.name, "brief")
+        trackSpeech:Add("distance",
+            distanceRounded .. " meters", "brief")
+        if directionText ~= "" then
+            trackSpeech:Add("direction", directionText, "brief")
+        end
+        if hazardText ~= "" then
+            trackSpeech:Add("hazardWarning", hazardText, "normal")
+        end
+        Ext.Tolk.Speak(trackSpeech:Format(), true)
         Log.Info("GPS: Tracking " .. trackingTarget.name
             .. " (" .. distanceRounded .. "m, "
             .. #currentPath .. " nodes"
@@ -3420,7 +3532,9 @@ local function AnnounceCurrentListItem(playerPosition)
     local speech = FormatEntitySpeech(playerPosition, entry)
     Log.Info("List [" .. categoryName .. " "
         .. currentItemIndex .. "/" .. #entities .. "]: " .. speech)
-    Ext.Tolk.Speak(speech, true)
+    local listSpeech = Helpers.CreateSpeechData()
+    listSpeech:Add("listItem", speech, "brief")
+    Ext.Tolk.Speak(listSpeech:Format(), true)
 end
 
 --- Announce category name then first item in a single speech.
@@ -3445,20 +3559,26 @@ local function AnnounceCategorySwitch(playerPosition, prefix)
 
     if #entities == 0 then
         Log.Info("List [" .. categoryName .. "]: empty")
-        Ext.Tolk.Speak(
-            prefixText .. categoryName .. ". None.", true)
+        local emptySpeech = Helpers.CreateSpeechData()
+        if prefixText ~= "" then
+            emptySpeech:Add("prefix", prefix, "brief")
+        end
+        emptySpeech:Add("category", categoryName, "brief")
+        emptySpeech:Add("emptyStatus", "None", "brief")
+        Ext.Tolk.Speak(emptySpeech:Format(), true)
     else
         local firstEntry = entities[1]
         local itemSpeech = FormatEntitySpeech(
             playerPosition, firstEntry)
         Log.Info("List [" .. categoryName .. " 1/"
             .. #entities .. "]: " .. itemSpeech)
-        -- Single combined speech: "prefix. Category. First item,
-        -- N meters."  Keeps the full announcement on one
-        -- interrupt so Tolk does not chop the category line.
-        Ext.Tolk.Speak(
-            prefixText .. categoryName .. ". " .. itemSpeech,
-            true)
+        local catSpeech = Helpers.CreateSpeechData()
+        if prefixText ~= "" then
+            catSpeech:Add("prefix", prefix, "brief")
+        end
+        catSpeech:Add("category", categoryName, "brief")
+        catSpeech:Add("firstItem", itemSpeech, "brief")
+        Ext.Tolk.Speak(catSpeech:Format(), true)
     end
 end
 
@@ -3467,12 +3587,16 @@ end
 function OpenEntityList(prefix)
     local playerEntity = GetPlayerEntity()
     if not playerEntity then
-        Ext.Tolk.Speak("Cannot find player", true)
+        local noPlayerSpeech = Helpers.CreateSpeechData()
+        noPlayerSpeech:Add("gpsError", "Cannot find player", "brief")
+        Ext.Tolk.Speak(noPlayerSpeech:Format(), true)
         return
     end
     local playerPosition = GetEntityPosition(playerEntity)
     if not playerPosition then
-        Ext.Tolk.Speak("Cannot get position", true)
+        local noPosSpeech = Helpers.CreateSpeechData()
+        noPosSpeech:Add("gpsError", "Cannot get position", "brief")
+        Ext.Tolk.Speak(noPosSpeech:Format(), true)
         return
     end
 
@@ -3552,7 +3676,10 @@ local function EntityListSelect()
     if not entityListOpen then return end
     local entities = GetCurrentCategoryEntities()
     if #entities == 0 then
-        Ext.Tolk.Speak("Nothing to select", true)
+        local emptySelectSpeech = Helpers.CreateSpeechData()
+        emptySelectSpeech:Add("listStatus",
+            "Nothing to select", "brief")
+        Ext.Tolk.Speak(emptySelectSpeech:Format(), true)
         return
     end
     local entry = entities[currentItemIndex]
@@ -3581,6 +3708,28 @@ local function OnTick()
 
     if not previousPosition then return end
     if gpsMode == GPS_MODE_OFF then return end
+
+    -- GPS is fully disabled during combat.  If the player entered
+    -- combat while GPS was active, silently skip all processing.
+    -- No announcement here: CycleGPSMode and StartTracking already
+    -- gate with a spoken message.  The tracking-target combat cancel
+    -- below handles the auto-cancel announcement.
+    if IsInCombat(playerEntity) then
+        -- If there was an active tracking target, cancel it once.
+        if trackingTarget then
+            Log.Info("GPS: cancelling tracking (entered combat)")
+            local cancelSpeech = Helpers.CreateSpeechData()
+            cancelSpeech:Add("gpsStatus",
+                "GPS cancelled, in combat", "brief")
+            Ext.Tolk.Speak(cancelSpeech:Format(), true)
+            trackingTarget = nil
+            currentPath = nil
+            stuckTickCount = 0
+            stuckLastDistance = nil
+            blockedAnnounced = false
+        end
+        return
+    end
 
     -- Routing mode with active target.  Work split:
     --   UpdateTrackingState: runs every tick.  Silent.  Recomputes
@@ -3668,7 +3817,10 @@ local function OnTick()
                             "GPS: stuck (%d ticks, dist=%.2f)",
                             stuckTickCount,
                             currentDistanceToTarget))
-                        Ext.Tolk.Speak("Path blocked", true)
+                        local blockedSpeech = Helpers.CreateSpeechData()
+                        blockedSpeech:Add("gpsStatus",
+                            "Path blocked", "brief")
+                        Ext.Tolk.Speak(blockedSpeech:Format(), true)
                         blockedAnnounced = true
                     end
                 end
@@ -3709,6 +3861,7 @@ local function OnTick()
     blockedAnnounced = false
     lastHazardAnnouncedLabel = nil
     lastPathLength = 0
+    lastRecomputePosition = nil
     lastLoggedDetourLabel = nil
     lastLoggedPathHazardKey = nil
     hazardClearTickCount = 0
@@ -3792,16 +3945,26 @@ local function SpeakCharacterInfo()
         end
     end
 
-    -- Build speech string.
-    local parts = {}
-    if characterName ~= "" then parts[#parts + 1] = characterName end
-    if characterInfo ~= "" then parts[#parts + 1] = characterInfo end
-    if hpText ~= "" then parts[#parts + 1] = hpText end
+    -- Build speech via SpeechData.
+    local charSpeech = Helpers.CreateSpeechData()
+    if characterName ~= "" then
+        charSpeech:Add("characterName", characterName, "brief")
+    end
+    if characterInfo ~= "" then
+        charSpeech:Add("characterInfo", characterInfo, "normal")
+    end
+    if hpText ~= "" then
+        charSpeech:Add("hp", hpText, "brief")
+    end
 
-    if #parts > 0 then
-        Ext.Tolk.Speak(table.concat(parts, ". "), true)
+    local charFormatted = charSpeech:Format()
+    if charFormatted then
+        Ext.Tolk.Speak(charFormatted, true)
     else
-        Ext.Tolk.Speak("No character info available", true)
+        local noCharSpeech = Helpers.CreateSpeechData()
+        noCharSpeech:Add("hudStatus",
+            "No character info available", "brief")
+        Ext.Tolk.Speak(noCharSpeech:Format(), true)
     end
 end
 
@@ -3816,14 +3979,21 @@ local function SpeakTargetInfo()
         actionText = hudInfo.actionText or ""
     end
 
-    local parts = {}
-    if targetName ~= "" then parts[#parts + 1] = targetName end
-    if actionText ~= "" then parts[#parts + 1] = actionText end
+    local targetSpeech = Helpers.CreateSpeechData()
+    if targetName ~= "" then
+        targetSpeech:Add("targetName", targetName, "brief")
+    end
+    if actionText ~= "" then
+        targetSpeech:Add("actionText", actionText, "normal")
+    end
 
-    if #parts > 0 then
-        Ext.Tolk.Speak(table.concat(parts, ". "), true)
+    local targetFormatted = targetSpeech:Format()
+    if targetFormatted then
+        Ext.Tolk.Speak(targetFormatted, true)
     else
-        Ext.Tolk.Speak("No target", true)
+        local noTargetSpeech = Helpers.CreateSpeechData()
+        noTargetSpeech:Add("hudStatus", "No target", "brief")
+        Ext.Tolk.Speak(noTargetSpeech:Format(), true)
     end
 end
 
@@ -3832,7 +4002,9 @@ end
 local function SpeakActionResources()
     local playerEntity = GetPlayerEntity()
     if not playerEntity then
-        Ext.Tolk.Speak("No character found", true)
+        local noCharSpeech = Helpers.CreateSpeechData()
+        noCharSpeech:Add("hudStatus", "No character found", "brief")
+        Ext.Tolk.Speak(noCharSpeech:Format(), true)
         return
     end
 
@@ -3874,9 +4046,16 @@ local function SpeakActionResources()
     end)
 
     if #parts > 0 then
-        Ext.Tolk.Speak(table.concat(parts, ". "), true)
+        local resourceSpeech = Helpers.CreateSpeechData()
+        for _, resourcePart in ipairs(parts) do
+            resourceSpeech:Add("resource", resourcePart, "brief")
+        end
+        Ext.Tolk.Speak(resourceSpeech:Format(), true)
     else
-        Ext.Tolk.Speak("No action resources available", true)
+        local noResourceSpeech = Helpers.CreateSpeechData()
+        noResourceSpeech:Add("hudStatus",
+            "No action resources available", "brief")
+        Ext.Tolk.Speak(noResourceSpeech:Format(), true)
     end
 end
 
@@ -4003,7 +4182,9 @@ local function OnControllerButton(event)
     elseif buttonName == "B" then
         event:PreventAction()
         CloseEntityList()
-        Ext.Tolk.Speak("List closed", true)
+        local closeSpeech = Helpers.CreateSpeechData()
+        closeSpeech:Add("listStatus", "List closed", "brief")
+        Ext.Tolk.Speak(closeSpeech:Format(), true)
     end
 end
 
@@ -4073,6 +4254,7 @@ local function ResetState()
     blockedAnnounced = false
     lastHazardAnnouncedLabel = nil
     lastPathLength = 0
+    lastRecomputePosition = nil
     lastLoggedDetourLabel = nil
     lastLoggedPathHazardKey = nil
     hazardClearTickCount = 0

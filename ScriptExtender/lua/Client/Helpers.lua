@@ -1325,7 +1325,7 @@ end
 --- range label+feet).
 --- @param widgetTexts table  Raw text array from C++ ReadWidgetTextBlocks.
 --- @param filterTitle string|nil  Title to filter (handler already spoke it).
---- @return string|nil  Formatted speech string or nil.
+--- @return table|nil  SpeechData object with tier annotations, or nil.
 local function FormatInspectTexts(widgetTexts, filterTitle)
     if not widgetTexts or #widgetTexts == 0 then return nil end
 
@@ -1504,17 +1504,30 @@ local function FormatInspectTexts(widgetTexts, filterTitle)
         attackPhrase = table.concat(attackDetails, ", ")
     end
 
-    -- Final assembly.
-    local parts = {}
-    if damagePhrase then table.insert(parts, damagePhrase) end
-    if rangePhrase then table.insert(parts, rangePhrase) end
-    if attackPhrase then table.insert(parts, attackPhrase) end
-    for _, entry in ipairs(costParts) do table.insert(parts, entry) end
-    for _, entry in ipairs(cooldownParts) do table.insert(parts, entry) end
-    for _, entry in ipairs(categoryParts) do table.insert(parts, entry) end
+    -- Final assembly via SpeechData.
+    local speechData = CreateSpeechData()
+    speechData:Add("inspectLabel", "Inspect", "brief")
+    if damagePhrase then
+        speechData:Add("damage", damagePhrase, "brief")
+    end
+    if rangePhrase then
+        speechData:Add("range", rangePhrase, "brief")
+    end
+    if attackPhrase then
+        speechData:Add("attack", attackPhrase, "brief")
+    end
+    for _, entry in ipairs(costParts) do
+        speechData:Add("cost", entry, "normal")
+    end
+    for _, entry in ipairs(cooldownParts) do
+        speechData:Add("cooldown", entry, "normal")
+    end
+    for _, entry in ipairs(categoryParts) do
+        speechData:Add("category", entry, "verbose")
+    end
 
-    if #parts == 0 then return nil end
-    return "Inspect. " .. table.concat(parts, ". ")
+    if #speechData.fields <= 1 then return nil end  -- only "Inspect" label
+    return speechData
 end
 
 -- ---------------------------------------------------------------------------
@@ -1550,7 +1563,17 @@ local function FormatFullTooltip(tooltipTexts)
                         local normalizedKey = cleaned:lower()
                         if not seen[normalizedKey] then
                             seen[normalizedKey] = true
-                            speechData:Add("detail", cleaned, "normal")
+                            -- Short texts without sentence structure
+                            -- are effects or labels (normal tier).
+                            -- Long texts with periods are descriptions
+                            -- (verbose tier).
+                            if #cleaned > 40 then
+                                speechData:Add("description",
+                                    cleaned, "verbose")
+                            else
+                                speechData:Add("effect",
+                                    cleaned, "normal")
+                            end
                         end
                     end
                 end

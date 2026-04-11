@@ -169,7 +169,14 @@ function BG3Access.Client.CycleLogLevel()
     currentLevel = (currentLevel + 1) % 3
     local levelName = LOG_LEVEL_NAMES[currentLevel]
     Ext.Utils.Print("[BG3Access] Log level: " .. levelName)
-    Ext.Tolk.Speak("Log level " .. levelName, true)
+    local Helpers = BG3Access.Client.Helpers
+    if Helpers and Helpers.CreateSpeechData then
+        local speechData = Helpers.CreateSpeechData()
+        speechData:Add("logLevel", "Log level " .. levelName, "brief")
+        Ext.Tolk.Speak(speechData:Format(), true)
+    else
+        Ext.Tolk.Speak("Log level " .. levelName, true)
+    end
 end
 
 -- Export constants for external use.

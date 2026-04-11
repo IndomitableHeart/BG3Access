@@ -81,7 +81,11 @@ local detailViewButtonSubscription  = nil   -- ControllerButtonInput handle
 local function SpeakDetailItem()
     if not detailViewList or not detailViewList[detailViewIndex] then return end
     local entry = detailViewList[detailViewIndex]
-    local speech = entry.label .. ": " .. entry.value
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("detailLabel", entry.label, "brief")
+    speechData:Add("detailValue", entry.value, "brief")
+    local speech = speechData:Format()
+    if not speech then return end
     Log.Info("DETAIL [" .. detailViewIndex .. "/" .. #detailViewList
         .. "]: " .. speech)
     Ext.Tolk.Speak(speech, true)
@@ -115,7 +119,9 @@ local function CloseDetailView(silent)
     detailViewIndex = 1
     if not silent then
         Log.Info("DETAIL VIEW: closed")
-        Ext.Tolk.Speak("Detail view closed", true)
+        local speechData = Helpers.CreateSpeechData()
+        speechData:Add("detailStatus", "Detail view closed", "brief")
+        Ext.Tolk.Speak(speechData:Format(), true)
     else
         Log.Info("DETAIL VIEW: closed (silent)")
     end
@@ -166,7 +172,9 @@ local function HandleDetailViewToggle()
         return false
     end
     if not builtList or #builtList == 0 then
-        Ext.Tolk.Speak("No details available", true)
+        local noDetailsSpeech = Helpers.CreateSpeechData()
+        noDetailsSpeech:Add("detailStatus", "No details available", "brief")
+        Ext.Tolk.Speak(noDetailsSpeech:Format(), true)
         return true  -- handled: panel is active, just no details for this element
     end
 
@@ -207,8 +215,11 @@ local function HandleDetailViewToggle()
 
     -- Announce entry and speak first item.
     local firstEntry = detailViewList[1]
-    local openSpeech = "Detail view. " .. firstEntry.label
-        .. ": " .. firstEntry.value
+    local openSpeechData = Helpers.CreateSpeechData()
+    openSpeechData:Add("detailStatus", "Detail view", "brief")
+    openSpeechData:Add("detailLabel", firstEntry.label, "brief")
+    openSpeechData:Add("detailValue", firstEntry.value, "brief")
+    local openSpeech = openSpeechData:Format()
     Log.Info("DETAIL VIEW: opened with " .. #detailViewList .. " items")
     Ext.Tolk.Speak(openSpeech, true)
     return true
@@ -499,12 +510,13 @@ local function HandleRadialOpen()
     if inRadial then return end
     inRadial = true
 
-    local parts = { "Action Radial" }
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("radialTitle", "Action Radial", "brief")
     if not radialHintSpoken then
         radialHintSpoken = true
-        table.insert(parts, RADIAL_HINT)
+        speechData:Add("radialHint", RADIAL_HINT, "normal")
     end
-    local speech = table.concat(parts, ". ")
+    local speech = speechData:Format()
     Log.Info("RADIAL OPEN: " .. speech)
     Ext.Tolk.Speak(speech, true)
 end
@@ -572,15 +584,20 @@ local function ProcessTooltip(snapshot)
     -- Diff against handler's SpeechData: remove fields already spoken.
     -- Panel handlers store SpeechData via GetLastSpeechData; the radial
     -- (not a panel handler) stores it in lastRadialSpeechData.
-    local handlerData = nil
-    if activePanelHandler and activePanelHandler.GetLastSpeechData then
-        handlerData = activePanelHandler.GetLastSpeechData()
-    end
-    if not handlerData then
-        handlerData = lastRadialSpeechData
-    end
-    if handlerData then
-        tooltipData = tooltipData:Diff(handlerData)
+    -- Handlers can set tooltipData.skipDiff = true to bypass the Diff
+    -- (e.g., Examine tooltips where the item name naturally overlaps
+    -- the tooltip title but both should be spoken).
+    if not tooltipData.skipDiff then
+        local handlerData = nil
+        if activePanelHandler and activePanelHandler.GetLastSpeechData then
+            handlerData = activePanelHandler.GetLastSpeechData()
+        end
+        if not handlerData then
+            handlerData = lastRadialSpeechData
+        end
+        if handlerData then
+            tooltipData = tooltipData:Diff(handlerData)
+        end
     end
 
     -- Format to string for speech and multi-wave dedup.
@@ -695,23 +712,29 @@ local function SpeakInspectData()
     local readOk, widgetTexts = pcall(
         Ext.UI.ReadWidgetTextBlocks, "PinnedTooltips_c")
     if readOk and widgetTexts and #widgetTexts > 0 then
-        local inspectSpeech = Helpers.FormatInspectTexts(
+        local inspectData = Helpers.FormatInspectTexts(
             widgetTexts, lastSpokenRadialTitle)
-        if inspectSpeech then
-            Log.Info("INSPECT (widget): " .. inspectSpeech)
-            Ext.Tolk.Speak(inspectSpeech, true)
-            return true
+        if inspectData then
+            local inspectSpeech = inspectData:Format()
+            if inspectSpeech then
+                Log.Info("INSPECT (widget): " .. inspectSpeech)
+                Ext.Tolk.Speak(inspectSpeech, true)
+                return true
+            end
         end
     end
 
     -- Fallback: use stored tooltip texts if widget read failed.
     if lastRawTooltipTexts and #lastRawTooltipTexts > 0 then
-        local inspectSpeech = Helpers.FormatInspectTexts(
+        local inspectData = Helpers.FormatInspectTexts(
             lastRawTooltipTexts, lastSpokenRadialTitle)
-        if inspectSpeech then
-            Log.Info("INSPECT (fallback): " .. inspectSpeech)
-            Ext.Tolk.Speak(inspectSpeech, true)
-            return true
+        if inspectData then
+            local inspectSpeech = inspectData:Format()
+            if inspectSpeech then
+                Log.Info("INSPECT (fallback): " .. inspectSpeech)
+                Ext.Tolk.Speak(inspectSpeech, true)
+                return true
+            end
         end
     end
 
@@ -819,10 +842,9 @@ local function CreatePanelHandler(config)
             local updateText = widgetBody or widgetActions
             if updateText and updateText ~= ""
                 and updateText ~= handlerState.lastSpokenFullText then
-                handlerState.lastSpokenFullText = updateText
-                Log.Info("WIDGET UPDATE [" .. config.name .. "]: "
-                    .. updateText)
-                Ext.Tolk.Speak(updateText, true)
+                local updateSpeech = Helpers.CreateSpeechData()
+                updateSpeech:Add("widgetUpdate", updateText, "brief")
+                updateSpeech:Speak(handlerState, false)
                 return
             end
         end
@@ -838,10 +860,9 @@ local function CreatePanelHandler(config)
         if isCarouselOnly then
             local carouselValue = snapshot.inlineCarouselValue
             if carouselValue ~= handlerState.lastSpokenFullText then
-                handlerState.lastSpokenFullText = carouselValue
-                Log.Info("CAROUSEL [" .. config.name .. "]: "
-                    .. carouselValue)
-                Ext.Tolk.Speak(carouselValue, true)
+                local carouselSpeech = Helpers.CreateSpeechData()
+                carouselSpeech:Add("carouselValue", carouselValue, "brief")
+                carouselSpeech:Speak(handlerState, false)
             end
             return
         end
@@ -857,23 +878,22 @@ local function CreatePanelHandler(config)
                 if type(customName) == "table" and customName.fields then
                     local delta = customName:Delta(
                         handlerState.lastSpeechData)
-                    local formatted = delta:Format()
-                    if formatted and formatted ~= "" then
+                    local deltaFormatted = delta:Format()
+                    if deltaFormatted and deltaFormatted ~= "" then
                         handlerState.lastSpeechData = customName
                         handlerState.lastSpokenFullText = customName:Format()
                         Log.Info("VALUE [" .. config.name .. "]: "
-                            .. formatted)
-                        Ext.Tolk.Speak(formatted, true)
+                            .. deltaFormatted)
+                        Ext.Tolk.Speak(deltaFormatted, true)
                     end
                     return
                 end
-                -- Non-empty string: speak as value change.
+                -- Non-empty string: wrap in SpeechData and speak.
                 if customName and customName ~= "" then
                     if customName ~= handlerState.lastSpokenFullText then
-                        handlerState.lastSpokenFullText = customName
-                        Log.Info("VALUE [" .. config.name .. "]: "
-                            .. customName)
-                        Ext.Tolk.Speak(customName, true)
+                        local valueSpeech = Helpers.CreateSpeechData()
+                        valueSpeech:Add("customValue", customName, "brief")
+                        valueSpeech:Speak(handlerState, false)
                     end
                     return
                 end
@@ -883,9 +903,9 @@ local function CreatePanelHandler(config)
             local valueText = Helpers.FormatDCValue(focusedElement.dcProps)
             if valueText and valueText ~= ""
                 and valueText ~= handlerState.lastSpokenFullText then
-                handlerState.lastSpokenFullText = valueText
-                Log.Info("VALUE [" .. config.name .. "]: " .. valueText)
-                Ext.Tolk.Speak(valueText, true)
+                local valueSpeech = Helpers.CreateSpeechData()
+                valueSpeech:Add("value", valueText, "brief")
+                valueSpeech:Speak(handlerState, false)
             end
             return
         end
@@ -1063,7 +1083,13 @@ local function CreatePanelHandler(config)
         end
 
         -- If customItemFn returned a full SpeechData, use it directly.
+        -- Empty SpeechData (zero fields) = handler handled everything
+        -- itself (e.g., Book reader), suppress all generic speech.
         if customSpeechData then
+            if #customSpeechData.fields == 0 then
+                handlerState.lastFocusedData = focusedElement
+                return
+            end
             -- Cache focused element data for detail view (RS Left).
             handlerState.lastFocusedData = focusedElement
             -- Merge screen entry fields (title/hint/tab) into the custom
@@ -1238,9 +1264,126 @@ local TradeHandler = CreatePanelHandler({
 })
 
 -- Inspect character or item details.
+-- Widget DC is generic ls.Widget; discovery activates via focused
+-- element DC types (VMRangeStat, VMResistance, VMItem).
 local ExamineHandler = CreatePanelHandler({
     name = "Examine",
     hint = false,
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local dcType = focusedElement.dcType or ""
+
+        -- VMRangeStat / VMStat: read label + value from rendered
+        -- TextBlocks, same approach as CharSheet.FormatStatFromTextBlocks.
+        if dcType:find("VMRangeStat") or dcType:find("VMStat") then
+            local readOk, textBlocks = pcall(Ext.UI.ReadFocusedTextBlocks)
+            if readOk and textBlocks and #textBlocks > 0 then
+                local labels = {}
+                local values = {}
+                for _, text in ipairs(textBlocks) do
+                    if text and text ~= "" then
+                        local cleaned = Helpers.StripMarkupTags(text)
+                        if cleaned and cleaned ~= "" then
+                            cleaned = cleaned:gsub("(%d+)~(%d+)",
+                                "%1 to %2")
+                            if cleaned:match("^[%d%+%-/]") then
+                                values[#values + 1] = cleaned
+                            else
+                                labels[#labels + 1] = cleaned
+                            end
+                        end
+                    end
+                end
+                local parts = {}
+                for _, label in ipairs(labels) do
+                    parts[#parts + 1] = label
+                end
+                for _, value in ipairs(values) do
+                    parts[#parts + 1] = value
+                end
+                if #parts > 0 then
+                    return table.concat(parts, ": ")
+                end
+            end
+        end
+
+        -- VMResistance: name + level from dcProps.  Description
+        -- comes from the tooltip on the next tick (customTooltipFn
+        -- adds it as a description field, no Diff needed).
+        if dcType:find("VMResistance") then
+            local dcProps = focusedElement.dcProps
+            if dcProps and dcProps.DamageType then
+                local damageType = tostring(dcProps.DamageType)
+
+                -- Resolve resistance level: Full covers both
+                -- magical and non-magical.  When Full is absent,
+                -- fall back to NonMagical or Magical.
+                local function ResolveLevel(rawLevel)
+                    if rawLevel == "255" then return "Vulnerable" end
+                    if type(rawLevel) == "string"
+                        and rawLevel ~= "None"
+                        and rawLevel ~= "" then
+                        return rawLevel
+                    end
+                    return nil
+                end
+
+                local resistanceLevel = ResolveLevel(dcProps.Full)
+                    or ResolveLevel(dcProps.NonMagical)
+                    or ResolveLevel(dcProps.Magical)
+
+                local speechData = Helpers.CreateSpeechData()
+                speechData:Add("resistanceName", damageType, "brief")
+                if resistanceLevel then
+                    speechData:Add("resistanceLevel",
+                        resistanceLevel, "brief")
+                end
+                return speechData
+            end
+        end
+
+        return nil
+    end,
+    customTooltipFn = function(tooltipTexts, focusedDCType)
+        if not tooltipTexts or #tooltipTexts == 0 then return nil end
+
+        -- VMRangeStat / VMStat: use FormatStatTooltip for breakdown
+        -- and description.  No skipDiff needed -- FormatStatTooltip
+        -- only adds breakdown + description fields (no name/title),
+        -- so the Diff won't kill them.
+        if focusedDCType
+            and (focusedDCType:find("VMRangeStat")
+                or focusedDCType:find("VMStat")) then
+            return Helpers.FormatStatTooltip(tooltipTexts)
+        end
+
+        -- VMResistance: tooltip has the description sentences.
+        -- Handler already spoke name + level, so only add
+        -- description fields.  Skip the title text (e.g.,
+        -- "Bludgeoning Resistance") since the handler covered it.
+        -- skipDiff because the description is new information,
+        -- not a duplicate of what the handler said.
+        if focusedDCType
+            and focusedDCType:find("VMResistance") then
+            local speechData = Helpers.CreateSpeechData()
+            speechData.skipDiff = true
+            for _, text in ipairs(tooltipTexts) do
+                if text and text ~= ""
+                    and text ~= "Inspect" then
+                    local cleaned = Helpers.StripMarkupTags(text)
+                    if cleaned and cleaned ~= ""
+                        and cleaned:find("damage") then
+                        speechData:Add("description",
+                            cleaned, "normal")
+                    end
+                end
+            end
+            if #speechData.fields == 0 then return nil end
+            return speechData
+        end
+
+        -- Other Examine types: use default formatter.
+        return nil
+    end,
 })
 
 -- Container inventory (opening a bag/pouch from the inventory).
@@ -1280,15 +1423,256 @@ local ContainerHandler = CreatePanelHandler({
 })
 
 -- Dice roll UI for skill checks and saving throws.
+-- onWidgetAdded fires on initial appearance AND every widget DC INPC
+-- change (RollState transitions).  We track lastRollState to detect
+-- transitions and speak entry, re-roll, and result announcements.
+-- customItemFn handles bonus item navigation (VMBoost, VMAdvantage).
 local ActiveRollHandler = CreatePanelHandler({
     name = "ActiveRoll",
-    hint = false,
+    hint = "Y to roll. Left and right to browse bonuses.",
+    onWidgetAdded = function(widgetData, handlerState)
+        local dcProps = widgetData and widgetData.dcProps
+        if not dcProps then return end
+
+        local rollState = dcProps.RollState
+        if not rollState or rollState == "" then return end
+
+        local previousState = handlerState.lastRollState
+        handlerState.lastRollState = rollState
+
+        -- Suppress duplicate announcements for the same state.
+        if rollState == previousState then return end
+
+        -- Entry: roll screen just appeared (WaitForStart or Introduction).
+        if rollState == "WaitForStart"
+            or rollState == "IntroductionAnimation" then
+            local speechData = Helpers.CreateSpeechData()
+
+            -- Dialogue line (for dialogue skill checks).
+            local dialogueLine = dcProps.SelectedDialogueLine
+            if dialogueLine and dialogueLine ~= ""
+                and not dialogueLine:match("^h%x+g")
+                and not dialogueLine:find("%[ForceUpdate%]") then
+                speechData:Add("dialogue", dialogueLine, "normal")
+            end
+
+            -- Skill or ability name ("Persuasion", "Sleight of Hand").
+            local skillName = dcProps.SkillOrAbility
+            if skillName and skillName ~= ""
+                and not skillName:match("^h%x+g") then
+                speechData:Add("skill", skillName, "brief")
+            end
+
+            -- Ability check text ("Charisma Check").
+            local abilityText = dcProps.AbilityCheckText
+            if abilityText and abilityText ~= ""
+                and dcProps.IsPureAbilityRoll ~= "True"
+                and not abilityText:match("^h%x+g") then
+                speechData:Add("ability", abilityText, "brief")
+            end
+
+            -- DC from Roll sub-object.
+            local roll = dcProps.Roll
+            if roll and type(roll) == "table" then
+                local difficultyCheck = roll.DifficultyCheck
+                if difficultyCheck and difficultyCheck ~= "" then
+                    speechData:Add("dc",
+                        "DC " .. difficultyCheck, "brief")
+                end
+                local advantageType = roll.RollAdvantageType
+                if advantageType
+                    and advantageType ~= "None"
+                    and advantageType ~= "" then
+                    speechData:Add("advantage", advantageType, "brief")
+                end
+            end
+
+            local formatted = speechData:Format()
+            if formatted and formatted ~= "" then
+                Log.Info("ACTIVE ROLL entry: " .. formatted)
+                handlerState.lastSpokenFullText = formatted
+                speechData:Speak(handlerState, true)
+            end
+
+        -- Re-roll available (Inspiration point or Lucky feat).
+        elseif rollState == "WaitForReRoll" then
+            local speechData = Helpers.CreateSpeechData()
+            speechData:Add("reroll",
+                "Re-roll available. Y to re-roll.", "brief")
+            local formatted = speechData:Format()
+            if formatted then
+                Log.Info("ACTIVE ROLL re-roll: " .. formatted)
+                handlerState.lastSpokenFullText = formatted
+                speechData:Speak(handlerState, true)
+            end
+
+        -- Result ready: announce outcome.
+        elseif rollState == "ResultReady" then
+            local finalResult = dcProps.FinalResult
+            local success = dcProps.Success
+            local skipped = dcProps.SkippedRoll
+            local speechData = Helpers.CreateSpeechData()
+
+            if skipped == "True" then
+                speechData:Add("skipped", "Skipped", "brief")
+            end
+
+            if finalResult and finalResult ~= "" then
+                speechData:Add("rolled",
+                    "Rolled " .. finalResult, "brief")
+            end
+
+            if success == "True" then
+                if finalResult == "20" then
+                    speechData:Add("outcome",
+                        "Critical Success!", "brief")
+                else
+                    speechData:Add("outcome", "Success!", "brief")
+                end
+            elseif success == "False" then
+                if finalResult == "1" then
+                    speechData:Add("outcome",
+                        "Critical Failure!", "brief")
+                else
+                    speechData:Add("outcome", "Failure.", "brief")
+                end
+            end
+
+            local formatted = speechData:Format()
+            if formatted and formatted ~= "" then
+                Log.Info("ACTIVE ROLL result: " .. formatted)
+                handlerState.lastSpokenFullText = formatted
+                speechData:Speak(handlerState, true)
+            end
+        end
+    end,
+    onReset = function(handlerState)
+        handlerState.lastRollState = nil
+    end,
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        -- Bonus items in the horizontal list: format with value info.
+        local dcProps = focusedElement.dcProps
+        if not dcProps then return nil end
+
+        local dcType = focusedElement.dcType or ""
+
+        -- VMBoost: modifier name + numeric value or dice string.
+        if dcType:find("VMBoost") then
+            local name = dcProps.Name or ""
+            local parts = {}
+            if name ~= "" then parts[#parts + 1] = name end
+
+            -- Numeric value ("+3", "-1").
+            local value = dcProps.Value
+            if value and value ~= "" and value ~= "0" then
+                local numericValue = tonumber(value)
+                if numericValue and numericValue > 0 then
+                    parts[#parts + 1] = "+" .. value
+                elseif numericValue then
+                    parts[#parts + 1] = value
+                end
+            end
+
+            -- Dice bonus ("+1d4" from Guidance, etc.).
+            local diceTypeSet = dcProps.DiceTypeSet
+            if diceTypeSet and type(diceTypeSet) == "table" then
+                local diceStr = diceTypeSet.Str
+                if diceStr and diceStr ~= "" then
+                    parts[#parts + 1] = "+" .. diceStr
+                end
+            end
+
+            if #parts > 0 then
+                return table.concat(parts, " ")
+            end
+        end
+
+        -- VMAdvantage: advantage/disadvantage + reason.
+        if dcType:find("VMAdvantage") then
+            local advantageType = dcProps.AdvantageType or ""
+            local description = dcProps.Description or ""
+            if advantageType ~= "" then
+                if description ~= ""
+                    and not description:match("^h%x+g") then
+                    return advantageType .. ": " .. description
+                end
+                return advantageType
+            end
+        end
+
+        -- VMCharacterAction: spell/action name + description.
+        if dcType:find("VMCharacterAction") then
+            local name = dcProps.Name
+            if name and name ~= ""
+                and not name:match("^h%x+g") then
+                return name
+            end
+        end
+
+        -- VMPassive: passive feature name.
+        if dcType:find("VMPassive") then
+            local name = dcProps.Name
+            if name and name ~= ""
+                and not name:match("^h%x+g") then
+                return name
+            end
+        end
+
+        -- Other types: fall through to generic pipeline.
+        return nil
+    end,
 })
 
--- Reaction ability decision during combat.
+-- Reaction ability decision popup during combat.
+-- Appears when the player can use a reaction (Opportunity Attack, Counterspell,
+-- etc.) on an enemy turn.  Focus lands on VMInterruptDecision items.
 local ReactionHandler = CreatePanelHandler({
     name = "Reaction",
-    hint = false,
+    hint = "A to use reaction. B to skip all.",
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local dcProps = focusedElement.dcProps
+        if not dcProps then return nil end
+
+        local dcType = focusedElement.dcType or ""
+
+        -- VMInterruptDecision: the actual reaction choice.
+        -- Interrupt is a sub-object with Name property.
+        if dcType:find("VMInterruptDecision")
+            or dcType:find("InterruptDecision") then
+            local interrupt = dcProps.Interrupt
+            if interrupt and type(interrupt) == "table" then
+                local interruptName = interrupt.Name
+                if interruptName and interruptName ~= ""
+                    and not interruptName:match("^h%x+g") then
+                    return interruptName
+                end
+            end
+            -- Fallback: top-level Name.
+            local name = dcProps.Name
+            if name and name ~= ""
+                and not name:match("^h%x+g") then
+                return name
+            end
+        end
+
+        -- VMInterruptor: character header in multi-char scenarios.
+        -- Contains Character sub-object.
+        if dcType:find("VMInterruptor") then
+            local character = dcProps.Character
+            if character and type(character) == "table" then
+                local charName = character.Name
+                    or character.CharacterName
+                    or character.DisplayName
+                if charName and charName ~= ""
+                    and not charName:match("^h%x+g") then
+                    return charName
+                end
+            end
+        end
+
+        -- Fall through to generic pipeline.
+        return nil
+    end,
 })
 
 -- Alchemy crafting (recipes and ingredients).
@@ -1600,10 +1984,23 @@ local RewardHandler = CreatePanelHandler({
     hint = false,
 })
 
--- Save name input dialog.
+-- Save name input dialog ("Create New Save" popup).
+-- namedTexts carry TitleContainer and SubtitleContainer from XAML.
+-- Buttons: A to save, Y to rename, B to cancel.
 local SavePopupHandler = CreatePanelHandler({
     name = "SavePopup",
-    hint = false,
+    hint = "A to save. Y to rename. B to cancel.",
+    onWidgetAdded = function(widgetData, handlerState)
+        -- Extract title from namedTexts (TitleContainer = "Create New Save").
+        if widgetData and widgetData.namedTexts then
+            local title = widgetData.namedTexts.TitleContainer
+            if title and title ~= ""
+                and not title:match("^h%x+g")
+                and not title:find("%[ForceUpdate%]") then
+                handlerState.titleOverride = title
+            end
+        end
+    end,
 })
 
 -- Honour mode death memorial.
@@ -1821,6 +2218,235 @@ local LobbyHandler = CreatePanelHandler({
     hint = false,
 })
 
+-- Tutorial popup (modal tips explaining game mechanics).
+-- DCTutorial has Tutorial sub-object with Title and DescriptionController.
+-- The description uses CtxTransStringRunGeneratorBehavior which means the
+-- rendered text includes controller button placeholders -- we extract what
+-- we can from dcProps and namedTexts.
+local TutorialHandler = CreatePanelHandler({
+    name = "Tutorial",
+    hint = "A to dismiss.",
+    onWidgetAdded = function(widgetData, handlerState)
+        -- Title from Tutorial sub-object in dcProps.
+        local dcProps = widgetData and widgetData.dcProps
+        if dcProps then
+            local tutorial = dcProps.Tutorial
+            if tutorial and type(tutorial) == "table" then
+                local title = tutorial.Title
+                if title and title ~= ""
+                    and not title:match("^h%x+g")
+                    and not title:find("%[ForceUpdate%]") then
+                    handlerState.titleOverride = "Tutorial: " .. title
+                end
+                local description = tutorial.DescriptionController
+                    or tutorial.Description
+                if description and description ~= ""
+                    and not description:match("^h%x+g")
+                    and not description:find("%[ForceUpdate%]") then
+                    handlerState.bodyOverride = description
+                end
+            end
+            -- Fallback: top-level Title/Text from dcProps.
+            if not handlerState.titleOverride then
+                local title = dcProps.Title or dcProps.Text
+                if title and title ~= ""
+                    and not title:match("^h%x+g") then
+                    handlerState.titleOverride = "Tutorial: " .. title
+                end
+            end
+        end
+
+        -- Also try namedTexts for rendered TextBlock content.
+        if widgetData and widgetData.namedTexts
+            and not handlerState.titleOverride
+            and not handlerState.bodyOverride then
+            local parts = {}
+            for elementName, elementText in pairs(widgetData.namedTexts) do
+                if elementText and elementText ~= ""
+                    and not elementText:match("^h%x+g")
+                    and not elementText:find("%[ForceUpdate%]") then
+                    parts[#parts + 1] = elementText
+                end
+            end
+            if #parts > 0 then
+                handlerState.titleOverride = "Tutorial"
+                handlerState.bodyOverride = table.concat(parts, ". ")
+            end
+        end
+
+        if handlerState.titleOverride or handlerState.bodyOverride then
+            Log.Info("TUTORIAL: title="
+                .. tostring(handlerState.titleOverride)
+                .. " body="
+                .. tostring(handlerState.bodyOverride
+                    and handlerState.bodyOverride:sub(1, 60)))
+        end
+    end,
+})
+
+-- Book / document viewer.
+-- DCBook has BookFullText bound to an LSBook control.  BookFullText is
+-- the entire book content.  BookType determines the visual style.
+-- The LSBook control handles pagination internally (HasPrevPage/HasNextPage).
+-- Body text is in BookFullText -- a single large string.
+--- SplitBookLines: split raw BookFullText into navigable lines.
+--- Splits on <br> tags and --- section separators.  Trims whitespace.
+--- Returns an array of non-empty line strings.
+local function SplitBookLines(rawText)
+    if not rawText or rawText == "" then return {} end
+    -- Replace <br> and <br/> with newline, then split.
+    local normalized = rawText:gsub("<br%s*/?>", "\n")
+    -- Strip any remaining markup tags.
+    normalized = normalized:gsub("<[^>]+>", " ")
+    local lines = {}
+    for line in normalized:gmatch("[^\n]+") do
+        local trimmed = line:match("^%s*(.-)%s*$")
+        if trimmed and trimmed ~= "" then
+            lines[#lines + 1] = trimmed
+        end
+    end
+    return lines
+end
+
+--- OpenBookReader: set up line-by-line reading with d-pad navigation.
+--- Speaks the first line and subscribes to d-pad input.
+local function OpenBookReader(handlerState)
+    if not handlerState.bookLines
+        or #handlerState.bookLines == 0 then
+        return
+    end
+
+    handlerState.bookLineIndex = 0
+    local lineCount = #handlerState.bookLines
+    Log.Info("BOOK: " .. lineCount .. " lines")
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("intro", "Book viewer. Use d-pad up and down"
+        .. " to move line by line through the text.", "brief")
+    speechData:Add("lineCount", lineCount .. " lines.", "normal")
+    speechData:Add("controls",
+        "A to pick up. B to close.", "normal")
+    speechData:Speak(handlerState, true)
+
+    -- Subscribe to d-pad for line navigation (once).
+    if not handlerState.buttonSubscription then
+        handlerState.buttonSubscription =
+            Ext.Events.ControllerButtonInput:Subscribe(function(event)
+                if not event.Pressed then return end
+                local buttonName = tostring(event.Button)
+
+                if buttonName == "DPadDown" then
+                    event:PreventAction()
+                    local bookLines = handlerState.bookLines
+                    if not bookLines then return end
+                    local currentIndex = handlerState.bookLineIndex
+                    if currentIndex >= #bookLines then
+                        local endSpeech = Helpers.CreateSpeechData()
+                        endSpeech:Add("boundary",
+                            "End of text", "brief")
+                        endSpeech:Speak(handlerState, false)
+                        return
+                    end
+                    currentIndex = currentIndex + 1
+                    handlerState.bookLineIndex = currentIndex
+                    Log.Info("BOOK [" .. currentIndex .. "/"
+                        .. #bookLines .. "]: "
+                        .. bookLines[currentIndex]:sub(1, 60))
+                    local lineSpeech = Helpers.CreateSpeechData()
+                    lineSpeech:Add("line",
+                        bookLines[currentIndex], "brief")
+                    lineSpeech:Speak(handlerState, false)
+
+                elseif buttonName == "DPadUp" then
+                    event:PreventAction()
+                    local bookLines = handlerState.bookLines
+                    if not bookLines then return end
+                    local currentIndex = handlerState.bookLineIndex
+                    if currentIndex <= 1 then
+                        local beginSpeech = Helpers.CreateSpeechData()
+                        beginSpeech:Add("boundary",
+                            "Beginning of text", "brief")
+                        beginSpeech:Speak(handlerState, false)
+                        return
+                    end
+                    currentIndex = currentIndex - 1
+                    handlerState.bookLineIndex = currentIndex
+                    Log.Info("BOOK [" .. currentIndex .. "/"
+                        .. #bookLines .. "]: "
+                        .. bookLines[currentIndex]:sub(1, 60))
+                    local lineSpeech = Helpers.CreateSpeechData()
+                    lineSpeech:Add("line",
+                        bookLines[currentIndex], "brief")
+                    lineSpeech:Speak(handlerState, false)
+
+                elseif buttonName == "DPadLeft"
+                    or buttonName == "DPadRight" then
+                    -- Block horizontal d-pad to prevent accidental
+                    -- navigation while reading.
+                    event:PreventAction()
+
+                elseif buttonName == "B" then
+                    -- Clean up the subscription and let B pass through
+                    -- to the game to close the book widget.
+                    if handlerState.buttonSubscription then
+                        Ext.Events.ControllerButtonInput:Unsubscribe(
+                            handlerState.buttonSubscription)
+                        handlerState.buttonSubscription = nil
+                    end
+                    handlerState.bookLines = nil
+                    handlerState.bookLineIndex = nil
+                    Log.Info("BOOK: closed (B pressed)")
+                end
+            end)
+    end
+end
+
+local BookHandler = CreatePanelHandler({
+    name = "Book",
+    hint = false,
+    onWidgetAdded = function(widgetData, handlerState)
+        -- Cache BookFullText and split into lines (normal widget path).
+        local dcProps = widgetData and widgetData.dcProps
+        if dcProps and not handlerState.bookLines then
+            local bookText = dcProps.BookFullText
+            if bookText and bookText ~= ""
+                and not bookText:match("^h%x+g")
+                and not bookText:find("%[ForceUpdate%]") then
+                handlerState.bookLines = SplitBookLines(bookText)
+                OpenBookReader(handlerState)
+            end
+        end
+    end,
+    onReset = function(handlerState)
+        if handlerState.buttonSubscription then
+            Ext.Events.ControllerButtonInput:Unsubscribe(
+                handlerState.buttonSubscription)
+            handlerState.buttonSubscription = nil
+        end
+        handlerState.bookLines = nil
+        handlerState.bookLineIndex = nil
+    end,
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        -- Discovery path fallback: onWidgetAdded gets synthetic
+        -- widgetData without dcProps.  The snapshot has the real data.
+        if not handlerState.bookLines
+            and snapshot.widgetData
+            and snapshot.widgetData.dcProps then
+            local bookText = snapshot.widgetData.dcProps.BookFullText
+            if bookText and bookText ~= ""
+                and not bookText:match("^h%x+g")
+                and not bookText:find("%[ForceUpdate%]") then
+                handlerState.bookLines = SplitBookLines(bookText)
+                OpenBookReader(handlerState)
+            end
+        end
+        -- Always return an empty SpeechData to suppress the generic
+        -- pipeline entirely (including namedTexts visual text noise
+        -- like "Close", "Pick up", "Turn Page").  The book reader
+        -- handles all speech directly.
+        return Helpers.CreateSpeechData()
+    end,
+})
+
 -- ============================================================================
 -- Panel DC type routing table
 -- ============================================================================
@@ -1842,9 +2468,14 @@ local DC_TYPE_HANDLERS = {
     -- Container inventory (bags, pouches)
     ["gui::DCContainerInventory"] = ContainerHandler,
     ["ls.DCContainerInventory"]   = ContainerHandler,
-    -- Examine / inspect
+    -- Examine / inspect (widget DC is generic ls.Widget, so discovery
+    -- uses focused element DC types: VMRangeStat, VMResistance, etc.)
     ["gui::DCExamine"]            = ExamineHandler,
     ["ls.DCExamine"]              = ExamineHandler,
+    ["gui::VMRangeStat"]          = ExamineHandler,
+    ["ls.VMRangeStat"]            = ExamineHandler,
+    ["gui::VMResistance"]         = ExamineHandler,
+    ["ls.VMResistance"]           = ExamineHandler,
     -- Dice rolls and reactions
     ["gui::DCActiveRoll"]         = ActiveRollHandler,
     ["ls.DCActiveRoll"]           = ActiveRollHandler,
@@ -1907,6 +2538,12 @@ local DC_TYPE_HANDLERS = {
     -- Multiplayer lobby
     ["gui::DCLobby"]              = LobbyHandler,
     ["ls.DCLobby"]                = LobbyHandler,
+    -- Tutorial popups
+    ["gui::DCTutorial"]           = TutorialHandler,
+    ["ls.DCTutorial"]             = TutorialHandler,
+    -- Book / document viewer
+    ["gui::DCBook"]               = BookHandler,
+    ["ls.DCBook"]                 = BookHandler,
 }
 
 -- All handler instances for batch reset.
@@ -1939,6 +2576,8 @@ local ALL_PANEL_HANDLERS = {
     ReportHandler,
     PartyLineHandler,
     LobbyHandler,
+    TutorialHandler,
+    BookHandler,
 }
 
 -- ============================================================================
@@ -2098,6 +2737,53 @@ local function RoutePanelSnapshot(snapshot)
             activePanelHandler.ResetState()
             activePanelHandler = previousPanelHandler
             previousPanelHandler = nil
+        end
+    end
+
+    -- Panel close detection: only run when the widget set actually
+    -- changed (wChg).  If no signal in the snapshot maps to the active
+    -- handler AND focus is gone (no focused element), the panel has
+    -- closed.  This prevents false deactivation from focus alternating
+    -- between mapped and unmapped DC types within the same panel
+    -- (e.g., Examine's VMItem header vs VMRangeStat rows).
+    if snapshot.postSettle or snapshot.widgetAdded then
+        local handlerStillPresent = false
+        -- Widget DC types from the scan.
+        if snapshot.widgetDCTypes then
+            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
+                if DC_TYPE_HANDLERS[widgetDCType]
+                    == activePanelHandler then
+                    handlerStillPresent = true
+                    break
+                end
+            end
+        end
+        -- Focused element DC type (discovery-activated handlers).
+        if not handlerStillPresent
+            and snapshot.focusedElement
+            and snapshot.focusedElement.dcType then
+            if DC_TYPE_HANDLERS[snapshot.focusedElement.dcType]
+                == activePanelHandler then
+                handlerStillPresent = true
+            end
+        end
+        -- Selected element DC type.
+        if not handlerStillPresent
+            and snapshot.selectedElement
+            and snapshot.selectedElement.dcType then
+            if DC_TYPE_HANDLERS[snapshot.selectedElement.dcType]
+                == activePanelHandler then
+                handlerStillPresent = true
+            end
+        end
+        if not handlerStillPresent then
+            Log.Info("Panel closed, deactivating: "
+                .. activePanelHandler.name)
+            CloseDetailView(true)
+            activePanelHandler.ResetState()
+            activePanelHandler = nil
+            previousPanelHandler = nil
+            return
         end
     end
 

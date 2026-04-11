@@ -99,16 +99,20 @@ local function HandleSubtitle(dcProps)
     local cleanSubtitle = Helpers.StripMarkupTags(subtitleText)
     if not cleanSubtitle or cleanSubtitle == "" then return end
 
-    local parts = {}
+    local cleanSpeaker = nil
     if speakerName and speakerName ~= "" then
-        local cleanSpeaker = Helpers.StripMarkupTags(speakerName)
-        if cleanSpeaker and cleanSpeaker ~= "" then
-            table.insert(parts, cleanSpeaker)
-        end
+        cleanSpeaker = Helpers.StripMarkupTags(speakerName)
+        if cleanSpeaker == "" then cleanSpeaker = nil end
     end
-    table.insert(parts, cleanSubtitle)
 
-    local fullText = table.concat(parts, ": ")
+    local speechData = Helpers.CreateSpeechData()
+    if cleanSpeaker then
+        speechData:Add("subtitle",
+            cleanSpeaker .. ": " .. cleanSubtitle, "brief")
+    else
+        speechData:Add("subtitle", cleanSubtitle, "brief")
+    end
+    local fullText = speechData:Format()
     Log.Info("SUBTITLE: " .. fullText)
     Ext.Tolk.Speak(fullText, true)
 end
@@ -150,8 +154,10 @@ local function HandleDialogWidget(dcProps)
     local cleanBody = Helpers.StripMarkupTags(bodyText)
     if not cleanBody or cleanBody == "" then return end
 
+    local dialogSpeech = Helpers.CreateSpeechData()
+    dialogSpeech:Add("dialogBody", cleanBody, "brief")
     Log.Info("DIALOG: " .. cleanBody:sub(1, 80))
-    Ext.Tolk.Speak(cleanBody, true)
+    Ext.Tolk.Speak(dialogSpeech:Format(), true)
 end
 
 -- ============================================================================
@@ -252,8 +258,10 @@ local function HandleDialogAnswerSnapshot(snapshot)
     if combined == dialogState.lastAnswerText then return end
     dialogState.lastAnswerText = combined
 
+    local answerSpeech = Helpers.CreateSpeechData()
+    answerSpeech:Add("answerText", combined, "brief")
     Log.Info("DIALOG ANSWER: " .. combined:sub(1, 160))
-    Ext.Tolk.Speak(combined, true)
+    Ext.Tolk.Speak(answerSpeech:Format(), true)
 end
 
 -- Handle focus on a dialog answer choice (player navigating answers).
@@ -283,16 +291,16 @@ local function HandleDialogAnswerFocus(focusedElement)
 
     -- Prefix with answer number if available.
     local answerIndex = dcProps.AnswerIdx
-    local parts = {}
+    local answerFocusSpeech = Helpers.CreateSpeechData()
     if answerIndex then
         local numIndex = tonumber(answerIndex)
         if numIndex then
-            table.insert(parts, tostring(numIndex + 1))
+            answerFocusSpeech:Add("answerNumber",
+                tostring(numIndex + 1), "brief")
         end
     end
-    table.insert(parts, cleanAnswer)
-
-    local fullText = table.concat(parts, ". ")
+    answerFocusSpeech:Add("answerText", cleanAnswer, "brief")
+    local fullText = answerFocusSpeech:Format()
     Log.Info("DIALOG ANSWER: " .. fullText:sub(1, 80))
     Ext.Tolk.Speak(fullText, true)
     return true
