@@ -1955,10 +1955,11 @@ local ALL_PANEL_HANDLERS = {
 local previousPanelHandler = nil
 
 
--- DC types that should only activate via TryActivateFromSnapshot
--- (focus/selection discovery), not via widget added events.  These
--- are HUD elements that are always visible but only interactive when
--- the user explicitly navigates into them (e.g., LT for party).
+-- DC types that should only activate when the user explicitly focuses
+-- or selects an element inside them (focusedElement/selectedElement),
+-- never from widget scans or widgetDCTypes arrays.  These are HUD
+-- elements that are always visible but only interactive when the user
+-- navigates into them (e.g., LT for party).
 local DISCOVERY_ONLY_DC_TYPES = {
     ["gui::DCPartyLine"] = true,
     ["ls.DCPartyLine"]   = true,
@@ -2039,10 +2040,24 @@ local function RoutePanelSnapshot(snapshot)
             discoveredHandler = DC_TYPE_HANDLERS[
                 snapshot.selectedElement.dcType]
         end
+        -- Widget added on this tick: the widget event's own DC type
+        -- is a direct signal (user opened a panel), not scan noise.
+        -- Discovery-only types ARE allowed here because the widget
+        -- was freshly added (e.g., LT opens PartyLineActive_c).
+        if not discoveredHandler
+            and snapshot.widgetAdded and snapshot.widgetData
+            and snapshot.widgetData.dcType then
+            discoveredHandler = DC_TYPE_HANDLERS[
+                snapshot.widgetData.dcType]
+        end
+        -- Fallback: check all widget DC types from this tick, but
+        -- skip discovery-only types (always-present HUD widgets).
         if not discoveredHandler and snapshot.widgetDCTypes then
             for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-                discoveredHandler = DC_TYPE_HANDLERS[widgetDCType]
-                if discoveredHandler then break end
+                if not DISCOVERY_ONLY_DC_TYPES[widgetDCType] then
+                    discoveredHandler = DC_TYPE_HANDLERS[widgetDCType]
+                    if discoveredHandler then break end
+                end
             end
         end
         if discoveredHandler then
@@ -2130,10 +2145,19 @@ local function TryActivateFromSnapshot(snapshot)
             panelDCType = snapshot.selectedElement.dcType
         end
     end
-    -- Check all widget DC types from this tick.
+    -- Widget added on this tick: freshly opened panel, allow all types.
+    if not panelDCType
+        and snapshot.widgetAdded and snapshot.widgetData
+        and snapshot.widgetData.dcType then
+        if DC_TYPE_HANDLERS[snapshot.widgetData.dcType] then
+            panelDCType = snapshot.widgetData.dcType
+        end
+    end
+    -- Fallback: all widget DC types, skip discovery-only (HUD noise).
     if not panelDCType and snapshot.widgetDCTypes then
         for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-            if DC_TYPE_HANDLERS[widgetDCType] then
+            if not DISCOVERY_ONLY_DC_TYPES[widgetDCType]
+                and DC_TYPE_HANDLERS[widgetDCType] then
                 panelDCType = widgetDCType
                 break
             end
