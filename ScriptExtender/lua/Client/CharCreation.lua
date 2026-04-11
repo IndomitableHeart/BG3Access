@@ -462,6 +462,11 @@ local function FormatCCDCTextSplit(dcProps)
     local text = nil
     local value = nil
     local desc = dcProps.Description
+    -- Description may be a sub-table (VMContextTransString) with a
+    -- .Text field, not a plain string.  Extract the string now.
+    if type(desc) == "table" then
+        desc = desc.Text or desc.Str or desc.Description
+    end
 
     -- Skill enum: VMCharacterCreationSkill has Skill + Ability.
     -- Check Skill FIRST so "Arcana" wins over "Intelligence".
@@ -506,6 +511,18 @@ local function FormatCCDCTextSplit(dcProps)
         if not desc then
             desc = spellTable.Description
         end
+    end
+
+    -- VMFeatureBoost: NameCTS.Text has display name,
+    -- Description.Text has the description.
+    if not text and type(dcProps.NameCTS) == "table" then
+        text = dcProps.NameCTS.Text
+    end
+    if not text and dcProps.ShortName then
+        text = dcProps.ShortName
+    end
+    if not desc and type(dcProps.Description) == "table" then
+        desc = dcProps.Description.Text
     end
 
     if not text or text == "" then return nil, nil, nil end
@@ -626,6 +643,27 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
     if elemText and IsPlaceholder(elemText) then
         Log.Debug("GetCCItemData: strip placeholder elemText: " .. elemText)
         elemText = nil
+    end
+
+    -- 1b. Level-up summary items (DCCharacterLevelUp): HP gains, etc.
+    --      These have no useful dcProps -- read text blocks for content.
+    if focusedElement.dcType == "gui::DCCharacterLevelUp" then
+        local readOk, textBlocks = pcall(Ext.UI.ReadFocusedTextBlocks)
+        if readOk and textBlocks and #textBlocks > 0 then
+            local parts = {}
+            for _, text in ipairs(textBlocks) do
+                if text and text ~= "" then
+                    local cleaned = Helpers.StripMarkupTags(text)
+                    if cleaned and cleaned ~= "" then
+                        parts[#parts + 1] = cleaned
+                    end
+                end
+            end
+            if #parts > 0 then
+                return table.concat(parts, ", "), nil, nil
+            end
+        end
+        return nil, nil, nil
     end
 
     -- 2. FormatCCDCTextSplit: Skill, Ability, Spell sub-table dcProps.
@@ -870,8 +908,9 @@ local function IsCCSnapshot(snapshot)
     local focusedElement = snapshot.focusedElement
     if not focusedElement then return false end
 
-    -- God-object DC.
-    if focusedElement.dcType == "gui::DCCharacterCreation" then
+    -- God-object DC (character creation or level up).
+    if focusedElement.dcType == "gui::DCCharacterCreation"
+        or focusedElement.dcType == "gui::DCCharacterLevelUp" then
         return true
     end
 
@@ -1473,6 +1512,9 @@ local function HandleCCSnapshot(snapshot)
             fullText = table.concat(parts, ". ")
         end
 
+        -- Strip markup for comparison and speech so raw LSTag text
+        -- doesn't bypass dedup against the already-spoken stripped version.
+        fullText = Helpers.StripMarkupTags(fullText)
         if fullText ~= "" and fullText ~= ccState.lastSpokenFullText then
             ccState.lastSpokenFullText = fullText
             ccState.lastSpokenName = elemId
@@ -1673,6 +1715,28 @@ local function HandleCCSnapshot(snapshot)
                 ccState.lastSpokenTitle = "Guardian Appearance"
                 namingScreenWasSpoken = false
                 Log.Info("CC SLOTS: guardian entry")
+            elseif ccState.currentWidgetDCType
+                == "gui::DCCharacterLevelUp" then
+                -- Level up entry.
+                local levelUpClass = nil
+                if snapshot.focusedElement
+                    and snapshot.focusedElement.namedTexts then
+                    levelUpClass =
+                        snapshot.focusedElement.namedTexts.classLevelText
+                end
+                local levelUpTitle = "Level Up"
+                if levelUpClass and levelUpClass ~= "" then
+                    levelUpTitle = "Level Up: " .. levelUpClass
+                end
+                speechData:Add("title", levelUpTitle, "brief")
+                speechData:Add("hint",
+                    "Up and down to review gains."
+                    .. " Press Y to accept."
+                    .. " Press X to add a class."
+                    .. " Press B to exit.", "normal")
+                ccState.lastSpokenTitle = levelUpTitle
+                Log.Info("CC SLOTS: level up entry, "
+                    .. tostring(levelUpClass))
             else
                 -- Main character creation entry.
                 speechData:Add("title", "Character Creation", "brief")
@@ -1871,6 +1935,11 @@ end
 --- rather than inheriting focus state from before the blurb.
 local function HandleWidgetAdded(widgetData)
     if not widgetData or not widgetData.dcType then return end
+    -- Track the widget DC type so we know if we're in CC vs Level Up.
+    if widgetData.dcType == "gui::DCCharacterCreation"
+        or widgetData.dcType == "gui::DCCharacterLevelUp" then
+        ccState.currentWidgetDCType = widgetData.dcType
+    end
     if not ccState.inCharacterCreation then return end
     if widgetData.dcType ~= "gui::DCCharacterCreation" then return end
     Log.Info("CC: DCCharacterCreation re-added while in CC"

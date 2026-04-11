@@ -1648,6 +1648,173 @@ local ReportHandler = CreatePanelHandler({
     hint = false,
 })
 
+-- Party portraits (LT from world HUD).
+-- Shows party members with name, level, class, HP, reactions, level-up.
+-- Uses text blocks from the portrait for structured speech since the
+-- CharacterPortrait template is precompiled and dcProps are minimal.
+local PartyLineHandler = CreatePanelHandler({
+    name = "PartyLine",
+    hint = "Up and down to browse party members."
+        .. " RB to level up if available.",
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local dcType = focusedElement.dcType
+        local dcProps = focusedElement.dcProps
+        local elemId = focusedElement.elemId or ""
+
+        -- Party member character entry.
+        if dcType == "ls.Character" and dcProps then
+            local speechData = Helpers.CreateSpeechData()
+
+            -- Character name from dcProps.
+            local charName = dcProps.Name or dcProps.CharacterName
+                or dcProps.DisplayName
+            if charName and charName ~= "" then
+                speechData:Add("name", charName, "brief")
+            end
+
+            -- Read text blocks for level/class and other info.
+            local readOk, textBlocks = pcall(
+                Ext.UI.ReadFocusedTextBlocks)
+            if readOk and textBlocks then
+                for _, text in ipairs(textBlocks) do
+                    if text and text ~= "" then
+                        local cleaned = Helpers.StripMarkupTags(text)
+                        if cleaned and cleaned ~= ""
+                            and cleaned ~= charName then
+                            -- Level/class: "Lv 1 Rogue"
+                            if cleaned:match("^Lv %d+") then
+                                speechData:Add("levelClass",
+                                    cleaned, "brief")
+                            -- HP: "10/10"
+                            elseif cleaned:match("^%d+/%d+$") then
+                                speechData:Add("hp",
+                                    "HP " .. cleaned, "normal")
+                            -- Level Up indicator.
+                            elseif cleaned == "Level Up" then
+                                speechData:Add("levelUp",
+                                    "Level Up available", "brief")
+                            -- Reactions header: skip.
+                            elseif cleaned == "Reactions" then
+                                -- skip
+                            -- Inspect label: skip.
+                            elseif cleaned == "Inspect" then
+                                -- skip
+                            -- Reaction names at verbose tier.
+                            else
+                                speechData:Add("reaction",
+                                    cleaned, "verbose")
+                            end
+                        end
+                    end
+                end
+            end
+
+            if #speechData.fields > 0 then
+                return speechData
+            end
+        end
+
+        -- Fall through to generic pipeline.
+        return nil
+    end,
+    customTooltipFn = function(tooltipTexts, focusedDCType)
+        -- Party member tooltip: extract level/class and Level Up
+        -- status.  Reactions are verbose-tier detail.
+        if focusedDCType == "ls.Character" and tooltipTexts then
+            local speechData = Helpers.CreateSpeechData()
+            local reactionCount = 0
+            local inReactions = false
+            for _, text in ipairs(tooltipTexts) do
+                if text and text ~= "" then
+                    local cleaned = Helpers.StripMarkupTags(text)
+                    if not cleaned or cleaned == "" then
+                        -- skip
+                    elseif cleaned == "Inspect" then
+                        -- skip
+                    elseif cleaned == "Reactions" then
+                        inReactions = true
+                    elseif cleaned == "Level Up" then
+                        inReactions = false
+                        speechData:Add("levelUp",
+                            "Level Up available", "brief")
+                    elseif cleaned:match("^Lv %d+") then
+                        speechData:Add("levelClass",
+                            cleaned, "brief")
+                    elseif inReactions then
+                        reactionCount = reactionCount + 1
+                    end
+                end
+            end
+            if reactionCount > 0 then
+                speechData:Add("reactions",
+                    tostring(reactionCount) .. " reactions active",
+                    "normal")
+            end
+            if #speechData.fields > 0 then
+                return speechData
+            end
+        end
+        return nil
+    end,
+    buildDetailList = function(focusedData, tooltipTexts)
+        if not focusedData then return nil end
+        if focusedData.dcType ~= "ls.Character" then return nil end
+
+        local detailList = {}
+        local dcProps = focusedData.dcProps
+
+        -- Name.
+        if dcProps then
+            local charName = dcProps.Name or dcProps.CharacterName
+                or dcProps.DisplayName
+            if charName and charName ~= "" then
+                detailList[#detailList + 1] = {
+                    label = "Name", value = charName}
+            end
+        end
+
+        -- Build remaining fields from tooltip texts.
+        if tooltipTexts then
+            local inReactions = false
+            for _, text in ipairs(tooltipTexts) do
+                if text and text ~= "" then
+                    local cleaned = Helpers.StripMarkupTags(text)
+                    if not cleaned or cleaned == "" then
+                        -- skip
+                    elseif cleaned == "Inspect" then
+                        -- skip
+                    elseif cleaned:match("^Lv %d+") then
+                        detailList[#detailList + 1] = {
+                            label = "Level", value = cleaned}
+                    elseif cleaned == "Reactions" then
+                        inReactions = true
+                    elseif cleaned == "Level Up" then
+                        inReactions = false
+                        detailList[#detailList + 1] = {
+                            label = "Level Up",
+                            value = "Available"}
+                    elseif inReactions then
+                        detailList[#detailList + 1] = {
+                            label = "Reaction", value = cleaned}
+                    end
+                end
+            end
+        end
+
+        -- HP from elemId (e.g., "10/10").
+        local elemId = focusedData.elemId or ""
+        local currentHP, maxHP = elemId:match("(%d+)/(%d+)")
+        if currentHP and maxHP then
+            detailList[#detailList + 1] = {
+                label = "HP",
+                value = currentHP .. " of " .. maxHP}
+        end
+
+        if #detailList == 0 then return nil end
+        return detailList
+    end,
+})
+
 -- Multiplayer lobby room (different from lobby browser in Menus).
 local LobbyHandler = CreatePanelHandler({
     name = "Lobby",
@@ -1734,6 +1901,9 @@ local DC_TYPE_HANDLERS = {
     ["ls.DCGammaCalibration"]     = GammaHandler,
     ["gui::DCReport"]             = ReportHandler,
     ["ls.DCReport"]               = ReportHandler,
+    -- Party portraits (LT from world)
+    ["gui::DCPartyLine"]          = PartyLineHandler,
+    ["ls.DCPartyLine"]            = PartyLineHandler,
     -- Multiplayer lobby
     ["gui::DCLobby"]              = LobbyHandler,
     ["ls.DCLobby"]                = LobbyHandler,
@@ -1767,6 +1937,7 @@ local ALL_PANEL_HANDLERS = {
     HDRHandler,
     GammaHandler,
     ReportHandler,
+    PartyLineHandler,
     LobbyHandler,
 }
 
@@ -1784,12 +1955,22 @@ local ALL_PANEL_HANDLERS = {
 local previousPanelHandler = nil
 
 
+-- DC types that should only activate via TryActivateFromSnapshot
+-- (focus/selection discovery), not via widget added events.  These
+-- are HUD elements that are always visible but only interactive when
+-- the user explicitly navigates into them (e.g., LT for party).
+local DISCOVERY_ONLY_DC_TYPES = {
+    ["gui::DCPartyLine"] = true,
+    ["ls.DCPartyLine"]   = true,
+}
+
 --- IsWorldDCType: returns true if the given DC type belongs to an
 --- in-game panel handled by WorldUI.
 --- @param dcType string  The DataContext type from a widget.
 --- @return boolean
 local function IsWorldDCType(dcType)
     if not dcType then return false end
+    if DISCOVERY_ONLY_DC_TYPES[dcType] then return false end
     return DC_TYPE_HANDLERS[dcType] ~= nil
 end
 
@@ -1800,6 +1981,10 @@ end
 --- @param widgetData table  The widget data from the snapshot.
 local function HandlePanelWidgetAdded(widgetData)
     if not widgetData or not widgetData.dcType then return end
+
+    -- Skip discovery-only DC types: these are HUD widgets that fire
+    -- on every scan but should only activate when focus enters them.
+    if DISCOVERY_ONLY_DC_TYPES[widgetData.dcType] then return end
 
     local newHandler = DC_TYPE_HANDLERS[widgetData.dcType]
     if not newHandler then return end

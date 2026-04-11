@@ -706,13 +706,16 @@ local function FormatExperienceBar()
     pcall(function()
         local xpComponent = entity.Experience
         if not xpComponent then return end
-        local totalXP = xpComponent.TotalExperience or 0
-        local nextLevelXP = xpComponent.NextLevelExperience or 0
-        if nextLevelXP > 0 then
-            parts[#parts + 1] = tostring(totalXP)
-                .. " of " .. tostring(nextLevelXP) .. " XP"
+        -- TotalExperience is the cumulative threshold for the next
+        -- level; NextLevelExperience is the player's current total.
+        -- Field names are counterintuitive but confirmed by testing.
+        local currentXP = xpComponent.NextLevelExperience or 0
+        local thresholdXP = xpComponent.TotalExperience or 0
+        if thresholdXP > 0 then
+            parts[#parts + 1] = tostring(currentXP)
+                .. " of " .. tostring(thresholdXP) .. " XP"
         else
-            parts[#parts + 1] = tostring(totalXP) .. " XP"
+            parts[#parts + 1] = tostring(currentXP) .. " XP"
         end
     end)
 
