@@ -876,6 +876,19 @@ local function RouteSnapshot(snapshot)
             and snapshot.widgetData.elemName == activeHandlerWidgetName then
             widgetStillPresent = true
         end
+        -- Widget callbacks only fire for changed widgets, not all
+        -- visible ones.  A single tick without the widget name
+        -- doesn't mean the widget closed -- it may just not have
+        -- fired a callback this tick.  Require the widget to be
+        -- absent AND no focused element (UI fully closed) before
+        -- clearing.  If there's still a focused element, the user
+        -- is navigating inside the menu and the handler is valid.
+        if not widgetStillPresent
+            and snapshot.focusedElement
+            and snapshot.focusedElement.elemType
+            and snapshot.focusedElement.elemType ~= "" then
+            widgetStillPresent = true
+        end
         if not widgetStillPresent then
             Log.Info("Clearing stale handler: " .. activeHandler.name
                 .. " (widget " .. activeHandlerWidgetName .. " gone)")
