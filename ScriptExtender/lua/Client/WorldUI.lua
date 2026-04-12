@@ -2704,11 +2704,51 @@ local function RoutePanelSnapshot(snapshot)
             Log.Info("Active panel (discovered): "
                 .. activePanelHandler.name)
         else
-            Log.Warn("RoutePanelSnapshot: no active panel handler, "
-                .. "falling back to Menus")
+            -- No WorldUI panel handler found.  Check if the snapshot
+            -- contains a menu-worthy DC type (e.g., gui::DCGameMenu
+            -- from the shortcuts menu).  Menus on separate visual
+            -- layers don't generate widget events so they reach here
+            -- with routeToWorld still true.  Only fall back to Menus
+            -- when a genuine menu signal is present.  Without this
+            -- guard, HUD widget text (Overlay, Actions, etc.) would
+            -- be spoken as menu content when returning to the world
+            -- after closing any panel.
             local Menus = BG3Access.Client.Menus
             if Menus then
-                Menus.RouteSnapshot(snapshot)
+                local hasMenuSignal = false
+                -- Check focused element dcType.
+                if snapshot.focusedElement
+                    and snapshot.focusedElement.dcType
+                    and Menus.IsMenuDCType(
+                        snapshot.focusedElement.dcType) then
+                    hasMenuSignal = true
+                end
+                -- Check selected element dcType.
+                if not hasMenuSignal
+                    and snapshot.selectedElement
+                    and snapshot.selectedElement.dcType
+                    and Menus.IsMenuDCType(
+                        snapshot.selectedElement.dcType) then
+                    hasMenuSignal = true
+                end
+                -- Check widget DC types from the scan.
+                if not hasMenuSignal and snapshot.widgetDCTypes then
+                    for _, widgetDCType in ipairs(
+                            snapshot.widgetDCTypes) do
+                        if Menus.IsMenuDCType(widgetDCType) then
+                            hasMenuSignal = true
+                            break
+                        end
+                    end
+                end
+                if hasMenuSignal then
+                    Log.Info("RoutePanelSnapshot: menu DC type "
+                        .. "detected, falling back to Menus")
+                    Menus.RouteSnapshot(snapshot)
+                else
+                    Log.Debug("RoutePanelSnapshot: no panel or "
+                        .. "menu handler, suppressing HUD noise")
+                end
             end
             return
         end

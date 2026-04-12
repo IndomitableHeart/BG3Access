@@ -41,6 +41,11 @@ local exploreLastSpoken   = nil
 local spokenLoadingTips = {}
 -- True when snapshots should route to WorldUI panel handlers instead of Menus.
 local routeToWorld        = false
+-- True when routeToWorld was flipped from true->false for a menu that
+-- opened during gameplay (e.g. shortcuts radial).  When the menu's
+-- widget disappears from the scan, routeToWorld is restored to true
+-- so HUD noise doesn't bleed through Menus routing.
+local worldRouteBeforeMenu = false
 -- True when a dialog overlay spoke on this tick while WorldUI is active.
 -- Suppresses the panel handler so dialog speech isn't interrupted.
 local worldDialogOverlayJustSpoke = false
@@ -190,8 +195,9 @@ local function HandleTickSnapshot(snapshot)
                 Menus.HandleWidgetAdded(snapshot.widgetData)
                 if routeToWorld then
                     if World then World.ResetAllPanelHandlers() end
+                    worldRouteBeforeMenu = true
                     routeToWorld = false
-                    Log.Info("Routing to Menus")
+                    Log.Info("Routing to Menus (from world)")
                 end
             else
                 -- Generic/unknown DC type: let both sides see the event
@@ -232,6 +238,48 @@ local function HandleTickSnapshot(snapshot)
     snapshotHasUIFocus = (focusedElement ~= nil
         and focusedElement.elemType ~= nil
         and focusedElement.elemType ~= "")
+
+    -- =================================================================
+    -- Restore world routing when a gameplay-interrupting menu closes.
+    -- When routeToWorld was flipped false for a menu (shortcuts, pause)
+    -- and no menu widgets remain in the scan, switch back to world.
+    -- =================================================================
+    if not routeToWorld and worldRouteBeforeMenu
+        and not suppressSnapshots then
+        local hasMenuWidget = false
+        if snapshot.widgetDCTypes then
+            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
+                if Menus.IsMenuDCType(widgetDCType) then
+                    hasMenuWidget = true
+                    break
+                end
+            end
+        end
+        if not hasMenuWidget then
+            worldRouteBeforeMenu = false
+            routeToWorld = true
+            Menus.ResetAllHandlers()
+            Log.Info("Routing back to WorldUI (menu closed)")
+        end
+    end
+
+    -- =================================================================
+    -- Early menu delivery: some menus (shortcuts radial) use local
+    -- focus instead of standard IsFocused/FocusManager, so the C++
+    -- focus strategies never report a focusedElement for them.
+    -- Deliver the snapshot to Menus before the focusedElement guard
+    -- drops it, so the screen entry announcement fires.
+    -- =================================================================
+    if not suppressSnapshots
+        and snapshot.widgetAdded and snapshot.widgetData
+        and snapshot.widgetData.dcType
+        and Menus.IsMenuDCType(snapshot.widgetData.dcType)
+        and (not focusedElement or not focusedElement.elemType) then
+        if not routeToWorld then
+            Menus.RouteSnapshot(snapshot)
+        end
+        return
+    end
 
     -- =================================================================
     -- focusedElement guard: everything below needs a valid focus target.
@@ -528,10 +576,15 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     exploreLastSpoken = nil
     spokenLoadingTips = {}
     worldDialogOverlayJustSpoke = false
+    worldRouteBeforeMenu = false
     suppressWorldEntryVisualText = false
 
     local toState = tostring(e.ToState)
     suppressSnapshots = LOADING_STATES[toState] or false
+    -- Suppress C++ Tick() entirely during loading to prevent deadlocks.
+    -- Noesis tree walks can hang when the loading thread is
+    -- constructing/destroying UI objects under internal mutexes.
+    pcall(Ext.UI.SuppressGlobalFocusTick, suppressSnapshots)
     -- Suppress visual text speech on world entry (Running state).
     -- HUD widgets fire immediately and their visual texts (static button
     -- prompts like "Examine", "Context Menu") are useless noise.
