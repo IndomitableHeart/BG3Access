@@ -565,6 +565,8 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     if World then World.ResetState() end
     local Nav = BG3Access.Client.WorldNav
     if Nav then Nav.ResetState() end
+    local Combat = BG3Access.Client.Combat
+    if Combat then Combat.ResetState() end
 
     -- Reset router state.
     lastWidgetRootStr = nil

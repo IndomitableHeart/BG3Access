@@ -7,6 +7,7 @@ BG3Access.Shared.RequireFiles("Client/", {
 "SpellBook",
 "WorldUI",
 "Menus",
+"Combat",
 "WorldNav",
 "EventRouter",
 })

@@ -3918,6 +3918,7 @@ local function FormatAmount(value)
 end
 
 --- Read character info: name, race/class, HP.
+--- In combat, also includes turn status and round number.
 --- RS Up handler.
 local function SpeakCharacterInfo()
     -- UI text from PartyLine_c widget.
@@ -3955,6 +3956,29 @@ local function SpeakCharacterInfo()
     end
     if hpText ~= "" then
         charSpeech:Add("hp", hpText, "brief")
+    end
+
+    -- Combat info: whose turn and round number.
+    local Combat = BG3Access.Client.Combat
+    if Combat and Combat.IsInCombat and Combat.IsInCombat() then
+        local currentTurn = Combat.GetCurrentTurnName
+            and Combat.GetCurrentTurnName()
+        local currentRound = Combat.GetCurrentRound
+            and Combat.GetCurrentRound()
+        if currentTurn and currentTurn ~= "" then
+            -- Check if it matches the player's character name.
+            if characterName ~= ""
+                and currentTurn == characterName then
+                charSpeech:Add("turnStatus", "Your turn", "brief")
+            else
+                charSpeech:Add("turnStatus",
+                    currentTurn .. "'s turn", "brief")
+            end
+        end
+        if currentRound and currentRound > 0 then
+            charSpeech:Add("round",
+                "Round " .. tostring(currentRound), "normal")
+        end
     end
 
     local charFormatted = charSpeech:Format()
@@ -4100,7 +4124,14 @@ local function HandleRSDirection(direction)
     elseif direction == RS_DIRECTION_DOWN then
         SpeakTargetInfo()
     elseif direction == RS_DIRECTION_RIGHT then
-        SpeakActionResources()
+        -- In combat: RS Right reads turn order instead of resources
+        -- (resources are already announced in the character info).
+        local Combat = BG3Access.Client.Combat
+        if Combat and Combat.IsInCombat and Combat.IsInCombat() then
+            Combat.SpeakTurnOrder()
+        else
+            SpeakActionResources()
+        end
     end
 end
 

@@ -297,3 +297,191 @@ end)
 
 _P("BG3Access: Server classify listener registered on '"
     .. CHANNEL_REQUEST .. "'")
+
+-- ============================================================================
+-- Combat Event Relay
+--
+-- Registers Osiris listeners for combat events and relays them to the
+-- client via net messages.  The client's Combat.lua module receives
+-- these and generates speech for the screen reader.
+--
+-- Events relayed:
+--   TurnStarted     -- whose turn it is (all combatants)
+--   CombatStarted   -- combat begins
+--   CombatEnded     -- combat ends
+--   RoundStarted    -- new combat round
+--   Died            -- character death (all combatants)
+--   StatusApplied   -- status effect gained (party members only)
+--   StatusRemoved   -- status effect lost (party members only)
+--   AttackedBy      -- damage dealt (party member involved)
+-- ============================================================================
+
+local COMBAT_CHANNEL = "BG3Access_Combat"
+
+--- Resolve a character GUID to a translated display name.
+--- Returns the name string, or "Unknown" if resolution fails.
+local function GetCharacterName(characterGuid)
+    local resolveOk, resolvedName = pcall(function()
+        local entity = Ext.Entity.Get(characterGuid)
+        if not entity or not entity.DisplayName then return nil end
+        local nameKey = entity.DisplayName.NameKey
+        if not nameKey or not nameKey.Handle
+            or not nameKey.Handle.Handle then
+            return nil
+        end
+        local translated = Ext.Loca.GetTranslatedString(
+            nameKey.Handle.Handle)
+        if translated and translated ~= "" then return translated end
+        return nil
+    end)
+    if resolveOk and resolvedName then return resolvedName end
+    return "Unknown"
+end
+
+--- Check whether a character GUID belongs to a player party member.
+local function IsPartyMember(characterGuid)
+    local checkOk, checkResult = pcall(function()
+        local entity = Ext.Entity.Get(characterGuid)
+        if not entity then return false end
+        local partyMember = entity.PartyMember
+        return partyMember ~= nil
+    end)
+    return checkOk and checkResult == true
+end
+
+--- Resolve a status ID to a human-readable display name.
+--- Falls back to the raw ID if no display name is found.
+local function GetStatusDisplayName(statusId)
+    local statusOk, statusName = pcall(function()
+        local statEntry = Ext.Stats.Get(statusId)
+        if statEntry and statEntry.DisplayName
+            and statEntry.DisplayName ~= "" then
+            local translated = Ext.Loca.GetTranslatedString(
+                statEntry.DisplayName)
+            if translated and translated ~= "" then
+                return translated
+            end
+        end
+        return nil
+    end)
+    if statusOk and statusName then return statusName end
+    return statusId
+end
+
+--- Send a combat event payload to all clients.
+local function RelayCombatEvent(eventData)
+    local stringifyOk, payload = pcall(Ext.Json.Stringify, eventData)
+    if stringifyOk and payload then
+        Ext.ServerNet.BroadcastMessage(COMBAT_CHANNEL, payload)
+    end
+end
+
+-- Turn started: announce whose turn it is (all combatants).
+Ext.Osiris.RegisterListener("TurnStarted", 1, "after",
+    function(characterGuid)
+        local characterName = GetCharacterName(characterGuid)
+        RelayCombatEvent({
+            event = "TurnStarted",
+            characterGuid = tostring(characterGuid),
+            characterName = characterName,
+            isPartyMember = IsPartyMember(characterGuid),
+        })
+    end)
+
+-- Combat started.
+Ext.Osiris.RegisterListener("CombatStarted", 1, "after",
+    function(combatGuid)
+        RelayCombatEvent({
+            event = "CombatStarted",
+            combatGuid = tostring(combatGuid),
+        })
+    end)
+
+-- Combat ended.
+Ext.Osiris.RegisterListener("CombatEnded", 1, "after",
+    function(combatGuid)
+        RelayCombatEvent({
+            event = "CombatEnded",
+            combatGuid = tostring(combatGuid),
+        })
+    end)
+
+-- New combat round.
+Ext.Osiris.RegisterListener("CombatRoundStarted", 2, "after",
+    function(combatGuid, round)
+        RelayCombatEvent({
+            event = "RoundStarted",
+            combatGuid = tostring(combatGuid),
+            round = round,
+        })
+    end)
+
+-- Character died (all combatants).
+Ext.Osiris.RegisterListener("Died", 1, "after",
+    function(characterGuid)
+        local characterName = GetCharacterName(characterGuid)
+        RelayCombatEvent({
+            event = "Died",
+            characterGuid = tostring(characterGuid),
+            characterName = characterName,
+            isPartyMember = IsPartyMember(characterGuid),
+        })
+    end)
+
+-- Status applied (party members only -- server filters).
+Ext.Osiris.RegisterListener("StatusApplied", 4, "after",
+    function(characterGuid, statusId, causee, storyActionId)
+        if not IsPartyMember(characterGuid) then return end
+        local characterName = GetCharacterName(characterGuid)
+        local statusDisplayName = GetStatusDisplayName(statusId)
+        RelayCombatEvent({
+            event = "StatusApplied",
+            characterGuid = tostring(characterGuid),
+            characterName = characterName,
+            statusId = statusId,
+            statusDisplayName = statusDisplayName,
+            isPartyMember = true,
+        })
+    end)
+
+-- Status removed (party members only -- server filters).
+Ext.Osiris.RegisterListener("StatusRemoved", 4, "after",
+    function(characterGuid, statusId, causee, storyActionId)
+        if not IsPartyMember(characterGuid) then return end
+        local characterName = GetCharacterName(characterGuid)
+        local statusDisplayName = GetStatusDisplayName(statusId)
+        RelayCombatEvent({
+            event = "StatusRemoved",
+            characterGuid = tostring(characterGuid),
+            characterName = characterName,
+            statusId = statusId,
+            statusDisplayName = statusDisplayName,
+            isPartyMember = true,
+        })
+    end)
+
+-- Damage dealt (only when a party member is attacker or defender).
+Ext.Osiris.RegisterListener("AttackedBy", 7, "after",
+    function(defender, attackerOwner, attacker2,
+             damageType, damageAmount, damageCause, storyActionId)
+        local defenderIsParty = IsPartyMember(defender)
+        local attackerIsParty = IsPartyMember(attackerOwner)
+        if not defenderIsParty and not attackerIsParty then return end
+
+        local defenderName = GetCharacterName(defender)
+        local attackerName = GetCharacterName(attackerOwner)
+        RelayCombatEvent({
+            event = "AttackedBy",
+            defenderGuid = tostring(defender),
+            defenderName = defenderName,
+            attackerGuid = tostring(attackerOwner),
+            attackerName = attackerName,
+            damageType = tostring(damageType),
+            damageAmount = damageAmount,
+            defenderIsParty = defenderIsParty,
+            attackerIsParty = attackerIsParty,
+        })
+    end)
+
+_P("BG3Access: Combat event relay registered on '"
+    .. COMBAT_CHANNEL .. "'")
