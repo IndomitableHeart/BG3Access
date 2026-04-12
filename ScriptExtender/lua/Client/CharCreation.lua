@@ -1138,10 +1138,10 @@ local function SpeakNamingScreen()
     namingScreenWasSpoken = true
 
     local speechData = Helpers.CreateSpeechData()
-    speechData:Add("namingTitle", "Enter Character Name", "brief")
+    speechData:Add("title", "Enter Character Name")
     speechData:Add("characterName", characterName, "brief")
-    speechData:Add("namingHint",
-        "Press A to rename. Press Y to choose guardian", "normal")
+    speechData:Add("hint",
+        "Press A to rename. Press Y to choose guardian")
     local speech = speechData:Format()
     Log.Info("NAMING SCREEN: " .. speech)
     Ext.Tolk.Speak(speech, true)

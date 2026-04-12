@@ -81,6 +81,31 @@ local function HandleTickSnapshot(snapshot)
         end
     end
 
+    -- =================================================================
+    -- Loading tips: read _loadingHint_ keys from widgetData.namedTexts.
+    -- C++ CollectLoadingHints finds the LoadingHints ItemsControl by name,
+    -- walks its TextBlock children, reads Inlines text, and stores as
+    -- _loadingHint_1, _loadingHint_2, etc.  Runs FIRST before any routing
+    -- logic that might return early (loading screen has no focused element).
+    -- =================================================================
+    if snapshot.widgetAdded and snapshot.widgetData
+        and snapshot.widgetData.dcType == "ls.LoadingScreen"
+        and snapshot.widgetData.namedTexts then
+        for textKey, textValue in pairs(snapshot.widgetData.namedTexts) do
+            if textKey:find("^_loadingHint_") then
+                if textValue and textValue ~= ""
+                    and not textValue:match("^%d+%%?$")
+                    and not spokenLoadingTips[textValue] then
+                    spokenLoadingTips[textValue] = true
+                    local tipSpeech = Helpers.CreateSpeechData()
+                    tipSpeech:Add("loadingTip", textValue, "normal")
+                    Log.Info("LOADING TIP: " .. textValue)
+                    Ext.Tolk.Speak(tipSpeech:Format(), false)
+                end
+            end
+        end
+    end
+
     local focusedElement = snapshot.focusedElement
 
     -- =================================================================
@@ -288,22 +313,24 @@ local function HandleTickSnapshot(snapshot)
     if not focusedElement or not focusedElement.elemType then return end
 
     -- =================================================================
+    -- Loading suppression: skip handler dispatch during loading.
+    -- =================================================================
+    if suppressSnapshots then
+        return
+    end
+
+    -- =================================================================
     -- World entry announcement: one-shot replacement for the junk
     -- visual text burst (Overlay "Examine", "Context Menu", etc.).
     -- Speaks character name + info via ReadHUDInfo instead.
     -- =================================================================
     if suppressWorldEntryVisualText then
         suppressWorldEntryVisualText = false
-        -- Clear ALL namedTexts: visual texts are HUD junk, and the
-        -- remaining widget texts (ExtraInfoName, TaskDescription, etc.)
-        -- would get spoken by the fallback handler.  We speak a clean
-        -- greeting via ReadHUDInfo instead.
         if focusedElement.namedTexts then
             for textKey, _ in pairs(focusedElement.namedTexts) do
                 focusedElement.namedTexts[textKey] = nil
             end
         end
-        -- Speak character name + info as world entry greeting.
         local hudOk, hudInfo = pcall(Ext.UI.ReadHUDInfo)
         if hudOk and hudInfo then
             local parts = {}
@@ -329,38 +356,6 @@ local function HandleTickSnapshot(snapshot)
             end
         end
         return  -- skip handler dispatch for this snapshot
-    end
-
-    -- =================================================================
-    -- Loading suppression: only allow visual text (tips, splash screen).
-    -- C++ sends indexed keys (_visualText_1, _visualText_2, ...) to
-    -- avoid Lua table key collisions.  Speak each non-percentage text.
-    -- =================================================================
-    if suppressSnapshots then
-        if snapshot.widgetAdded and focusedElement.namedTexts then
-            -- Collect and sort keys so tips speak in document order
-            -- (pairs() iteration order is not guaranteed).
-            local visualKeys = {}
-            for textKey, _ in pairs(focusedElement.namedTexts) do
-                if textKey:find("^_visualText_") then
-                    table.insert(visualKeys, textKey)
-                end
-            end
-            table.sort(visualKeys)
-            for _, textKey in ipairs(visualKeys) do
-                local visualText = focusedElement.namedTexts[textKey]
-                if visualText and visualText ~= ""
-                    and not visualText:match("^%d+%%?$")
-                    and not spokenLoadingTips[visualText] then
-                    spokenLoadingTips[visualText] = true
-                    local tipSpeech = Helpers.CreateSpeechData()
-                    tipSpeech:Add("loadingTip", visualText, "normal")
-                    Log.Info("LOADING TIP: " .. visualText)
-                    Ext.Tolk.Speak(tipSpeech:Format(), false)
-                end
-            end
-        end
-        return
     end
 
     -- =================================================================

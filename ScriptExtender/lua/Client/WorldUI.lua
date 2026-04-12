@@ -511,10 +511,10 @@ local function HandleRadialOpen()
     inRadial = true
 
     local speechData = Helpers.CreateSpeechData()
-    speechData:Add("radialTitle", "Action Radial", "brief")
+    speechData:Add("title", "Action Radial")
     if not radialHintSpoken then
         radialHintSpoken = true
-        speechData:Add("radialHint", RADIAL_HINT, "normal")
+        speechData:Add("hint", RADIAL_HINT)
     end
     local speech = speechData:Format()
     Log.Info("RADIAL OPEN: " .. speech)
@@ -770,6 +770,11 @@ end
 ---                                  Returns (name, value, desc) to override, or nil
 ---                                  to fall through.  Can also return a SpeechData
 ---                                  object for full control over speech ordering.
+---   treatTabsAsItems (boolean)  -- optional: when true, tab-typed focus changes
+---                                  (ListBoxItems) are classified as item navigation
+---                                  instead of screen entries.  Use for panels where
+---                                  ListBoxItems are navigable items, not real tabs
+---                                  (e.g., ActiveRoll bonus list).
 ---   customTooltipFn (function)  -- optional: per-handler tooltip formatting.
 ---                                  Called with (tooltipTexts, focusedDCType).
 ---                                  Returns formatted speech string, or nil to
@@ -818,17 +823,24 @@ local function CreatePanelHandler(config)
             and snapshot.inlineCarouselValue ~= ""
 
         local isScreenEntry = false
+        -- treatTabsAsItems: when true, tab-typed focus changes are
+        -- item navigation, not screen entries.  Used by ActiveRoll
+        -- where ListBoxItems are bonus items, not real carousel tabs.
+        local tabIsItem = config.treatTabsAsItems
+            and focusedElement.isTab
         if snapshot.selectionChanged then
             isScreenEntry = true
         elseif snapshot.widgetAdded and snapshot.widgetData
             and not handlerState.lastSpokenTab then
             isScreenEntry = true
-        elseif snapshot.focusChanged and focusedElement.isTab then
+        elseif snapshot.focusChanged and focusedElement.isTab
+            and not tabIsItem then
             isScreenEntry = true
         end
 
         local isItemNav = snapshot.focusChanged
-            and not focusedElement.isTab and not isScreenEntry
+            and (not focusedElement.isTab or tabIsItem)
+            and not isScreenEntry
         local isCarouselOnly = hasCarousel and not snapshot.focusChanged
         local isValueOnly = not isScreenEntry and not isItemNav
             and not isCarouselOnly and snapshot.valueChanged
@@ -1429,7 +1441,8 @@ local ContainerHandler = CreatePanelHandler({
 -- customItemFn handles bonus item navigation (VMBoost, VMAdvantage).
 local ActiveRollHandler = CreatePanelHandler({
     name = "ActiveRoll",
-    hint = "Y to roll. Left and right to browse bonuses.",
+    hint = false,
+    treatTabsAsItems = true,
     onWidgetAdded = function(widgetData, handlerState)
         local dcProps = widgetData and widgetData.dcProps
         if not dcProps then return end
@@ -1438,14 +1451,30 @@ local ActiveRollHandler = CreatePanelHandler({
         if not rollState or rollState == "" then return end
 
         local previousState = handlerState.lastRollState
-        handlerState.lastRollState = rollState
 
         -- Suppress duplicate announcements for the same state.
+        -- NOTE: lastRollState is committed AFTER successful speech,
+        -- not here.  If data isn't ready yet (e.g., FinalResult nil
+        -- on first ResultReady INPC), the state stays unconsumed so
+        -- the next INPC can retry with complete data.
         if rollState == previousState then return end
 
         -- Entry: roll screen just appeared (WaitForStart or Introduction).
         if rollState == "WaitForStart"
             or rollState == "IntroductionAnimation" then
+            -- Always mark hint as spoken so the generic screen entry
+            -- pipeline doesn't speak it separately.  We include it
+            -- in the entry speech below.
+            handlerState.tabHintSpoken = true
+
+            -- Skip if DC isn't fully populated yet (first widget event
+            -- often arrives before the game sets SkillOrAbility).  The
+            -- INPC-driven second event will have complete data.
+            local skillName = dcProps.SkillOrAbility
+            if not skillName or skillName == ""
+                or skillName:match("^h%x+g") then
+                return
+            end
             local speechData = Helpers.CreateSpeechData()
 
             -- Dialogue line (for dialogue skill checks).
@@ -1456,46 +1485,54 @@ local ActiveRollHandler = CreatePanelHandler({
                 speechData:Add("dialogue", dialogueLine, "normal")
             end
 
-            -- Skill or ability name ("Persuasion", "Sleight of Hand").
-            local skillName = dcProps.SkillOrAbility
+            -- Build title from roll info: skill, ability check, DC,
+            -- advantage.  Combined into a single "title" field so it
+            -- always speaks regardless of verbosity tier.
+            local titleParts = {}
             if skillName and skillName ~= ""
                 and not skillName:match("^h%x+g") then
-                speechData:Add("skill", skillName, "brief")
+                titleParts[#titleParts + 1] = skillName
             end
-
-            -- Ability check text ("Charisma Check").
             local abilityText = dcProps.AbilityCheckText
             if abilityText and abilityText ~= ""
                 and dcProps.IsPureAbilityRoll ~= "True"
                 and not abilityText:match("^h%x+g") then
-                speechData:Add("ability", abilityText, "brief")
+                titleParts[#titleParts + 1] = abilityText
             end
-
-            -- DC from Roll sub-object.
             local roll = dcProps.Roll
             if roll and type(roll) == "table" then
                 local difficultyCheck = roll.DifficultyCheck
                 if difficultyCheck and difficultyCheck ~= "" then
-                    speechData:Add("dc",
-                        "DC " .. difficultyCheck, "brief")
+                    titleParts[#titleParts + 1] = "DC " .. difficultyCheck
                 end
                 local advantageType = roll.RollAdvantageType
                 if advantageType
                     and advantageType ~= "None"
                     and advantageType ~= "" then
-                    speechData:Add("advantage", advantageType, "brief")
+                    titleParts[#titleParts + 1] = advantageType
                 end
             end
+            if #titleParts > 0 then
+                speechData:Add("title",
+                    table.concat(titleParts, ". "))
+            end
+
+            -- Navigation hint (globally toggleable via hintsEnabled).
+            speechData:Add("hint",
+                "Y to roll. Left and right to browse bonuses.")
 
             local formatted = speechData:Format()
             if formatted and formatted ~= "" then
+                handlerState.lastRollState = rollState
                 Log.Info("ACTIVE ROLL entry: " .. formatted)
                 handlerState.lastSpokenFullText = formatted
+                handlerState.entrySpoken = true
                 speechData:Speak(handlerState, true)
             end
 
         -- Re-roll available (Inspiration point or Lucky feat).
         elseif rollState == "WaitForReRoll" then
+            handlerState.lastRollState = rollState
             local speechData = Helpers.CreateSpeechData()
             speechData:Add("reroll",
                 "Re-roll available. Y to re-roll.", "brief")
@@ -1507,30 +1544,47 @@ local ActiveRollHandler = CreatePanelHandler({
             end
 
         -- Result ready: announce outcome.
+        -- Properties use On/Off (not True/False).
+        -- Roll.RolledNumber has the die value but is often 0 when
+        -- ResultReady first fires (dice animation still settling).
+        -- Result ready: FinalResult DP has the rolled number (read
+        -- from the DCActiveRoll DependencyProperty, not the Roll
+        -- sub-object which is often 0 during dice animation).
+        -- If FinalResult isn't available yet, don't commit state
+        -- so the next INPC retry can pick it up with complete data.
         elseif rollState == "ResultReady" then
             local finalResult = dcProps.FinalResult
             local success = dcProps.Success
             local skipped = dcProps.SkippedRoll
+
+            -- Defer if FinalResult isn't populated yet.
+            if not finalResult or finalResult == ""
+                or finalResult == "0" then
+                Log.Debug("ACTIVE ROLL ResultReady: FinalResult="
+                    .. tostring(finalResult) .. ", deferring")
+                return
+            end
+
+            handlerState.lastRollState = rollState
             local speechData = Helpers.CreateSpeechData()
 
-            if skipped == "True" then
+            if skipped == "On" then
                 speechData:Add("skipped", "Skipped", "brief")
             end
 
-            if finalResult and finalResult ~= "" then
-                speechData:Add("rolled",
-                    "Rolled " .. finalResult, "brief")
-            end
+            speechData:Add("rolled",
+                "Rolled " .. finalResult, "brief")
 
-            if success == "True" then
-                if finalResult == "20" then
+            local resultNumber = tonumber(finalResult) or 0
+            if success == "On" then
+                if resultNumber == 20 then
                     speechData:Add("outcome",
                         "Critical Success!", "brief")
                 else
                     speechData:Add("outcome", "Success!", "brief")
                 end
-            elseif success == "False" then
-                if finalResult == "1" then
+            else
+                if resultNumber == 1 then
                     speechData:Add("outcome",
                         "Critical Failure!", "brief")
                 else
@@ -1544,23 +1598,64 @@ local ActiveRollHandler = CreatePanelHandler({
                 handlerState.lastSpokenFullText = formatted
                 speechData:Speak(handlerState, true)
             end
+
+        else
+            -- Unrecognized intermediate state (e.g., rolling animation).
+            -- Consume it so it doesn't block the next real transition.
+            handlerState.lastRollState = rollState
+            Log.Debug("ACTIVE ROLL state: " .. rollState)
         end
     end,
     onReset = function(handlerState)
         handlerState.lastRollState = nil
+        handlerState.entrySpoken = false
+        handlerState.lastBonusElemId = nil
     end,
     customItemFn = function(focusedElement, handlerState, snapshot)
-        -- Bonus items in the horizontal list: format with value info.
+        -- Suppress item speech until the entry announcement has spoken.
+        -- The game focuses Thieves' Tools before the INPC delivers
+        -- complete roll data, causing item speech to get interrupted.
+        -- Return empty SpeechData to suppress all generic speech too.
+        if not handlerState.entrySpoken then
+            return Helpers.CreateSpeechData()
+        end
+
+        local elemId = focusedElement.elemId
         local dcProps = focusedElement.dcProps
-        if not dcProps then return nil end
+        if not dcProps then
+            Log.Warn("ActiveRoll customItemFn: dcProps nil for "
+                .. tostring(focusedElement.dcType)
+                .. " elemId=" .. tostring(elemId))
+            return nil
+        end
+
+        -- Dedup on elemId: skip only when the same element is focused
+        -- consecutively.  Different elements always speak even when
+        -- their text is identical (e.g., two "+2" bonuses).
+        if elemId and elemId == handlerState.lastBonusElemId then
+            return Helpers.CreateSpeechData()
+        end
+        handlerState.lastBonusElemId = elemId
 
         local dcType = focusedElement.dcType or ""
 
-        -- VMBoost: modifier name + numeric value or dice string.
+        -- VMBoost: modifier name + boost type + numeric value or dice.
+        -- BoostType distinguishes "ProficiencyBonus" vs "ExpertiseBonus"
+        -- (XAML uses DataTrigger on BoostType to render the label).
         if dcType:find("VMBoost") then
             local name = dcProps.Name or ""
             local parts = {}
             if name ~= "" then parts[#parts + 1] = name end
+
+            -- Boost type label (Proficiency / Expertise).
+            local boostType = dcProps.BoostType
+            if boostType and boostType ~= "" then
+                if boostType == "ProficiencyBonus" then
+                    parts[#parts + 1] = "Proficiency"
+                elseif boostType == "ExpertiseBonus" then
+                    parts[#parts + 1] = "Expertise"
+                end
+            end
 
             -- Numeric value ("+3", "-1").
             local value = dcProps.Value
@@ -1583,8 +1678,19 @@ local ActiveRollHandler = CreatePanelHandler({
             end
 
             if #parts > 0 then
-                return table.concat(parts, " ")
+                local itemSpeech = Helpers.CreateSpeechData()
+                itemSpeech:Add("itemName",
+                    table.concat(parts, " "), "brief")
+                return itemSpeech
             end
+
+            -- Debug: log dcProps when VMBoost produces no text.
+            local propDump = {}
+            for propName, propValue in pairs(dcProps) do
+                propDump[#propDump + 1] = propName .. "="
+                    .. tostring(propValue)
+            end
+            Log.Warn("VMBoost empty: " .. table.concat(propDump, " | "))
         end
 
         -- VMAdvantage: advantage/disadvantage + reason.
@@ -1592,20 +1698,25 @@ local ActiveRollHandler = CreatePanelHandler({
             local advantageType = dcProps.AdvantageType or ""
             local description = dcProps.Description or ""
             if advantageType ~= "" then
+                local itemSpeech = Helpers.CreateSpeechData()
+                local advantageText = advantageType
                 if description ~= ""
                     and not description:match("^h%x+g") then
-                    return advantageType .. ": " .. description
+                    advantageText = advantageType .. ": " .. description
                 end
-                return advantageType
+                itemSpeech:Add("itemName", advantageText, "brief")
+                return itemSpeech
             end
         end
 
-        -- VMCharacterAction: spell/action name + description.
+        -- VMCharacterAction: spell/action name.
         if dcType:find("VMCharacterAction") then
             local name = dcProps.Name
             if name and name ~= ""
                 and not name:match("^h%x+g") then
-                return name
+                local itemSpeech = Helpers.CreateSpeechData()
+                itemSpeech:Add("itemName", name, "brief")
+                return itemSpeech
             end
         end
 
@@ -1614,7 +1725,9 @@ local ActiveRollHandler = CreatePanelHandler({
             local name = dcProps.Name
             if name and name ~= ""
                 and not name:match("^h%x+g") then
-                return name
+                local itemSpeech = Helpers.CreateSpeechData()
+                itemSpeech:Add("itemName", name, "brief")
+                return itemSpeech
             end
         end
 

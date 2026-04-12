@@ -238,6 +238,25 @@ local function CreateMenuHandler(config)
         end
 
         if isValueOnly then
+            -- customItemFn handles value changes for expander toggles.
+            if config.customItemFn then
+                local customValue = config.customItemFn(
+                    focusedElement, handlerState, snapshot)
+                if customValue and customValue ~= ""then
+                    -- For value-only changes, speak just the state
+                    -- portion (e.g., "expanded") not the full text
+                    -- (e.g., "Tav, expanded") to avoid repeating the
+                    -- name the user already heard on focus.
+                    local stateOnly = customValue:match(", ([%a]+)$")
+                    local toSpeak = stateOnly or customValue
+                    if toSpeak ~= handlerState.lastSpokenFullText then
+                        local valueSpeech = Helpers.CreateSpeechData()
+                        valueSpeech:Add("customValue", toSpeak, "brief")
+                        valueSpeech:Speak(handlerState, false)
+                    end
+                    return
+                end
+            end
             local valueText = Helpers.FormatDCValue(focusedElement.dcProps)
             if valueText and valueText ~= ""
                 and valueText ~= handlerState.lastSpokenFullText then
@@ -400,9 +419,27 @@ local function CreateMenuHandler(config)
         local itemValue = nil
         local itemDesc = nil
 
-        local splitName, splitValue, splitDesc, splitValueDesc =
-            Helpers.FormatDCTextSplit(focusedElement.dcProps,
-                focusedElement.dcType)
+        -- customItemFn: handler-specific extraction before generic.
+        -- Return nil to fall through, string to override item name,
+        -- SpeechData for full control.
+        local splitName, splitValue, splitDesc, splitValueDesc
+        local customHandled = false
+        if config.customItemFn then
+            splitName = config.customItemFn(
+                focusedElement, handlerState, snapshot)
+            if splitName ~= nil then
+                customHandled = true
+                splitValue = nil
+                splitDesc = nil
+                splitValueDesc = nil
+            end
+        end
+
+        if not customHandled then
+            splitName, splitValue, splitDesc, splitValueDesc =
+                Helpers.FormatDCTextSplit(focusedElement.dcProps,
+                    focusedElement.dcType)
+        end
         if not splitName or splitName == "" then
             splitName = Helpers.ExtractTextFromData(
                 focusedElement, handlerState.lastSpokenTab, isScreenEntry)
@@ -582,6 +619,35 @@ local SaveLoadHandler = CreateMenuHandler({
     end,
     onReset = function(handlerState)
         handlerState.saveLoadMode = nil
+    end,
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        -- Append expanded/collapsed state for campaign expanders.
+        local elemId = focusedElement.elemId or ""
+        if elemId:find("ExpanderButton") then
+            -- Read rendered text from the focused element's visual
+            -- tree (gives "Tav", not "DockPanel" from the elemId).
+            local headerName = nil
+            local readOk, headerTexts = pcall(
+                Ext.UI.ReadFocusedTextBlocks)
+            if readOk and headerTexts and #headerTexts > 0 then
+                headerName = Helpers.StripMarkupTags(headerTexts[1])
+            end
+            if not headerName or headerName == "" then
+                headerName = Helpers.FormatDCText(
+                    focusedElement.dcProps, focusedElement.dcType)
+            end
+            if not headerName or headerName == "" then
+                headerName = "Campaign"
+            end
+            local isChecked = focusedElement.isChecked
+            if isChecked == true then
+                headerName = headerName .. ", expanded"
+            elseif isChecked == false then
+                headerName = headerName .. ", collapsed"
+            end
+            return headerName
+        end
+        return nil
     end,
     hintFn = function(screenTitle, handlerState)
         -- Determine mode from stored detection or from screenTitle fallback.

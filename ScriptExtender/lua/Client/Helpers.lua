@@ -955,6 +955,10 @@ local DIALOG_BUTTON_HINT = "Press A to confirm, or B to cancel"
 -- "verbose" adds descriptions and secondary details.
 local TIER_RANK = {brief = 1, normal = 2, verbose = 3}
 
+-- Global hint toggle.  When false, Format() omits all fields named "hint".
+-- Default on.  Will be wired to mod settings later.
+local hintsEnabled = true
+
 --- CreateSpeechData: creates an ordered speech data builder.
 --- Each field has a name (for debugging/identification), a value (the
 --- text to speak), and a verbosity tier (brief/normal/verbose).
@@ -1087,6 +1091,13 @@ local function CreateSpeechData()
 
         --- Format: assemble fields into a speech string, filtered by
         --- verbosity.  Fields with tier rank <= verbosity rank are included.
+        ---
+        --- Special field semantics:
+        ---   "title"  -- always included regardless of verbosity tier.
+        ---   "hint"   -- included only when the global hintsEnabled flag
+        ---               is true; tier parameter is ignored.
+        ---   all else -- standard tier filtering applies.
+        ---
         --- @param self table  The SpeechData object.
         --- @param verbosity string|nil  "brief", "normal", or "verbose".
         ---     Default "verbose" (all fields spoken).
@@ -1096,8 +1107,18 @@ local function CreateSpeechData()
             local maxRank = TIER_RANK[verbosity] or 3
             local parts = {}
             for _, field in ipairs(self.fields) do
-                local fieldRank = TIER_RANK[field.tier] or 2
-                if fieldRank <= maxRank then
+                local include = false
+                if field.name == "title" then
+                    -- Title fields always speak regardless of verbosity.
+                    include = true
+                elseif field.name == "hint" then
+                    -- Hint fields are globally toggleable.
+                    include = hintsEnabled
+                else
+                    local fieldRank = TIER_RANK[field.tier] or 2
+                    include = fieldRank <= maxRank
+                end
+                if include then
                     -- Strip trailing punctuation/whitespace before joining.
                     local cleaned = field.value:gsub("[%.%s]+$", "")
                     if cleaned ~= "" then
@@ -1886,6 +1907,19 @@ end
 -- ---------------------------------------------------------------------------
 -- Exports
 -- ---------------------------------------------------------------------------
+--- SetHintsEnabled: toggle the global hint flag.
+--- When false, Format() omits all fields named "hint".
+--- @param enabled boolean
+local function SetHintsEnabled(enabled)
+    hintsEnabled = enabled
+end
+
+--- GetHintsEnabled: return current hint toggle state.
+--- @return boolean
+local function GetHintsEnabled()
+    return hintsEnabled
+end
+
 BG3Access.Client.Helpers = {
     StripMarkupTags              = StripMarkupTags,
     NormalizeForCompare          = NormalizeForCompare,
@@ -1917,4 +1951,6 @@ BG3Access.Client.Helpers = {
     FormatAbilityTooltip         = FormatAbilityTooltip,
     FormatCombatStatTooltip      = FormatCombatStatTooltip,
     FormatItemTooltip            = FormatItemTooltip,
+    SetHintsEnabled              = SetHintsEnabled,
+    GetHintsEnabled              = GetHintsEnabled,
 }
