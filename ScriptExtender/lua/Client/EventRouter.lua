@@ -303,14 +303,15 @@ local function HandleTickSnapshot(snapshot)
                     Log.Info("Routing to Menus (from world)")
                 end
             else
-                -- Generic/unknown DC type: let both sides see the event
-                -- but don't change routing.
-                if routeToWorld then
-                    if World then
-                        World.HandlePanelWidgetAdded(snapshot.widgetData)
-                    end
-                else
-                    Menus.HandleWidgetAdded(snapshot.widgetData)
+                -- Generic/unknown DC type (HUD noise like
+                -- DCCrossplayNotifications, ls.Widget, etc.).
+                -- Only forward to WorldUI which safely ignores
+                -- unhandled types.  Do NOT forward to Menus --
+                -- the default handler (MainMenu) would activate
+                -- for HUD noise and steal routing from WorldUI
+                -- panels like Journal/Quests.
+                if routeToWorld and World then
+                    World.HandlePanelWidgetAdded(snapshot.widgetData)
                 end
             end
         end
