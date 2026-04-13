@@ -807,6 +807,14 @@ local function CreatePanelHandler(config)
         local focusedElement = snapshot.focusedElement
         if not focusedElement or not focusedElement.elemType then return end
 
+        -- User-initiated: true when the snapshot was triggered by user
+        -- input (d-pad, button, carousel switch, value toggle).
+        -- System events (widget scans, post-settle) are not user-initiated.
+        local userInitiated = snapshot.focusChanged
+            or snapshot.selectionChanged
+            or snapshot.inlineCarouselChanged
+            or snapshot.valueChanged
+
         -- Dialog answer navigation: when focus changes within an active
         -- dialog, the cutscene module handles answer speech.
         if snapshot.focusChanged and focusedElement
@@ -856,7 +864,7 @@ local function CreatePanelHandler(config)
                 and updateText ~= handlerState.lastSpokenFullText then
                 local updateSpeech = Helpers.CreateSpeechData()
                 updateSpeech:Add("widgetUpdate", updateText, "brief")
-                updateSpeech:Speak(handlerState, false)
+                updateSpeech:Speak(handlerState, false, nil, userInitiated)
                 return
             end
         end
@@ -874,7 +882,7 @@ local function CreatePanelHandler(config)
             if carouselValue ~= handlerState.lastSpokenFullText then
                 local carouselSpeech = Helpers.CreateSpeechData()
                 carouselSpeech:Add("carouselValue", carouselValue, "brief")
-                carouselSpeech:Speak(handlerState, false)
+                carouselSpeech:Speak(handlerState, false, nil, userInitiated)
             end
             return
         end
@@ -905,7 +913,8 @@ local function CreatePanelHandler(config)
                     if customName ~= handlerState.lastSpokenFullText then
                         local valueSpeech = Helpers.CreateSpeechData()
                         valueSpeech:Add("customValue", customName, "brief")
-                        valueSpeech:Speak(handlerState, false)
+                        valueSpeech:Speak(handlerState, false, nil,
+                            userInitiated)
                     end
                     return
                 end
@@ -917,7 +926,7 @@ local function CreatePanelHandler(config)
                 and valueText ~= handlerState.lastSpokenFullText then
                 local valueSpeech = Helpers.CreateSpeechData()
                 valueSpeech:Add("value", valueText, "brief")
-                valueSpeech:Speak(handlerState, false)
+                valueSpeech:Speak(handlerState, false, nil, userInitiated)
             end
             return
         end
@@ -1117,10 +1126,12 @@ local function CreatePanelHandler(config)
                     merged:Add(field.name, field.value, field.tier)
                 end
                 handlerState.lastSpeechData = merged
-                merged:Speak(handlerState, isScreenEntry)
+                merged:Speak(handlerState, isScreenEntry, nil,
+                    userInitiated)
             else
                 handlerState.lastSpeechData = customSpeechData
-                customSpeechData:Speak(handlerState, isScreenEntry)
+                customSpeechData:Speak(handlerState, isScreenEntry, nil,
+                    userInitiated)
             end
             return
         end
@@ -1186,7 +1197,7 @@ local function CreatePanelHandler(config)
         -- Cache focused element data for detail view (RS Left).
         handlerState.lastFocusedData = focusedElement
         handlerState.lastSpeechData = speechData
-        speechData:Speak(handlerState, isScreenEntry)
+        speechData:Speak(handlerState, isScreenEntry, nil, userInitiated)
     end
 
     -- -----------------------------------------------------------------
@@ -2456,7 +2467,7 @@ local function OpenBookReader(handlerState)
                         local endSpeech = Helpers.CreateSpeechData()
                         endSpeech:Add("boundary",
                             "End of text", "brief")
-                        endSpeech:Speak(handlerState, false)
+                        endSpeech:Speak(handlerState, false, nil, true)
                         return
                     end
                     currentIndex = currentIndex + 1
@@ -2467,7 +2478,7 @@ local function OpenBookReader(handlerState)
                     local lineSpeech = Helpers.CreateSpeechData()
                     lineSpeech:Add("line",
                         bookLines[currentIndex], "brief")
-                    lineSpeech:Speak(handlerState, false)
+                    lineSpeech:Speak(handlerState, false, nil, true)
 
                 elseif buttonName == "DPadUp" then
                     event:PreventAction()
@@ -2478,7 +2489,7 @@ local function OpenBookReader(handlerState)
                         local beginSpeech = Helpers.CreateSpeechData()
                         beginSpeech:Add("boundary",
                             "Beginning of text", "brief")
-                        beginSpeech:Speak(handlerState, false)
+                        beginSpeech:Speak(handlerState, false, nil, true)
                         return
                     end
                     currentIndex = currentIndex - 1
@@ -2489,7 +2500,7 @@ local function OpenBookReader(handlerState)
                     local lineSpeech = Helpers.CreateSpeechData()
                     lineSpeech:Add("line",
                         bookLines[currentIndex], "brief")
-                    lineSpeech:Speak(handlerState, false)
+                    lineSpeech:Speak(handlerState, false, nil, true)
 
                 elseif buttonName == "DPadLeft"
                     or buttonName == "DPadRight" then
@@ -2792,15 +2803,44 @@ local function RoutePanelSnapshot(snapshot)
             discoveredHandler = DC_TYPE_HANDLERS[
                 snapshot.selectedElement.dcType]
         end
-        -- Widget added on this tick: the widget event's own DC type
-        -- is a direct signal (user opened a panel), not scan noise.
-        -- Discovery-only types ARE allowed here because the widget
-        -- was freshly added (e.g., LT opens PartyLineActive_c).
+        -- Widget added on this tick: check widgetDCTypes for a
+        -- non-discovery type first.  widgetData.dcType may have been
+        -- overwritten by a background widget (PartyLine_c processed
+        -- last by C++) so it cannot be trusted directly.
+        if not discoveredHandler
+            and snapshot.widgetAdded and snapshot.widgetDCTypes then
+            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
+                if not DISCOVERY_ONLY_DC_TYPES[widgetDCType] then
+                    discoveredHandler = DC_TYPE_HANDLERS[widgetDCType]
+                    if discoveredHandler then break end
+                end
+            end
+        end
+        -- If no non-discovery handler found but widgetData has a
+        -- discovery type, allow it only when no HANDLED non-discovery
+        -- type exists in widgetDCTypes.  Unhandled HUD types like
+        -- gui::DCOverlay, gui::DCCombatants are always present and
+        -- must not block genuine LT opens (PartyLineActive_c is the
+        -- only HANDLED new widget, alongside unhandled HUD noise).
         if not discoveredHandler
             and snapshot.widgetAdded and snapshot.widgetData
-            and snapshot.widgetData.dcType then
-            discoveredHandler = DC_TYPE_HANDLERS[
-                snapshot.widgetData.dcType]
+            and snapshot.widgetData.dcType
+            and DISCOVERY_ONLY_DC_TYPES[snapshot.widgetData.dcType] then
+            local hasHandledNonDiscovery = false
+            if snapshot.widgetDCTypes then
+                for _, widgetDCType in ipairs(
+                        snapshot.widgetDCTypes) do
+                    if not DISCOVERY_ONLY_DC_TYPES[widgetDCType]
+                        and DC_TYPE_HANDLERS[widgetDCType] then
+                        hasHandledNonDiscovery = true
+                        break
+                    end
+                end
+            end
+            if not hasHandledNonDiscovery then
+                discoveredHandler = DC_TYPE_HANDLERS[
+                    snapshot.widgetData.dcType]
+            end
         end
         -- Fallback: check all widget DC types from this tick, but
         -- skip discovery-only types (always-present HUD widgets).
@@ -2816,6 +2856,12 @@ local function RoutePanelSnapshot(snapshot)
             activePanelHandler = discoveredHandler
             Log.Info("Active panel (discovered): "
                 .. activePanelHandler.name)
+            -- Handler just activated -- deliver snapshot and return.
+            -- Skip close detection on this snapshot: widgetDCTypes
+            -- cache is stale (built early in tick before the widget
+            -- became visible) and would falsely deactivate the handler.
+            activePanelHandler.HandleSnapshot(snapshot)
+            return
         else
             -- No WorldUI panel handler found.  Check if the snapshot
             -- contains a menu-worthy DC type (e.g., gui::DCGameMenu

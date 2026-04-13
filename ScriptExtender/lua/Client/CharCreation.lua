@@ -1235,6 +1235,13 @@ end
 local function HandleCCSnapshot(snapshot)
     local focusedElement = snapshot.focusedElement
 
+    -- User-initiated: true when the snapshot was triggered by user
+    -- input (d-pad, button, carousel switch, value toggle).
+    local userInitiated = snapshot.focusChanged
+        or snapshot.selectionChanged
+        or snapshot.inlineCarouselChanged
+        or snapshot.valueChanged
+
     -- =================================================================
     -- Guardian teardown suppression: after B from guardian, suppress ALL
     -- CC snapshots until the next button press (Y or B).  The naming
@@ -1766,7 +1773,7 @@ local function HandleCCSnapshot(snapshot)
             ccState.tabHintSpoken = true
             ccState.lastMainTab = detectedSectionLabel or tabName
             ccState.lastSpokenName = elemId
-            speechData:Speak(ccState, true)
+            speechData:Speak(ccState, true, nil, userInitiated)
             return
         end
 
@@ -1931,7 +1938,7 @@ local function HandleCCSnapshot(snapshot)
         end
     end
 
-    speechData:Speak(ccState, isScreenEntry)
+    speechData:Speak(ccState, isScreenEntry, nil, userInitiated)
 end
 
 -- ============================================================================

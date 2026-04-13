@@ -29,22 +29,31 @@ local currentTurnCharacterGuid = nil
 local currentRound = 0
 local pendingRoundAnnouncement = nil
 
+-- Minimal handler state for SpeechData:Speak() dedup.
+local combatSpeechState = {
+    lastSpokenFullText = nil,
+}
+
 -- ---------------------------------------------------------------------------
 -- Speech helpers
 -- ---------------------------------------------------------------------------
 
 --- Speak combat text with interrupt (cuts off previous speech).
+--- Combat events are always "user-initiated" in the sense that they
+--- are game events the user needs to hear immediately.
 local function SpeakCombatInterrupt(text)
     if not text or text == "" then return end
-    Log.Debug("Combat speech (interrupt): " .. text)
-    Ext.Tolk.Speak(text, true)
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("combat", text, "brief")
+    speechData:Speak(combatSpeechState, true, nil, true)
 end
 
 --- Speak combat text queued (appends after current speech).
 local function SpeakCombatQueued(text)
     if not text or text == "" then return end
-    Log.Debug("Combat speech (queued): " .. text)
-    Ext.Tolk.Speak(text, false)
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("combat", text, "normal")
+    speechData:Speak(combatSpeechState, false, nil, false)
 end
 
 -- ---------------------------------------------------------------------------
@@ -326,6 +335,7 @@ local function ResetState()
     currentTurnCharacterGuid = nil
     currentRound = 0
     pendingRoundAnnouncement = nil
+    combatSpeechState.lastSpokenFullText = nil
 end
 
 --- Query: are we currently in combat?

@@ -1131,22 +1131,24 @@ local function CreateSpeechData()
         end,
 
         --- Speak: format and speak the assembled text with interrupt logic.
-        --- Handles: screen entry append vs interrupt, visual-text-only
-        --- append, dedup via lastSpokenFullText, and Tolk output.
+        --- Interrupt only when user-initiated (d-pad, button) or screen
+        --- entry.  System events (widget scans, post-settle) append so
+        --- they don't cut off hint or entry speech mid-sentence.
         --- @param self table  The SpeechData object.
         --- @param handlerState table  Handler's isolated state.
         --- @param isScreenEntry boolean  Whether this is a screen entry.
         --- @param verbosity string|nil  Verbosity level (default "verbose").
-        Speak = function(self, handlerState, isScreenEntry, verbosity)
+        --- @param userInitiated boolean|nil  True when snapshot had user
+        ---     input (focusChanged, selectionChanged, carousel, value).
+        Speak = function(self, handlerState, isScreenEntry, verbosity,
+                         userInitiated)
             local assembled = self:Format(verbosity)
             if not assembled or assembled == "" then return end
 
-            local interrupt = true
-            if handlerState.screenEntryJustSpoke
-                and not isScreenEntry then
-                interrupt = false
-                handlerState.screenEntryJustSpoke = false
-            end
+            -- Interrupt only on user-initiated events or screen entries.
+            -- System events append so they don't cut off active speech.
+            local interrupt = isScreenEntry or (userInitiated == true)
+
             -- Visual text (loading tips): body-only, no title/tab/hint/item.
             -- Always append so tips queue naturally.
             if self:HasField("body") and not self:HasField("title")
@@ -1154,9 +1156,6 @@ local function CreateSpeechData()
                 and not self:HasField("hint")
                 and not self:HasField("itemName") then
                 interrupt = false
-            end
-            if isScreenEntry then
-                handlerState.screenEntryJustSpoke = true
             end
 
             local Log = BG3Access.Client.Log

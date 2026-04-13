@@ -172,6 +172,13 @@ local function CreateMenuHandler(config)
         local focusedElement = snapshot.focusedElement
         if not focusedElement or not focusedElement.elemType then return end
 
+        -- User-initiated: true when the snapshot was triggered by user
+        -- input (d-pad, button, carousel switch, value toggle).
+        local userInitiated = snapshot.focusChanged
+            or snapshot.selectionChanged
+            or snapshot.inlineCarouselChanged
+            or snapshot.valueChanged
+
         -- Dialog answer navigation: when focus changes within an active
         -- dialog, the cutscene module handles answer speech.
         if snapshot.focusChanged and focusedElement
@@ -214,7 +221,7 @@ local function CreateMenuHandler(config)
                 and updateText ~= handlerState.lastSpokenFullText then
                 local updateSpeech = Helpers.CreateSpeechData()
                 updateSpeech:Add("widgetUpdate", updateText, "brief")
-                updateSpeech:Speak(handlerState, false)
+                updateSpeech:Speak(handlerState, false, nil, userInitiated)
                 return
             end
         end
@@ -232,7 +239,7 @@ local function CreateMenuHandler(config)
             if carouselValue ~= handlerState.lastSpokenFullText then
                 local carouselSpeech = Helpers.CreateSpeechData()
                 carouselSpeech:Add("carouselValue", carouselValue, "brief")
-                carouselSpeech:Speak(handlerState, false)
+                carouselSpeech:Speak(handlerState, false, nil, userInitiated)
             end
             return
         end
@@ -252,7 +259,8 @@ local function CreateMenuHandler(config)
                     if toSpeak ~= handlerState.lastSpokenFullText then
                         local valueSpeech = Helpers.CreateSpeechData()
                         valueSpeech:Add("customValue", toSpeak, "brief")
-                        valueSpeech:Speak(handlerState, false)
+                        valueSpeech:Speak(handlerState, false, nil,
+                            userInitiated)
                     end
                     return
                 end
@@ -262,7 +270,7 @@ local function CreateMenuHandler(config)
                 and valueText ~= handlerState.lastSpokenFullText then
                 local valueSpeech = Helpers.CreateSpeechData()
                 valueSpeech:Add("value", valueText, "brief")
-                valueSpeech:Speak(handlerState, false)
+                valueSpeech:Speak(handlerState, false, nil, userInitiated)
             end
             return
         end
@@ -493,7 +501,7 @@ local function CreateMenuHandler(config)
         speechData:Add("itemValue", itemValue, "brief")
         speechData:Add("itemDesc", itemDesc, "verbose")
 
-        speechData:Speak(handlerState, isScreenEntry)
+        speechData:Speak(handlerState, isScreenEntry, nil, userInitiated)
     end
 
     -- -----------------------------------------------------------------
@@ -943,7 +951,7 @@ local function RouteSnapshot(snapshot)
     if activeHandlerWidgetName and activeHandler
         and activeHandler ~= defaultHandler
         and not snapshot.focusChanged and not snapshot.selectionChanged
-        and not snapshot.valueChanged then
+        and not snapshot.valueChanged and not snapshot.widgetAdded then
         local widgetStillPresent = false
         if snapshot.visualTextWidgetName
             and snapshot.visualTextWidgetName == activeHandlerWidgetName then
@@ -956,15 +964,31 @@ local function RouteSnapshot(snapshot)
         -- Widget callbacks only fire for changed widgets, not all
         -- visible ones.  A single tick without the widget name
         -- doesn't mean the widget closed -- it may just not have
-        -- fired a callback this tick.  Require the widget to be
-        -- absent AND no focused element (UI fully closed) before
-        -- clearing.  If there's still a focused element, the user
-        -- is navigating inside the menu and the handler is valid.
+        -- fired a callback this tick.  Check multiple signals before
+        -- concluding the widget is gone.
+        --
+        -- Focused element present = user is navigating in the menu.
         if not widgetStillPresent
             and snapshot.focusedElement
             and snapshot.focusedElement.elemType
             and snapshot.focusedElement.elemType ~= "" then
             widgetStillPresent = true
+        end
+        -- Selected element present = user has a tab/item selected.
+        if not widgetStillPresent
+            and snapshot.selectedElement
+            and snapshot.selectedElement.elemType
+            and snapshot.selectedElement.elemType ~= "" then
+            widgetStillPresent = true
+        end
+        -- Handler's DC type still in widgetDCTypes = widget visible.
+        if not widgetStillPresent and snapshot.widgetDCTypes then
+            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
+                if DC_TYPE_HANDLERS[widgetDCType] == activeHandler then
+                    widgetStillPresent = true
+                    break
+                end
+            end
         end
         if not widgetStillPresent then
             Log.Info("Clearing stale handler: " .. activeHandler.name

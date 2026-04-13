@@ -60,12 +60,75 @@ local suppressWorldEntryVisualText = false
 -- on its own is unreliable because BG3's HUD has "selected" elements
 -- (party member, hotbar slot) that the focus strategies pick up.
 local snapshotHasUIFocus = false
+-- True for one tick after worldRouteBeforeMenu restores world routing.
+-- Suppresses the post-settle widget scan so background widgets like
+-- PartyLine_c don't trigger handler activation on menu close.
+local suppressNextWidgetScan = false
+
+-- ---------------------------------------------------------------------------
+-- SelectRoutingDCType: decide which DC type to use for widget routing.
+--
+-- widgetData.dcType is LIVE data from the actual widget callback -- it
+-- reflects the real newly-visible widget.  widgetDCTypes is a cached
+-- array that can be one frame behind (rebuilt early in the tick before
+-- visibility updates).
+--
+-- Rule: trust widgetData.dcType when it's a known menu or world type.
+-- Only consult widgetDCTypes when widgetData has a generic/background
+-- type (ls.Widget, ls.DCPartyLine) that can't drive routing.
+-- ---------------------------------------------------------------------------
+local function SelectRoutingDCType(snapshot)
+    local widgetDataType = snapshot.widgetData
+        and snapshot.widgetData.dcType
+    if not widgetDataType then return nil end
+
+    -- If widgetData.dcType is a known menu or world type, use it
+    -- directly.  It's live data from the actual widget callback.
+    local World = BG3Access.Client.WorldUI
+    if Menus.IsMenuDCType(widgetDataType) then
+        return widgetDataType
+    end
+    if World and World.IsWorldDCType(widgetDataType) then
+        return widgetDataType
+    end
+
+    -- widgetData has a generic type (ls.Widget, ls.DCPartyLine, etc.).
+    -- Check widgetDCTypes for a better match.  This handles the case
+    -- where a background widget (PartyLine_c) was processed last by
+    -- C++ and overwrote widgetData with its generic type.
+    if snapshot.widgetDCTypes then
+        local bestType = nil
+        local bestPriority = 0  -- 0=none, 1=world panel, 2=menu
+        for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
+            if Menus.IsMenuDCType(widgetDCType) then
+                if 2 > bestPriority then
+                    bestType = widgetDCType
+                    bestPriority = 2
+                end
+            elseif World and World.IsWorldDCType(widgetDCType) then
+                if 1 > bestPriority then
+                    bestType = widgetDCType
+                    bestPriority = 1
+                end
+            end
+        end
+        if bestType then return bestType end
+    end
+
+    -- No better match found, use the original generic type.
+    return widgetDataType
+end
 
 -- ---------------------------------------------------------------------------
 -- HandleTickSnapshot: thin router.
 -- Dispatches to the correct handler module based on snapshot content.
 -- ---------------------------------------------------------------------------
 local function HandleTickSnapshot(snapshot)
+    -- Per-tick flag: true when the widget routing block just switched
+    -- routing to Menus on this tick.  Prevents the world-restore check
+    -- from immediately undoing the switch on the same snapshot.
+    local menuRoutedThisTick = false
+
     -- =================================================================
     -- Dialog/cutscene widget events: handle BEFORE focus check since
     -- cutscenes have no focused element.
@@ -176,8 +239,22 @@ local function HandleTickSnapshot(snapshot)
     if not suppressSnapshots
         and snapshot.widgetAdded and snapshot.widgetData
         and snapshot.widgetData.dcType then
-        local newDCType = snapshot.widgetData.dcType
-        Log.Debug("WIDGET EVENT: dcType=" .. newDCType)
+        -- Skip widget scan noise after menu close (e.g., PartyLine_c
+        -- re-discovered when returning to world from shortcuts/radials).
+        -- Clear widgetAdded so downstream discovery (RoutePanelSnapshot)
+        -- also ignores this scan.
+        if suppressNextWidgetScan then
+            suppressNextWidgetScan = false
+            snapshot.widgetAdded = false
+            Log.Debug("WIDGET EVENT suppressed (menu close re-scan)")
+        else
+        -- Use the highest-priority DC type from widgetDCTypes instead
+        -- widgetData.dcType is live data from the actual callback.
+        -- SelectRoutingDCType trusts it for known types, and only
+        -- falls back to widgetDCTypes for generic types.
+        local newDCType = SelectRoutingDCType(snapshot)
+        Log.Debug("WIDGET EVENT: dcType=" .. newDCType
+            .. " (widgetData=" .. snapshot.widgetData.dcType .. ")")
         -- Reset dialog state when a non-dialog widget appears.
         if not Cutscene.IsDialogOrCutscene(newDCType) then
             Cutscene.ResetDialogState()
@@ -221,6 +298,7 @@ local function HandleTickSnapshot(snapshot)
                 if routeToWorld then
                     if World then World.ResetAllPanelHandlers() end
                     worldRouteBeforeMenu = true
+                    menuRoutedThisTick = true
                     routeToWorld = false
                     Log.Info("Routing to Menus (from world)")
                 end
@@ -236,6 +314,7 @@ local function HandleTickSnapshot(snapshot)
                 end
             end
         end
+    end  -- suppressNextWidgetScan else
     end
 
     -- =================================================================
@@ -260,9 +339,25 @@ local function HandleTickSnapshot(snapshot)
     -- Update UI focus flag: true whenever the snapshot carries a
     -- focused element.  This is how IsUIActive knows whether the
     -- player is in the world (no focus) or in some UI (focused).
+    -- When focus is lost (transition from true to false), silence
+    -- any in-progress speech -- the user just closed a menu/panel.
+    local hadUIFocus = snapshotHasUIFocus
     snapshotHasUIFocus = (focusedElement ~= nil
         and focusedElement.elemType ~= nil
         and focusedElement.elemType ~= "")
+    if hadUIFocus and not snapshotHasUIFocus then
+        -- Only silence when no handler is active.  Focus can
+        -- temporarily drop between ticks during menu transitions
+        -- (widget scan ticks have no focusedElement).  If a handler
+        -- is still active, the menu/panel is still open.
+        local World = BG3Access.Client.WorldUI
+        local hasActiveHandler = Menus.GetActiveHandler()
+            or (World and World.GetActivePanelHandler
+                and World.GetActivePanelHandler())
+        if not hasActiveHandler then
+            Ext.Tolk.Silence()
+        end
+    end
 
     -- =================================================================
     -- Restore world routing when a gameplay-interrupting menu closes.
@@ -270,7 +365,7 @@ local function HandleTickSnapshot(snapshot)
     -- and no menu widgets remain in the scan, switch back to world.
     -- =================================================================
     if not routeToWorld and worldRouteBeforeMenu
-        and not suppressSnapshots then
+        and not suppressSnapshots and not menuRoutedThisTick then
         local hasMenuWidget = false
         if snapshot.widgetDCTypes then
             for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
@@ -280,9 +375,12 @@ local function HandleTickSnapshot(snapshot)
                 end
             end
         end
-        if not hasMenuWidget then
+        if not hasMenuWidget and snapshot.widgetDCTypes then
             worldRouteBeforeMenu = false
             routeToWorld = true
+            -- Suppress the next widget scan so background widgets
+            -- (PartyLine_c) don't trigger handler activation.
+            suppressNextWidgetScan = true
             Menus.ResetAllHandlers()
             Log.Info("Routing back to WorldUI (menu closed)")
         end
@@ -294,16 +392,25 @@ local function HandleTickSnapshot(snapshot)
     -- focus strategies never report a focusedElement for them.
     -- Deliver the snapshot to Menus before the focusedElement guard
     -- drops it, so the screen entry announcement fires.
+    -- Use priority DC type (widgetData.dcType may be wrong when a
+    -- background widget like PartyLine_c was processed last by C++).
     -- =================================================================
     if not suppressSnapshots
         and snapshot.widgetAdded and snapshot.widgetData
         and snapshot.widgetData.dcType
-        and Menus.IsMenuDCType(snapshot.widgetData.dcType)
         and (not focusedElement or not focusedElement.elemType) then
-        if not routeToWorld then
-            Menus.RouteSnapshot(snapshot)
+        local earlyMenuDCType = SelectRoutingDCType(snapshot)
+        if Menus.IsMenuDCType(earlyMenuDCType) then
+            if not routeToWorld then
+                Menus.RouteSnapshot(snapshot)
+            end
+            return
         end
-        return
+    end
+
+    -- Clear widget scan suppression once the user navigates to something.
+    if suppressNextWidgetScan and snapshot.focusChanged then
+        suppressNextWidgetScan = false
     end
 
     -- =================================================================
@@ -551,6 +658,27 @@ local LOADING_STATES = {
     StopLoading = true,
 }
 
+-- On console reset (SE hot-reload), GameStateChanged doesn't fire.
+-- Check the current game state so suppressSnapshots is correct.
+-- Without this, suppressSnapshots stays true forever after a reset.
+-- Ext.Client may not exist during initial load, so pcall everything.
+local initOk, currentState = pcall(function()
+    return Ext.Client.GetGameState()
+end)
+if initOk and currentState then
+    local stateStr = tostring(currentState)
+    suppressSnapshots = LOADING_STATES[stateStr] or false
+    if not suppressSnapshots then
+        -- Running or Menu state: allow snapshots immediately.
+        pcall(Ext.UI.SuppressGlobalFocusTick, false)
+        if stateStr == "Running" then
+            routeToWorld = true
+        end
+    end
+    Log.Info("Init state: " .. stateStr
+        .. " suppress=" .. tostring(suppressSnapshots))
+end
+
 Ext.Events.GameStateChanged:Subscribe(function(e)
     Log.Info("GameStateChanged: " .. tostring(e.FromState)
         .. " -> " .. tostring(e.ToState))
@@ -575,6 +703,7 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     worldDialogOverlayJustSpoke = false
     worldRouteBeforeMenu = false
     suppressWorldEntryVisualText = false
+    suppressNextWidgetScan = false
 
     local toState = tostring(e.ToState)
     suppressSnapshots = LOADING_STATES[toState] or false
