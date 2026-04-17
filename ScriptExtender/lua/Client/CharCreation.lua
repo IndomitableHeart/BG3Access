@@ -1,14 +1,24 @@
 -- File: Client/CharCreation.lua
 --
--- Character Creation specific snapshot handler.
+-- Character Creation per-page factory router.
 --
 -- CC uses a god-object DataContext (gui::DCCharacterCreation) with 100+
--- properties.  Generic FormatDCText/FormatDCTextSplit cannot extract useful
--- text from it.  This module handles all CC-specific logic in isolation
--- so it cannot affect other menus.
+-- properties.  Generic FormatDCText / FormatDCTextSplit cannot extract
+-- useful text from it, so CC logic lives here in isolation.
+--
+-- Architecture:
+--   * Shared module state (ccState) tracks cross-page concerns:
+--     transitions, naming screen, guardian detection, intro split,
+--     selected origin, widget DC type.
+--   * Each CC page (Origin / Race / Class / Abilities / Skills /
+--     Appearance / ...) has its own handler created by
+--     CreateCCPageHandler.  Per-handler state (dedup, tab-hint spoken,
+--     last-carousel tick) is owned by the handler, not by ccState.
+--   * HandleCCSnapshot is the thin router.  It classifies the current
+--     page, handles transitions / instructions / first-entry speech,
+--     then dispatches to the active handler.
 --
 -- The Manager detects CC and delegates here via HandleCCSnapshot().
--- This module owns its own state table (ccState) with no shared state coupling.
 
 local Log = BG3Access.Client.Log
 local Helpers = BG3Access.Client.Helpers
@@ -44,6 +54,20 @@ local CC_CONTEXT_TYPES = {
     ["ls.VMAbility"]                  = "Abilities",
 }
 
+-- Sub-item VM types that appear on MULTIPLE pages as feature/spell/skill
+-- rows (class features list, race features list, background skill
+-- proficiency section, etc.).  When these types appear as the FOCUSED
+-- element, they must NOT trigger a page re-classification on d-pad
+-- alone (focusChanged) -- doing so would switch from e.g. the Class
+-- page to the Spell page when the user merely d-padded down into the
+-- class features list.  They only re-classify when selectionChanged
+-- is true (the user pressed RB/LB to switch tabs).
+local CC_SUBITEM_DC_TYPES = {
+    ["ls.VMSpellReference"]      = true,
+    ["ls.VMSkill"]               = true,
+    ["ls.VMAbility"]             = true,
+}
+
 -- Body type display names.  Keys are lowercase versions of the
 -- BodyTypeAndShape DC property values (Female, Male, FemaleStrong, MaleStrong).
 local BODY_TYPE_NAMES = {
@@ -69,8 +93,8 @@ local function IsPlaceholder(text)
     if type(text) ~= "string" then return false end
     -- ASCII: "(x2)", "(X3)", etc.
     if text:find("^%([xX]%d+%)$") then return true end
-    -- Unicode multiplication sign: the × character is multi-byte.
-    -- Check for short strings starting with ( ending with ) containing a digit.
+    -- Unicode multiplication sign: the multi-byte x character.
+    -- Short strings starting with ( ending with ) containing a digit.
     if #text <= 8 and text:sub(1, 1) == "(" and text:sub(-1) == ")"
         and text:find("%d") then
         return true
@@ -174,6 +198,7 @@ local CC_TAB_HINTS = {
     ["Background"] = "Choose your background. This affects your skill proficiencies and how characters react to you. D-pad left and right to browse backgrounds.",
     ["Abilities"] = nil,  -- handled separately with points remaining
     ["Skills"] = nil,  -- handled separately with instruction text
+    ["Cantrip"] = "Change your cantrip selection by choosing from the spell list below. D-pad in all directions to navigate the spell grid. Cantrips don't use spell slots and can be cast at will.",
     ["Spell"] = "Change your cantrip selection by choosing from the spell list below. D-pad in all directions to navigate the spell grid. Cantrips don't use spell slots and can be cast at will.",
     ["High Elf Cantrip"] = "This is the cantrip linked to your selected race. Cantrips don't use spell slots and can be cast at will.",
     ["Appearance"] = "Customize your character's appearance. D-pad up and down to navigate options. D-pad left and right to change values.",
@@ -199,8 +224,6 @@ local CC_PAGE_INSTRUCTION_HANDLES = {
     },
 }
 local instructionTextCache = {}
-
--- Common spell stat ID prefixes in BG3.
 
 -- Resolve instructional text for a CC page.  Cached per tab name.
 -- Returns a string like "Choose 2 Skills" or nil.
@@ -232,6 +255,17 @@ local function GetPageInstructionText(tabName)
     return nil
 end
 
+-- Section-transition labels: spoken once when focus moves from the
+-- carousel into the sub-item feature list on a carousel page.  Gives
+-- the player context that these items are granted automatically, not
+-- selections they need to make.
+local CC_SECTION_TRANSITION_LABELS = {
+    ["Race"]     = "You acquire the following:",
+    ["Subrace"]  = "You acquire the following:",
+    ["Class"]    = "You acquire the following:",
+    ["Subclass"] = "You acquire the following:",
+}
+
 -- DC types that represent race/class features and passives.
 -- These need stat-based description lookup.
 local CC_FEATURE_DC_TYPES = {
@@ -248,10 +282,44 @@ local CC_SUMMARY_STAT_LABELS = {
     ["ls.VMClass"]     = "",  -- already has name ("Level 1 Barbarian")
 }
 
+-- Valid page names (whitelist for the classifier).  Must cover every
+-- key in PAGE_HANDLERS below; it is declared here because
+-- ClassifyPage is defined before PAGE_HANDLERS.  Without this
+-- whitelist, arbitrary tabName strings like "Custom" or "Astarion"
+-- (the origin carousel's selected ListBoxItem names) would be
+-- accepted as page identifiers, flipping ccState.currentPage and
+-- re-triggering screen-entry speech on every carousel step.
+local CC_PAGE_NAMES = {
+    ["Origin"]           = true,
+    ["Race"]             = true,
+    ["Subrace"]          = true,
+    ["Class"]            = true,
+    ["Subclass"]         = true,
+    ["Background"]       = true,
+    ["Deity"]            = true,
+    ["Feat"]             = true,
+    ["Abilities"]        = true,
+    ["Ability Bonus"]    = true,
+    ["Skills"]           = true,
+    ["Cantrip"]          = true,
+    ["Spell"]            = true,
+    ["High Elf Cantrip"] = true,
+    ["Appearance"]       = true,
+}
+
 -- ============================================================================
--- CC-internal state (isolated from Manager and other handlers)
+-- CC module state (shared across all per-page handlers)
 -- ============================================================================
+--
+-- Per-page state (dedup, last-spoken, tab-hint spoken) lives on each
+-- handler's handlerState table.  ccState holds only cross-page
+-- concerns: transitions, naming screen, guardian detection, intro
+-- split, selected origin, currentWidgetDCType, and the active handler
+-- pointer used by the router.
+
 local ccState = {
+    -- Speech dedup / last-spoken tracking (router-level; also referenced
+    -- by :Speak(ccState, ...) for cross-call dedup after first entry).
     lastSpokenName           = nil,
     lastSpokenFullText       = nil,
     lastSpokenTab            = nil,
@@ -259,9 +327,7 @@ local ccState = {
     lastSpokenItemName       = nil,
     lastMainTab              = nil,
     lastCarouselTick         = nil,
-    tabHintSpoken            = false,
-    tabHintsSpoken           = nil,
-    abilityHintSpoken        = false,
+    -- Router-level flags retained for first-entry and transition logic.
     screenEntryJustSpoke     = false,
     inCharacterCreation      = false,
     inPostNamingCC           = false,
@@ -271,23 +337,57 @@ local ccState = {
     selectedOriginName       = nil,
     isCustomOrigin           = nil,
     currentWidgetDCType      = nil,
+    -- Router dispatch state (per-page factory refactor).
+    currentPage              = nil,
+    activePageHandler        = nil,
+    firstEntrySpoken         = false,
+    -- Intro split state (main CC entry only).
+    introAwaitingContinue       = false,
+    introContinueSubscription   = nil,
+    introAxisSubscription       = nil,
+    introButtonSuppression      = nil,
+    introAxisSuppression        = nil,
+    customBackstoryText         = nil,
+    -- Suppresses INPC follow-up after standalone carousel already spoke
+    -- name + description for the same item.
+    lastStandaloneCarouselValue = nil,
+    lastHandlerSpeechData       = nil,
+    -- CC tooltip dedup field.  Helpers.ProcessTooltip mutates this to
+    -- collapse subset / superset waves.  Isolated from WorldUI's
+    -- tooltipState holder because the two contexts don't share namespace
+    -- and must reset independently on CC enter / exit.
+    lastTooltipSpeech           = nil,
+    -- Post-cutscene return suppression.  When the origin-preview cutscene
+    -- ends, Noesis rebuilds the CC UI and fires a burst of stale focus /
+    -- selection events (every carousel item cycles through).  Without a
+    -- gate the user hears the full origin backstory again -- sometimes
+    -- doubled.  awaitingPostCutsceneNav suppresses all handler dispatch
+    -- until genuine user d-pad input arrives.  The hint speaks once on
+    -- the first noise tick, then silence until the user re-engages.
+    -- postCutsceneArmedAt stores MonotonicTime() when the gate was armed;
+    -- the noise burst finishes within ~500ms, so any focus/selection
+    -- change arriving 1000ms+ after arming is genuine user input.
+    awaitingPostCutsceneNav     = false,
+    postCutsceneHintSpoken      = false,
+    postCutsceneArmedAt         = 0,
 }
 
+-- Forward declaration: handler-block code assigns this so
+-- ResetCCState / HandleWidgetAdded can reset per-handler state too.
+local resetHandlersHook = nil
+
 -- ============================================================================
--- CC Helper Functions
+-- CC helper functions
 -- ============================================================================
 
--- Get the CC section label from a data table's dcType.
--- Returns section name string or nil.
--- Stat description helpers: use shared versions from Helpers.lua.
--- ParseDescriptionParam, ResolveDescriptionParams, ReadStatDescription
--- are all defined in Helpers and exported as Helpers.* functions.
+local ResolveTranslatedString = Helpers.ResolveTranslatedString
+-- Stat description helpers: shared versions from Helpers.lua.
 local ParseDescriptionParam = Helpers.ParseDescriptionParam
 local ResolveDescriptionParams = Helpers.ResolveDescriptionParams
 local ReadStatDescription = Helpers.ReadStatDescription
 
-local ResolveTranslatedString = Helpers.ResolveTranslatedString
-
+-- Get the CC section label from a data table's dcType.
+-- Returns section name string or nil.
 local function GetSectionLabel(data)
     if not data or not data.dcType then return nil end
     local label = CC_SECTION_LABELS[data.dcType]
@@ -309,6 +409,26 @@ end
 local function GetBodyTypeName(elemName)
     if not elemName then return nil end
     return BODY_TYPE_NAMES[elemName]
+end
+
+-- Returns true if the dcType is a sub-item or feature type that
+-- appears on multiple pages (class features, race features, etc.).
+-- Used to detect the carousel-to-feature-list section transition.
+local function IsFeatureOrSubItemDCType(dcType)
+    if not dcType then return false end
+    return CC_SUBITEM_DC_TYPES[dcType] == true
+        or CC_FEATURE_DC_TYPES[dcType] == true
+end
+
+-- Body-type tab names (Male, Female, MaleStrong, FemaleStrong) appear
+-- as selectedElement.tabName when the Origin page's gender selector or
+-- the Appearance page's body-type row cycles.  These are NOT page
+-- tabs; they are sub-item values.  Treating them as page tabs caused
+-- "You are on the Female page" and re-announcing the hint on every
+-- gender change.  The classifier uses this to filter them out.
+local function IsBodyTypeTabName(tabName)
+    if type(tabName) ~= "string" or tabName == "" then return false end
+    return BODY_TYPE_NAMES[tabName:lower()] ~= nil
 end
 
 -- Extract title and description from the CC god-object using tab context.
@@ -366,7 +486,6 @@ end
 -- APIs are preferred over Noesis sub-table pointers because they are
 -- always available once the cache is built and don't depend on C++
 -- extracting the right pointer type from the god-object.
--- Returns description string or nil.
 -- itemName is the display name of the currently selected item
 -- (race name, class name, deity name, etc.) used for API lookups.
 local function GetGodObjectDescription(dcProps, tabName, itemName)
@@ -376,7 +495,8 @@ local function GetGodObjectDescription(dcProps, tabName, itemName)
 
     -- 1. StaticData API by display name (primary).
     if staticDataType and itemName and itemName ~= "" then
-        local apiDesc = Helpers.LookupStaticDataDescription(staticDataType, itemName)
+        local apiDesc = Helpers.LookupStaticDataDescription(
+            staticDataType, itemName)
         if apiDesc then return apiDesc end
     end
 
@@ -428,8 +548,6 @@ local function GetGodObjectDescription(dcProps, tabName, itemName)
     local godTitle, godDesc = ExtractContextualGodObjectText(
         dcProps, tabName)
     if godDesc and godDesc ~= "" then
-        -- Only return if the title matches or we have no item name
-        -- to cross-check (screen entry with no specific item).
         if not itemName or itemName == ""
             or (godTitle and godTitle:lower() == itemName:lower()) then
             return godDesc
@@ -456,17 +574,18 @@ end
 
 -- Extract text from CC-specific dcProps (Skill, Ability, Spell sub-table).
 -- Returns (name, value, description) or all nils.
-local function FormatCCDCTextSplit(dcProps)
+local function FormatCCDCTextSplit(dcProps, dcType)
     if not dcProps then return nil, nil, nil end
 
     local text = nil
     local value = nil
-    local desc = dcProps.Description
-    -- Description may be a sub-table (VMContextTransString) with a
-    -- .Text field, not a plain string.  Extract the string now.
-    if type(desc) == "table" then
-        desc = desc.Text or desc.Str or desc.Description
-    end
+    -- API-first: descriptions are NOT extracted from dcProps here.
+    -- GetCCItemData runs API lookups (StaticData, Feature/Passive,
+    -- Spell) which resolve parameter placeholders like [2] into real
+    -- values.  Raw dcProps.Description is the LAST RESORT fallback
+    -- in GetCCItemData, used only when all API lookups fail (modded
+    -- content with no stat entry).
+    local desc = nil
 
     -- Skill enum: VMCharacterCreationSkill has Skill + Ability.
     -- Check Skill FIRST so "Arcana" wins over "Intelligence".
@@ -498,38 +617,62 @@ local function FormatCCDCTextSplit(dcProps)
         if dcProps.Value then
             local numericValue = tonumber(tostring(dcProps.Value))
             if numericValue then
-                value = (numericValue >= 0 and "+" or "") .. tostring(numericValue)
+                value = (numericValue >= 0 and "+" or "")
+                    .. tostring(numericValue)
             end
         end
     end
 
     -- VMSpellReference: Spell sub-table has the spell details.
+    -- Name only; description deferred to API (LookupSpellDescription
+    -- resolves DescriptionParams).
     if not text and type(dcProps.Spell) == "table" then
         local spellTable = dcProps.Spell
         text = spellTable.Name or spellTable.DisplayName
             or spellTable.Title or spellTable.Text
-        if not desc then
-            desc = spellTable.Description
-        end
     end
 
-    -- VMFeatureBoost: NameCTS.Text has display name,
-    -- Description.Text has the description.
+    -- VMFeatureBoost / VMPassiveFeatureBoost: NameCTS.Text or
+    -- ShortName has the display name.
     if not text and type(dcProps.NameCTS) == "table" then
         text = dcProps.NameCTS.Text
     end
     if not text and dcProps.ShortName then
         text = dcProps.ShortName
     end
-    if not desc and type(dcProps.Description) == "table" then
-        desc = dcProps.Description.Text
+
+    -- VM carousel items (VMSelectableRace, VMSelectableOrigin,
+    -- VMSelectableClass, VMSelectable): Name is the display name.
+    -- Two guards prevent false matches on the god-object
+    -- (gui::DCCharacterCreation): IDString (present on VM types but
+    -- not on the god-object), and dcType membership in
+    -- CC_SECTION_LABELS (covers the post-cutscene case where
+    -- selected-as-focused elements may lack IDString in dcProps).
+    -- Description is returned separately so the caller can place it
+    -- in its own SpeechData field rather than concatenating it into
+    -- the name.
+    local isVMCarouselType = dcProps.IDString
+        or (dcType and CC_SECTION_LABELS[dcType])
+    if not text and type(dcProps.Name) == "string"
+        and dcProps.Name ~= "" and isVMCarouselType then
+        text = dcProps.Name
+        -- Return description separately (API-first enrichment in
+        -- GetCCItemData may override with a StaticData lookup, but
+        -- when it can't the raw VM description is the best we have).
+        -- Strip markup since some VM descriptions carry formatting.
+        if type(desc) == "string" and desc ~= "" then
+            desc = Helpers.StripMarkupTags(desc)
+        else
+            desc = nil
+        end
     end
 
     if not text or text == "" then return nil, nil, nil end
     return text, value, desc
 end
 
--- Origin page context labels.  Maps elemText to god-object properties.
+-- Origin / Appearance page context labels.  Body Type and Identity
+-- rows appear on both pages and use the same extraction logic.
 -- Returns (name, value, description) or all nils.
 local function ExtractOriginContext(data)
     if not data or not data.dcProps then return nil, nil, nil end
@@ -575,8 +718,6 @@ local function ExtractOriginContext(data)
     end
 
     -- "Origin" meta-option: play as a pre-made origin character.
-    -- The actual description lives at DummyCharacter.Stats.OriginDescription
-    -- (two levels deep, not accessible yet).
     if Helpers.NormalizeForCompare(elemText) == "origin" then
         return nil, nil,
             "Play as an existing character from Baldur's Gate 3"
@@ -587,7 +728,8 @@ local function ExtractOriginContext(data)
     if type(selectedOrigin) == "table" then
         local originName = selectedOrigin.Name or selectedOrigin.DisplayName
             or selectedOrigin.Title
-        if originName and Helpers.NormalizeForCompare(elemText) == Helpers.NormalizeForCompare(originName) then
+        if originName and Helpers.NormalizeForCompare(elemText)
+            == Helpers.NormalizeForCompare(originName) then
             local originDesc = selectedOrigin.Description
             if type(originDesc) == "string" and originDesc ~= "" then
                 -- Custom: speak the API description, then action hint.
@@ -605,29 +747,23 @@ local function ExtractOriginContext(data)
 end
 
 -- ============================================================================
--- Unified Item Data Extraction
+-- Unified item data extraction
 -- ============================================================================
-
--- Extract name, value, and description for the current CC focused element.
--- This is the SINGLE source of truth for item data.  All code paths
--- (dedup, isValueOnly, screen entry, item nav) use the same result.
+--
+-- GetCCItemData is the single source of truth for per-element name/
+-- value/description extraction.  All handler pipelines (screen entry,
+-- item nav, value-only) call it.
 --
 -- Pipeline (stops at first name hit):
 --   1. Placeholder guard
---   2. FormatCCDCTextSplit (Skill, Ability, Spell dcProps)
---   3. ExtractOriginContext (Body Type, Identity, Origin)
---   4. Helpers.FormatDCText (generic dcProps)
---   5. Helpers.ExtractTextFromData (visual text / elemText fallback)
+--   2. Level-up summary items (DCCharacterLevelUp)
+--   3. FormatCCDCTextSplit (Skill, Ability, Spell dcProps)
+--   4. ExtractOriginContext (Body Type, Identity, Origin)
+--   5. Helpers.FormatDCText (generic dcProps)
+--   6. Helpers.ExtractTextFromData (visual text / elemText fallback)
 -- Then applies overrides (carousel, toggles, bonus ability, stat labels)
 -- and enriches with API-first descriptions.
---
--- Parameters:
---   focusedElement  - the focused element data table
---   snapshot        - full snapshot from C++
---   tabName         - current tab name (may be nil for item nav)
---   isScreenEntry   - boolean, passed to Helpers.ExtractTextFromData
---
--- Returns: name, value, description (all strings or nil)
+
 local function GetCCItemData(focusedElement, snapshot, tabName,
                              isScreenEntry)
     if not focusedElement then return nil, nil, nil end
@@ -637,16 +773,14 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
     local itemValue = nil
     local itemDescription = nil
 
-    -- 1. Placeholder guard: strip placeholder elemText so downstream
-    --    extractors (Helpers.ExtractTextFromData) don't pick it up.
+    -- 1. Placeholder guard.
     local elemText = focusedElement.elemText
     if elemText and IsPlaceholder(elemText) then
         Log.Debug("GetCCItemData: strip placeholder elemText: " .. elemText)
         elemText = nil
     end
 
-    -- 1b. Level-up summary items (DCCharacterLevelUp): HP gains, etc.
-    --      These have no useful dcProps -- read text blocks for content.
+    -- 2. Level-up summary items (DCCharacterLevelUp).
     if focusedElement.dcType == "gui::DCCharacterLevelUp" then
         local readOk, textBlocks = pcall(Ext.UI.ReadFocusedTextBlocks)
         if readOk and textBlocks and #textBlocks > 0 then
@@ -666,23 +800,20 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
         return nil, nil, nil
     end
 
-    -- 2. FormatCCDCTextSplit: Skill, Ability, Spell sub-table dcProps.
-    itemName, itemValue, itemDescription = FormatCCDCTextSplit(dcProps)
+    -- 3. FormatCCDCTextSplit: Skill, Ability, Spell sub-table dcProps.
+    itemName, itemValue, itemDescription = FormatCCDCTextSplit(
+        dcProps, focusedElement.dcType)
 
-    -- 3. ExtractOriginContext: Body Type, Identity, Origin character.
+    -- 4. ExtractOriginContext: Body Type, Identity, Origin character.
     if not itemName or itemName == "" then
         itemName, itemValue, itemDescription = ExtractOriginContext(
             focusedElement)
     end
 
-    -- If a prior extractor returned description but no name (e.g.
-    -- ExtractOriginContext for "Custom" or "Origin"), the element is
-    -- claimed.  Do NOT fall through to generic extractors which would
-    -- overwrite the description with unrelated text.
     local elementClaimed = (itemName and itemName ~= "")
         or (itemDescription and itemDescription ~= "")
 
-    -- 4. Helpers.FormatDCText: generic dcProps formatting.
+    -- 5. Helpers.FormatDCText: generic dcProps formatting.
     if not elementClaimed then
         itemName = Helpers.FormatDCText(dcProps)
         itemValue = nil
@@ -690,8 +821,7 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
         elementClaimed = itemName and itemName ~= ""
     end
 
-    -- 5. Helpers.ExtractTextFromData: visual text / elemText fallback.
-    --    Pass the effective tab name for context.
+    -- 6. Helpers.ExtractTextFromData: visual text / elemText fallback.
     if not elementClaimed then
         local effectiveTab = tabName or ccState.lastSpokenTab
         itemName = Helpers.ExtractTextFromData(
@@ -700,31 +830,85 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
         itemDescription = nil
     end
 
-    -- If all extractors produced nothing, bail early.
-    -- An element with description but no name (Custom, Origin) is valid.
+    -- DC property authority for carousel pages: TryShallowChildTextScan
+    -- finds whichever TextBlock is first in BFS order, which may be
+    -- any of the 3 visible carousel items.  The god-object SelectedX.
+    -- Name is authoritative for the actual current selection.
+    --
+    -- SKIP when a specific extractor already claimed the element with
+    -- a description but no name.  ExtractOriginContext returns
+    -- (nil, nil, "Play as an existing character...") for the Origin
+    -- category button; overriding itemName with SelectedOrigin.Name
+    -- ("Astarion") would replace the category announcement with a
+    -- specific character the user hasn't navigated to yet.
+    local hasDescriptionOnly = (itemDescription and itemDescription ~= "")
+        and (not itemName or itemName == "")
+    if not hasDescriptionOnly
+        and focusedElement.dcType == "gui::DCCharacterCreation"
+        and dcProps then
+        local effectiveTab = tabName or ccState.lastMainTab
+            or ccState.lastSpokenTab
+        if effectiveTab then
+            local subTableKey = CC_SELECTED_DESCRIPTION_KEYS[effectiveTab]
+            if subTableKey then
+                local subTable = dcProps[subTableKey]
+                if type(subTable) == "table" then
+                    local dcName = subTable.Name
+                        or subTable.DisplayName or subTable.Title
+                    if dcName and dcName ~= "" then
+                        -- Only override carousel container BFS results,
+                        -- not sub-item labels.  If itemName resolves via
+                        -- StaticData for this tab, it IS a carousel item
+                        -- (possibly wrong from BFS ordering) and dcName
+                        -- corrects it.  If itemName does NOT resolve, it
+                        -- is a sub-item (Identity, Body Type, etc.) and
+                        -- is already correct.
+                        local shouldOverride = (not itemName
+                            or itemName == "")
+                        if not shouldOverride and itemName then
+                            local staticDataType =
+                                CC_TAB_STATIC_DATA_TYPE[effectiveTab]
+                            if staticDataType then
+                                shouldOverride =
+                                    Helpers.LookupStaticDataDescription(
+                                        staticDataType, itemName) ~= nil
+                            end
+                        end
+                        if shouldOverride then
+                            itemName = dcName
+                            if not itemDescription
+                                or itemDescription == "" then
+                                itemDescription = nil
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- If all extractors produced nothing, bail.
     if (not itemName or itemName == "")
         and (not itemDescription or itemDescription == "") then
         return nil, nil, nil
     end
 
-    -- Final placeholder check on the extracted name.
+    -- Final placeholder check on extracted name.
     if itemName and IsPlaceholder(itemName) then
         Log.Info("GetCCItemData: suppress placeholder name: " .. itemName)
         return nil, nil, nil
     end
 
-    -- Element name overrides: replace terse button text with friendlier labels.
+    -- Element name overrides: terse button text -> friendlier label.
     if itemName and focusedElement.elemName
         and CC_ELEM_NAME_OVERRIDES[focusedElement.elemName] then
         itemName = CC_ELEM_NAME_OVERRIDES[focusedElement.elemName]
     end
 
-    -- ----------------------------------------------------------------
-    -- 6. Post-extraction overrides (only when itemName is set)
-    -- ----------------------------------------------------------------
-    -- Elements with description-only (Custom, Origin on the origin page)
-    -- skip overrides entirely — they have no name/value to transform.
-
+    -- --------------------------------------------------------------
+    -- Post-extraction overrides (only when itemName is set).
+    -- Description-only elements skip these.
+    -- --------------------------------------------------------------
     if itemName and itemName ~= "" then
         -- Carousel value: non-numeric carousel values override itemValue.
         local hasCarousel = snapshot.inlineCarouselChanged
@@ -740,7 +924,7 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
             end
         end
 
-        -- Toggle properties: read value from god-object property by item name.
+        -- Toggle properties: read value from god-object property.
         if not itemValue and dcProps then
             local toggleProperty = CC_TOGGLE_PROPERTIES[itemName]
             if toggleProperty then
@@ -751,9 +935,10 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
             end
         end
 
-        -- Appearance label properties: elemText IS the label, value from god-object.
+        -- Appearance label properties: elemText IS the label.
         if not itemValue and dcProps then
-            local appearanceMapping = CC_APPEARANCE_LABEL_PROPERTIES[itemName]
+            local appearanceMapping =
+                CC_APPEARANCE_LABEL_PROPERTIES[itemName]
             if appearanceMapping then
                 local rawValue = dcProps[appearanceMapping.property]
                 if type(rawValue) == "string" and rawValue ~= "" then
@@ -768,30 +953,29 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
             end
         end
 
-        -- Slider setting value: dcProps.Value is only a concrete number
-        -- during INPC (val=1) snapshots -- the binding expression makes it
-        -- nil at initial focus.  Helpers.FormatDCValue reads it the same way
-        -- the Menus pipeline does, restoring the value on left/right presses.
-        if not itemValue and focusedElement.dcType == "gui::VMSliderSetting" then
+        -- Slider setting value: FormatDCValue restores value on
+        -- left/right presses (binding makes raw Value nil at focus).
+        if not itemValue
+            and focusedElement.dcType == "gui::VMSliderSetting" then
             local sliderValue = Helpers.FormatDCValue(dcProps)
             if sliderValue and sliderValue ~= "" then
                 itemValue = sliderValue
             end
         end
 
-        -- Bonus ability: append selected ability name for "+2 Bonus" items.
+        -- Bonus ability: append selected ability name for "+2 Bonus".
         if itemName:find("Bonus", 1, true) and dcProps
             and dcProps.SelectedBonusAbility then
             itemName = itemName .. " to " .. dcProps.SelectedBonusAbility
             Log.Debug("GetCCItemData: bonus ability: " .. itemName)
         end
 
-        -- Summary stat labels: prepend static label for DC types with no name.
+        -- Summary stat labels: prepend static label for DC types with
+        -- no name of their own (Initiative, Hit Points).
         if focusedElement.dcType
             and CC_SUMMARY_STAT_LABELS[focusedElement.dcType] then
             local staticLabel = CC_SUMMARY_STAT_LABELS[focusedElement.dcType]
             if staticLabel and staticLabel ~= "" and not itemValue then
-                -- The "name" is actually the value; rewrite as label + value.
                 itemValue = itemName
                 itemName = staticLabel
             end
@@ -804,31 +988,59 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
         end
     end
 
-    -- ----------------------------------------------------------------
-    -- 7. Description enrichment (API-first)
-    -- ----------------------------------------------------------------
+    -- --------------------------------------------------------------
+    -- Description enrichment (API-first).
+    -- --------------------------------------------------------------
     if not itemDescription or itemDescription == "" then
         itemDescription = nil  -- normalize empty string to nil
 
-        -- Deity detection: if lastMainTab isn't a known StaticData type
-        -- but the tab name IS a deity display name, fix it.
+        -- Deity detection: if lastMainTab isn't a known StaticData
+        -- type but the tab name IS a deity display name, fix it.
         local effectiveMainTab = ccState.lastMainTab
         if effectiveMainTab
             and not CC_TAB_STATIC_DATA_TYPE[effectiveMainTab]
-            and Helpers.LookupStaticDataDescription("God", effectiveMainTab) then
+            and Helpers.LookupStaticDataDescription("God",
+                effectiveMainTab) then
             effectiveMainTab = "Deity"
         end
 
-        -- A. StaticData API via GetGodObjectDescription (primary).
-        --    Covers Race, Class, Subclass, Background, Deity, Origin, Feat.
+        -- A0. VM carousel items: API description by display name.
+        if not itemDescription and focusedElement.dcType
+            and CC_SECTION_LABELS[focusedElement.dcType] then
+            local sectionLabel = GetSectionLabel(focusedElement)
+            if sectionLabel then
+                local staticDataType = CC_TAB_STATIC_DATA_TYPE[sectionLabel]
+                if staticDataType and itemName and itemName ~= "" then
+                    itemDescription = Helpers.LookupStaticDataDescription(
+                        staticDataType, itemName)
+                    if itemDescription then
+                        Log.Debug("GetCCItemData: VM API desc: "
+                            .. itemName .. " -> "
+                            .. tostring(itemDescription):sub(1, 60))
+                    end
+                end
+            end
+            -- dcProps.Description fallback (modded content).
+            if not itemDescription and dcProps then
+                local vmDescription = dcProps.Description
+                if type(vmDescription) == "table" then
+                    vmDescription = vmDescription.Text
+                        or vmDescription.Str
+                        or vmDescription.Description
+                end
+                if type(vmDescription) == "string"
+                    and vmDescription ~= "" then
+                    itemDescription = Helpers.StripMarkupTags(vmDescription)
+                end
+            end
+        end
+
+        -- A. StaticData API via GetGodObjectDescription.
         if not itemDescription
             and focusedElement.dcType == "gui::DCCharacterCreation"
             and dcProps and effectiveMainTab then
             itemDescription = GetGodObjectDescription(
                 dcProps, effectiveMainTab, itemName)
-            -- Inline carousel items (Race, Subrace on appearance page):
-            -- itemName is the label ("Race"), but the actual value to look
-            -- up is in the carousel value ("Drow").  Try that too.
             if not itemDescription
                 and snapshot.inlineCarouselValue
                 and snapshot.inlineCarouselValue ~= "" then
@@ -838,21 +1050,22 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
             end
         end
 
-        -- B. Feature/passive API via Helpers.LookupFeatureDescription.
-        --    Covers race/class features, proficiencies, Darkvision, etc.
+        -- B. Feature/passive API.  Some features have sparse tooltips
+        -- (Darkvision: just name + range) so the description must
+        -- come from the API.  For features with rich tooltips
+        -- (Perception: description + ability + modifier), the exact-
+        -- match Diff in ProcessTooltip strips duplicates.
         if not itemDescription and focusedElement.dcType
             and CC_FEATURE_DC_TYPES[focusedElement.dcType] then
             local featureSuccess, featureDescription = pcall(
                 Helpers.LookupFeatureDescription, itemName)
             if featureSuccess and featureDescription then
-                itemDescription = featureDescription
-                Log.Debug("GetCCItemData: feature desc: " .. itemName
-                    .. " -> " .. tostring(featureDescription):sub(1, 60))
+                itemDescription =
+                    Helpers.StripMarkupTags(featureDescription)
             end
         end
 
-        -- C. Spell API via Helpers.LookupSpellDescription.
-        --    Covers spell buttons (Fire Bolt, etc.).
+        -- C. Spell API.
         if not itemDescription and itemName
             and focusedElement.elemType
             and (focusedElement.elemType:find("LSButton", 1, true)
@@ -861,19 +1074,37 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
             local spellSuccess, spellDescription = pcall(
                 Helpers.LookupSpellDescription, itemName)
             if spellSuccess and spellDescription then
-                itemDescription = spellDescription
-                Log.Debug("GetCCItemData: spell desc: " .. itemName
-                    .. " -> " .. tostring(spellDescription):sub(1, 60))
+                itemDescription =
+                    Helpers.StripMarkupTags(spellDescription)
             end
         end
 
-        -- D. Last resort: selected element VM .Description property.
-        --    Only if all API lookups missed (Noesis pointer, least reliable).
-        if not itemDescription and snapshot.selectedElement
-            and snapshot.selectedElement.dcProps then
-            local vmDescription = snapshot.selectedElement.dcProps.Description
-            if type(vmDescription) == "string" and vmDescription ~= "" then
-                itemDescription = vmDescription
+        -- D. Last resort: dcProps.Description (focused or selected).
+        -- For features/spells not found in the API (modded content).
+        if not itemDescription then
+            local rawDescription = nil
+            if dcProps then
+                rawDescription = dcProps.Description
+            end
+            if not rawDescription and snapshot.selectedElement
+                and snapshot.selectedElement.dcProps then
+                rawDescription =
+                    snapshot.selectedElement.dcProps.Description
+            end
+            if type(rawDescription) == "table" then
+                rawDescription = rawDescription.Text
+                    or rawDescription.Str
+                    or rawDescription.Description
+            end
+            if type(rawDescription) == "string"
+                and rawDescription ~= "" then
+                rawDescription = Helpers.StripMarkupTags(rawDescription)
+                if rawDescription:find("%[%d+%]") then
+                    rawDescription =
+                        Helpers.ResolveDescriptionParams(
+                            rawDescription, nil)
+                end
+                itemDescription = rawDescription
             end
         end
     end
@@ -900,7 +1131,7 @@ local function FormatCCValue(dcProps)
 end
 
 -- ============================================================================
--- CC Detection (called by Manager)
+-- CC detection (called by the Manager)
 -- ============================================================================
 
 -- Returns true if this snapshot should be handled by the CC module.
@@ -949,153 +1180,7 @@ local function IsCCSnapshot(snapshot)
 end
 
 -- ============================================================================
--- CC Snapshot Handler
--- ============================================================================
-
-
--- One-shot diagnostic: dump CC entity components on first CC entry.
--- Recurses into userdata/table fields up to maxDepth levels.
-local ccEntityDiagDone = false
-
-local function DumpValue(value, indent, maxDepth, visited)
-    if maxDepth <= 0 then return end
-    indent = indent or "  "
-    visited = visited or {}
-
-    local valueType = type(value)
-    if valueType == "userdata" then
-        -- Avoid infinite loops on circular references.
-        local address = tostring(value)
-        if visited[address] then
-            Log.Info(indent .. "(circular ref: " .. address .. ")")
-            return
-        end
-        visited[address] = true
-
-        -- Try pairs() to enumerate fields.
-        local fieldsSuccess, fieldsError = pcall(function()
-            local fieldCount = 0
-            for key, subValue in pairs(value) do
-                fieldCount = fieldCount + 1
-                if fieldCount > 30 then
-                    Log.Info(indent .. "... (truncated at 30 fields)")
-                    break
-                end
-                local subType = type(subValue)
-                if subType == "userdata" or subType == "table" then
-                    Log.Info(indent .. tostring(key) .. " = "
-                        .. subType .. ": " .. tostring(subValue))
-                    DumpValue(subValue, indent .. "  ",
-                        maxDepth - 1, visited)
-                else
-                    Log.Info(indent .. tostring(key) .. " = "
-                        .. tostring(subValue))
-                end
-            end
-            if fieldCount == 0 then
-                -- Try array-style access.
-                local lenSuccess, length = pcall(function()
-                    return #value
-                end)
-                if lenSuccess and length and length > 0 then
-                    Log.Info(indent .. "(array, length=" .. length .. ")")
-                    local showCount = math.min(length, 6)
-                    for arrayIndex = 1, showCount do
-                        local itemSuccess, item = pcall(function()
-                            return value[arrayIndex]
-                        end)
-                        if itemSuccess then
-                            Log.Info(indent .. "  [" .. arrayIndex
-                                .. "] = " .. tostring(item))
-                            if type(item) == "userdata" then
-                                DumpValue(item, indent .. "    ",
-                                    maxDepth - 1, visited)
-                            end
-                        end
-                    end
-                    if length > showCount then
-                        Log.Info(indent .. "  ... ("
-                            .. length .. " total)")
-                    end
-                else
-                    Log.Info(indent .. "(no enumerable fields)")
-                end
-            end
-        end)
-        if not fieldsSuccess then
-            Log.Info(indent .. "(pairs failed: "
-                .. tostring(fieldsError) .. ")")
-        end
-    elseif valueType == "table" then
-        local count = 0
-        for key, subValue in pairs(value) do
-            count = count + 1
-            if count > 20 then
-                Log.Info(indent .. "... (truncated)")
-                break
-            end
-            local subType = type(subValue)
-            if subType == "userdata" or subType == "table" then
-                Log.Info(indent .. tostring(key) .. " = "
-                    .. subType .. ": " .. tostring(subValue))
-                DumpValue(subValue, indent .. "  ",
-                    maxDepth - 1, visited)
-            else
-                Log.Info(indent .. tostring(key) .. " = "
-                    .. tostring(subValue))
-            end
-        end
-    end
-end
-
-local function DumpCCEntityComponents()
-    if ccEntityDiagDone then return end
-    ccEntityDiagDone = true
-
-    Log.Info("=== CC ENTITY DIAGNOSTIC ===")
-
-    local componentTypes = {
-        "CCCharacterDefinition",
-        "CCCreation",
-        "CCState",
-        "CCSessionCommon",
-        "CCDefinitionCommon",
-        "CCLevelUp",
-        "CCLevelUpDefinition",
-        "CharacterCreationStats",
-        "ClientCCBaseDefinitionState",
-    }
-    for _, componentName in ipairs(componentTypes) do
-        local success, entities = pcall(
-            Ext.Entity.GetAllEntitiesWithComponent, componentName)
-        if success and entities and #entities > 0 then
-            Log.Info("CC ENTITY [" .. componentName .. "]: "
-                .. #entities .. " entities")
-            for entityIndex, entity in ipairs(entities) do
-                if entityIndex > 2 then
-                    Log.Info("  ... (" .. #entities .. " total)")
-                    break
-                end
-                local componentSuccess, component = pcall(function()
-                    return entity[componentName]
-                end)
-                if componentSuccess and component then
-                    Log.Info("  --- Entity " .. entityIndex .. " ---")
-                    DumpValue(component, "    ", 3)
-                end
-            end
-        elseif success then
-            Log.Info("CC ENTITY [" .. componentName .. "]: 0 entities")
-        else
-            Log.Info("CC ENTITY [" .. componentName .. "]: error - "
-                .. tostring(entities))
-        end
-    end
-    Log.Info("=== END CC ENTITY DIAGNOSTIC ===")
-end
-
--- ============================================================================
--- CC Y-button subscription for naming screen detection
+-- CC Y-button subscription for naming-screen detection
 -- ============================================================================
 -- The naming screen has no d-pad focusable elements (buttons map to
 -- controller inputs directly).  Instead of trying to detect it from
@@ -1107,14 +1192,9 @@ local ccYButtonSubscription = nil
 local namingScreenWasSpoken = false
 
 local function SpeakNamingScreen()
-    -- Get character name from the correct source.
-    -- For origin characters: use SelectedOrigin.Name from the god-object
-    -- DC (tracked in ccState by HandleCCSnapshot).  The entity API's
-    -- CharacterName lags behind the UI carousel selection.
-    -- For custom characters: use the entity API (reflects renames).
     local characterName = nil
     if ccState.isCustomOrigin then
-        -- Custom: entity API has the renamed name (Big Pillow, etc.)
+        -- Custom: entity API has the renamed name (Big Pillow, etc.).
         local namingSuccess, namingEntities = pcall(
             Ext.Entity.GetAllEntitiesWithComponent,
             "CCCharacterDefinition")
@@ -1125,7 +1205,6 @@ local function SpeakNamingScreen()
             end)
         end
     else
-        -- Origin character: use tracked SelectedOrigin.Name
         characterName = ccState.selectedOriginName
     end
     if not characterName or characterName == ""
@@ -1152,39 +1231,30 @@ end
 
 local function SubscribeCCYButton()
     if ccYButtonSubscription then return end
-    ccYButtonSubscription = Ext.Events.ControllerButtonInput:Subscribe(function(event)
-        if not event.Pressed then return end
-        if not ccState.inCharacterCreation then return end
-        local buttonName = tostring(event.Button)
-        if buttonName == "Y" and ccState.lastMainTab ~= "Naming"
-            and not ccState.inPostNamingCC then
-            -- Y from any CC tab → forward to naming screen.
-            -- Use lastMainTab (survives widget root resets) instead of
-            -- lastSpokenTab (gets cleared on widget root change).
-            -- Set lockout so snapshot handler drops lingering CC snapshots.
-            ccState.suppressGuardianTeardown = false
-            ccState.pendingTransition = "Naming"
-            Log.Debug("CC Y-button: transition to Naming")
-            SpeakNamingScreen()
-        elseif buttonName == "B" and ccState.lastMainTab == "Naming" then
-            -- B from naming screen or text input → back to main CC.
-            -- Set lockout so snapshot handler drops stale snapshots
-            -- until a real CC element arrives.
-            ccState.suppressGuardianTeardown = false
-            ccState.pendingTransition = "MainCC"
-            namingScreenWasSpoken = false
-            Log.Debug("CC B-button: transition from Naming to MainCC")
-        elseif buttonName == "B" and ccState.inPostNamingCC then
-            -- B from guardian CC → back to naming screen.
-            -- Suppress all CC snapshots until the next button press.
-            -- The naming screen has no detectable elements; stale guardian
-            -- snapshots keep firing during teardown.
-            ccState.suppressGuardianTeardown = true
-            ccState.inPostNamingCC = false
-            Log.Debug("CC B-button: transition from Guardian to Naming")
-            SpeakNamingScreen()
-        end
-    end)
+    ccYButtonSubscription =
+        Ext.Events.ControllerButtonInput:Subscribe(function(event)
+            if not event.Pressed then return end
+            if not ccState.inCharacterCreation then return end
+            local buttonName = tostring(event.Button)
+            if buttonName == "Y" and ccState.lastMainTab ~= "Naming"
+                and not ccState.inPostNamingCC then
+                ccState.suppressGuardianTeardown = false
+                ccState.pendingTransition = "Naming"
+                Log.Debug("CC Y-button: transition to Naming")
+                SpeakNamingScreen()
+            elseif buttonName == "B"
+                and ccState.lastMainTab == "Naming" then
+                ccState.suppressGuardianTeardown = false
+                ccState.pendingTransition = "MainCC"
+                namingScreenWasSpoken = false
+                Log.Debug("CC B-button: transition from Naming to MainCC")
+            elseif buttonName == "B" and ccState.inPostNamingCC then
+                ccState.suppressGuardianTeardown = true
+                ccState.inPostNamingCC = false
+                Log.Debug("CC B-button: transition from Guardian to Naming")
+                SpeakNamingScreen()
+            end
+        end)
     Log.Debug("Subscribed CC Y-button listener")
 end
 
@@ -1196,8 +1266,322 @@ local function UnsubscribeCCYButton()
     end
 end
 
+-- ============================================================================
+-- Intro split (main CC first-entry LT listener)
+-- ============================================================================
+-- Scoped to the initial entry into main CC (currentWidgetDCType ==
+-- "gui::DCCharacterCreation") AND not a naming return / guardian entry
+-- AND not level up.  On that entry the router speaks a welcome message,
+-- arms the LT listener, and drops subsequent CC snapshots until LT
+-- fires.  The LT press then speaks the currently-selected origin's
+-- backstory (Custom by default) and normal navigation resumes.
+--
+-- LT is the one controller input the Origin page does not bind to any
+-- game action, so using it for "continue" does not collide with
+-- existing controls.  PreventAction is called defensively.
+
+local CC_INTRO_WELCOME =
+    "Welcome to character creation."
+    .. " You can choose to create a custom character and build from scratch,"
+    .. " or you can choose a character with a preset backstory."
+    .. " D-pad left and right to cycle between making a custom character"
+    .. " or playing with an existing one, and down to navigate content."
+    .. " Press right trigger to see a summary of your character."
+    .. " Use RB and LB to switch pages."
+    .. " Press left trigger to continue."
+
+local function UnsubscribeIntroContinue()
+    if ccState.introContinueSubscription then
+        pcall(Ext.Events.ControllerButtonInput.Unsubscribe,
+            Ext.Events.ControllerButtonInput,
+            ccState.introContinueSubscription)
+        ccState.introContinueSubscription = nil
+    end
+    if ccState.introAxisSubscription then
+        pcall(Ext.Events.ControllerAxisInput.Unsubscribe,
+            Ext.Events.ControllerAxisInput,
+            ccState.introAxisSubscription)
+        ccState.introAxisSubscription = nil
+    end
+    if ccState.introButtonSuppression then
+        pcall(Ext.Events.ControllerButtonInput.Unsubscribe,
+            Ext.Events.ControllerButtonInput,
+            ccState.introButtonSuppression)
+        ccState.introButtonSuppression = nil
+    end
+    if ccState.introAxisSuppression then
+        pcall(Ext.Events.ControllerAxisInput.Unsubscribe,
+            Ext.Events.ControllerAxisInput,
+            ccState.introAxisSuppression)
+        ccState.introAxisSuppression = nil
+    end
+end
+
+local function SpeakIntroBackstory()
+    -- "Create a custom character. Backstory: ...".  Prefer the text
+    -- cached at welcome time.  snapshot suppression while armed keeps
+    -- dcProps frozen, so the cached value is already the freshest.
+    local backstory = ccState.customBackstoryText
+    if not backstory or backstory == "" then
+        backstory = "You've always felt you had a greater calling,"
+            .. " but it has never borne fruit."
+            .. " Everything changes when you awaken imprisoned on an alien ship."
+            .. " Perhaps your time has finally come."
+    end
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("originLabel", "Create a custom character.", "brief")
+    speechData:Add("originBackstory", "Backstory: " .. backstory, "verbose")
+    local speech = speechData:Format()
+    Log.Info("CC INTRO BACKSTORY: " .. speech)
+    Ext.Tolk.Speak(speech, true)
+    ccState.lastSpokenFullText = speech
+end
+
+local function HandleIntroContinuePress()
+    if not ccState.introAwaitingContinue then return end
+    ccState.introAwaitingContinue = false
+    UnsubscribeIntroContinue()
+    -- D-pad was suppressed while the gate was armed, so focus is
+    -- still on the Custom origin where it landed on entry.  The
+    -- cached backstory is guaranteed to match.
+    SpeakIntroBackstory()
+end
+
+local function SubscribeIntroContinue()
+    UnsubscribeIntroContinue()
+    -- Button channel: some backends report LT as a button (either
+    -- "LeftTrigger" or "TriggerLeft").
+    ccState.introContinueSubscription =
+        Ext.Events.ControllerButtonInput:Subscribe(function(event)
+            if not event.Pressed then return end
+            if not ccState.introAwaitingContinue then return end
+            local buttonName = tostring(event.Button)
+            if buttonName == "LeftTrigger"
+                or buttonName == "TriggerLeft" then
+                pcall(function() event:PreventAction() end)
+                HandleIntroContinuePress()
+            end
+        end)
+    -- Axis channel: LT also reports as an analog axis.  Edge-triggered
+    -- so a held trigger doesn't re-fire.  Threshold 0.5 prevents
+    -- partial pulls from triggering accidentally.
+    local axisEdgeCrossed = false
+    ccState.introAxisSubscription =
+        Ext.Events.ControllerAxisInput:Subscribe(function(event)
+            if not ccState.introAwaitingContinue then return end
+            local axisName = tostring(event.Axis)
+            if axisName ~= "TriggerLeft" then return end
+            local value = event.Value or 0
+            if value >= 0.5 then
+                if not axisEdgeCrossed then
+                    axisEdgeCrossed = true
+                    HandleIntroContinuePress()
+                end
+            else
+                axisEdgeCrossed = false
+            end
+        end)
+    -- Suppress all navigation input while the gate is armed so focus
+    -- can't drift from the Custom origin.  PreventAction eats the
+    -- event before Noesis processes it.  LT is excluded (handled
+    -- above).  Unsubscribed by UnsubscribeIntroContinue on LT press.
+    ccState.introButtonSuppression =
+        Ext.Events.ControllerButtonInput:Subscribe(function(event)
+            if not ccState.introAwaitingContinue then return end
+            if not event.Pressed then return end
+            local buttonName = tostring(event.Button)
+            -- Allow system buttons (Guide, Start) through.
+            if buttonName ~= "LeftTrigger"
+                and buttonName ~= "TriggerLeft"
+                and buttonName ~= "Guide"
+                and buttonName ~= "Start"
+                and buttonName ~= "Back" then
+                pcall(function() event:PreventAction() end)
+            end
+        end)
+    ccState.introAxisSuppression =
+        Ext.Events.ControllerAxisInput:Subscribe(function(event)
+            if not ccState.introAwaitingContinue then return end
+            local axisName = tostring(event.Axis)
+            -- Allow LT through; suppress sticks and other axes.
+            if axisName ~= "TriggerLeft" then
+                pcall(function() event:PreventAction() end)
+            end
+        end)
+    Log.Debug("Subscribed CC intro LT listener + input suppression")
+end
+
+-- ============================================================================
+-- First-entry speech helpers (invoked once per flow from the router)
+-- ============================================================================
+
+-- SpeakGuardianEntry: first CC snapshot after naming -> guardian page.
+local function SpeakGuardianEntry()
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("title", "Guardian Appearance", "brief")
+    speechData:Add("hint",
+        "Choose your guardian's appearance."
+        .. " D-pad up and down to browse options."
+        .. " D-pad left and right to change values."
+        .. " Press Y to venture forth and start the game."
+        .. " Press B to return to character naming.", "normal")
+    ccState.lastSpokenTitle = "Guardian Appearance"
+    Log.Info("CC FIRST ENTRY: guardian")
+    return speechData
+end
+
+-- SpeakLevelUpEntry: CC widget is gui::DCCharacterLevelUp.
+local function SpeakLevelUpEntry(focusedElement)
+    local levelUpClass = nil
+    if focusedElement and focusedElement.namedTexts then
+        levelUpClass = focusedElement.namedTexts.classLevelText
+    end
+    local levelUpTitle = "Level Up"
+    if levelUpClass and levelUpClass ~= "" then
+        levelUpTitle = "Level Up: " .. levelUpClass
+    end
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("title", levelUpTitle, "brief")
+    speechData:Add("hint",
+        "Up and down to review gains."
+        .. " Press Y to accept."
+        .. " Press X to add a class."
+        .. " Press B to exit.", "normal")
+    ccState.lastSpokenTitle = levelUpTitle
+    Log.Info("CC FIRST ENTRY: level up, " .. tostring(levelUpClass))
+    return speechData
+end
+
+-- SpeakMainCCEntry: main CC entry.  Arms the LT listener and returns
+-- the welcome SpeechData.  Caches Custom's backstory for the LT press.
+local function SpeakMainCCEntry(focusedElement)
+    if focusedElement and focusedElement.dcProps then
+        local selectedOrigin = focusedElement.dcProps.SelectedOrigin
+        if type(selectedOrigin) == "table" then
+            local backstory = selectedOrigin.Description
+            if type(backstory) == "string" and backstory ~= "" then
+                ccState.customBackstoryText = Helpers.StripMarkupTags(
+                    backstory):gsub("[%.%s]+$", "")
+            end
+        end
+    end
+
+    ccState.introAwaitingContinue = true
+    SubscribeIntroContinue()
+
+    local speechData = Helpers.CreateSpeechData()
+    speechData:Add("title", "Character Creation", "brief")
+    speechData:Add("welcome", CC_INTRO_WELCOME, "verbose")
+    ccState.lastSpokenTitle = "Character Creation"
+    Log.Info("CC FIRST ENTRY: main, intro-await LT")
+    return speechData
+end
+
+-- ============================================================================
+-- Page classifier
+-- ============================================================================
+--
+-- ClassifyPage: determine which CC page the snapshot is on.
+-- Returns a page name from the set of keys in PAGE_HANDLERS, or nil.
+--
+-- Resolution order (returns on first hit):
+--   1. focusedSectionLabel / selectedSectionLabel from CC_SECTION_LABELS
+--      (VM types directly identify Race / Class / Skill / etc.)
+--   2. selectedTabName, filtered to exclude body-type strings and
+--      ListBoxItem:N indices (neither are real tabs)
+--   3. focusedElement.tabName (when element itself is a tab), same filters
+--   4. Deity detection via StaticData API when tab name looks like a deity
+--   5. elemName hints for Appearance (no VM type, no header tab)
+--   6. Fall back to ccState.currentPage (stay on current page)
+
+local function ClassifyPage(snapshot)
+    local focusedElement = snapshot.focusedElement
+    if not focusedElement then return ccState.currentPage end
+
+    local focusedSectionLabel = GetSectionLabel(focusedElement)
+    local selectedSectionLabel = nil
+    if snapshot.selectedElement then
+        selectedSectionLabel = GetSectionLabel(snapshot.selectedElement)
+    end
+
+    -- VM types are the most reliable signal.
+    if selectedSectionLabel then return selectedSectionLabel end
+    if focusedSectionLabel then
+        -- Sub-item types (VMSpellReference, VMSkill, VMAbility) appear
+        -- on multiple pages: class/race feature lists, background skill
+        -- proficiency, etc.  Only let them re-classify the page when
+        -- selectionChanged confirms a genuine tab switch (RB/LB), not
+        -- on d-pad down within the same page.  Without this gate,
+        -- d-padding from the Druid carousel into its spell features
+        -- would switch to SpellSelectionHandler and speak the cantrip
+        -- hint instead of staying on the Class page.
+        if CC_SUBITEM_DC_TYPES[focusedElement.dcType] then
+            if snapshot.selectionChanged then
+                return focusedSectionLabel
+            end
+            -- Fall through to keep current page.
+        else
+            return focusedSectionLabel
+        end
+    end
+
+    -- Selected tab name (header carousel), filtered.  Only accept
+    -- tabNames that match a known page or a deity display name.
+    -- Carousel-internal ListBoxItems (Custom, Astarion, etc.) also
+    -- come through as .tabName but are item selections, not pages.
+    if snapshot.selectedElement and snapshot.selectedElement.isTab then
+        local selectedTabName = snapshot.selectedElement.tabName
+        if selectedTabName and selectedTabName ~= ""
+            and not selectedTabName:find("^ListBoxItem:")
+            and not IsBodyTypeTabName(selectedTabName) then
+            if CC_PAGE_NAMES[selectedTabName] then
+                return selectedTabName
+            end
+            if Helpers.LookupStaticDataDescription("God",
+                    selectedTabName) then
+                return "Deity"
+            end
+            -- Unknown name (character / item display name) -- fall
+            -- through so we don't flip currentPage on carousel steps.
+        end
+    end
+
+    -- Focused element's tab name (when the element IS a tab).  Same
+    -- whitelist filter as above.
+    if focusedElement.isTab then
+        local focusedTabName = focusedElement.tabName
+        if focusedTabName and focusedTabName ~= ""
+            and not focusedTabName:find("^ListBoxItem:")
+            and not IsBodyTypeTabName(focusedTabName) then
+            if CC_PAGE_NAMES[focusedTabName] then
+                return focusedTabName
+            end
+            if Helpers.LookupStaticDataDescription("God",
+                    focusedTabName) then
+                return "Deity"
+            end
+        end
+    end
+
+    -- Appearance page hints: no CC VM type, no recognized tab name.
+    if focusedElement.elemName
+        and (focusedElement.elemName:find("Appearance", 1, true)
+            or focusedElement.elemName:find("newRandom", 1, true)) then
+        return "Appearance"
+    end
+    if focusedElement.elemText == "Randomise" then
+        return "Appearance"
+    end
+
+    -- Stay on the current page if nothing re-classifies.
+    return ccState.currentPage
+end
+
+-- ============================================================================
+-- ResetCCNavigation / ResetCCState
+-- ============================================================================
+
 --- ResetCCNavigation: clear CC navigation dedup state only.
---- Defined before HandleCCSnapshot so it can be called on cutscene return.
 local function ResetCCNavigation()
     ccState.lastSpokenTab = nil
     ccState.lastSpokenTitle = nil
@@ -1205,9 +1589,9 @@ local function ResetCCNavigation()
     ccState.lastSpokenItemName = nil
 end
 
---- ResetCCState: clear all CC state.
---- Defined before HandleCCSnapshot so it can be called on cutscene return.
---- Also exported for Manager to call on GameStateChanged.
+--- ResetCCState: clear all CC state.  Called by the Manager on
+--- GameStateChanged.  Also invoked by HandleWidgetAdded on blurb
+--- return (preserving firstEntrySpoken so the intro does not replay).
 local function ResetCCState()
     ccState.lastSpokenName = nil
     ccState.lastSpokenFullText = nil
@@ -1216,9 +1600,6 @@ local function ResetCCState()
     ccState.lastSpokenItemName = nil
     ccState.lastMainTab = nil
     ccState.lastCarouselTick = nil
-    ccState.tabHintSpoken = false
-    ccState.tabHintsSpoken = nil
-    ccState.abilityHintSpoken = false
     ccState.screenEntryJustSpoke = false
     ccState.inCharacterCreation = false
     ccState.inPostNamingCC = false
@@ -1228,80 +1609,937 @@ local function ResetCCState()
     ccState.selectedOriginName = nil
     ccState.isCustomOrigin = nil
     ccState.currentWidgetDCType = nil
+    ccState.currentPage = nil
+    ccState.activePageHandler = nil
+    ccState.firstEntrySpoken = false
+    ccState.introAwaitingContinue = false
+    ccState.customBackstoryText = nil
+    ccState.lastStandaloneCarouselValue = nil
+    ccState.lastHandlerSpeechData = nil
+    ccState.lastTooltipSpeech = nil
+    ccState.awaitingPostCutsceneNav = false
+    ccState.postCutsceneHintSpoken = false
+    ccState.postCutsceneArmedAt = 0
+    UnsubscribeIntroContinue()
+    if resetHandlersHook then resetHandlersHook() end
 end
 
--- Main CC handler.  Called by Manager when IsCCSnapshot returns true.
--- Uses module-level ccState for all CC-specific state.
+-- ============================================================================
+-- CreateCCPageHandler factory
+-- ============================================================================
+--
+-- Mirrors Menus.CreateMenuHandler and WorldUI.CreatePanelHandler.  Each
+-- page handler owns its own handlerState table and shares the generic
+-- HandleSnapshot dispatch pipeline from this factory.
+--
+-- Config fields (all optional except name):
+--   name (string)              -- display name for logs
+--   pages (table of strings)   -- tab names this handler services
+--   hint (string|false|nil)    -- static hint (nil -> CC_TAB_HINTS[tab])
+--                                 false explicitly suppresses
+--   hintFn (function)          -- (tabName, snapshot, handlerState)
+--                                 -> string | false | nil
+--                                 nil return falls through to hint
+--   screenBodyFn (function)    -- extra body text on screen entry;
+--                                 (focusedElement, tabName,
+--                                  handlerState, snapshot) -> string
+--   customItemFn (function)    -- per-handler item extraction override;
+--                                 (focusedElement, snapshot, tabName,
+--                                  handlerState) -> (name, value, desc)
+--                                 return all nil to fall through to
+--                                 the default GetCCItemData extractor
+--   onReset (function)         -- (handlerState)
+--
+-- Returns: { name, pages, HandlesPage, HandleSnapshot, ResetNavigation,
+--            ResetState }
+
+local function CreateCCPageHandler(config)
+    local handlerState = {
+        lastSpokenName       = nil,
+        lastSpokenFullText   = nil,
+        lastSpokenItemName   = nil,
+        lastSpokenTitle      = nil,
+        lastCarouselTick     = nil,
+        tabHintsSpoken       = {},   -- keyed by tab name
+        screenEntryJustSpoke = false,
+        -- True after the "You acquire the following..." section label
+        -- has been spoken for this page visit.  Reset on page switch
+        -- (ResetNavigation) so it re-speaks on return.
+        sectionLabelSpoken   = false,
+        -- Free-form slot for screenBodyFn / customItemFn / onReset to
+        -- stash per-handler data (abilityRulesSpoken, etc.).
+        handlerExtras        = {},
+    }
+
+    local pageSet = {}
+    if config.pages then
+        for _, pageName in ipairs(config.pages) do
+            pageSet[pageName] = true
+        end
+    end
+
+    local function HandlesPage(pageName)
+        return pageSet[pageName] == true
+    end
+
+    -- Resolve hint for a tab: hintFn > config.hint > CC_TAB_HINTS[tab].
+    local function ResolveHint(tabName, snapshot)
+        if config.hintFn then
+            local dynamicHint = config.hintFn(
+                tabName, snapshot, handlerState)
+            if dynamicHint ~= nil then return dynamicHint end
+        end
+        if config.hint ~= nil then return config.hint end
+        return CC_TAB_HINTS[tabName]
+    end
+
+    -- ---------------------------------------------------------------
+    -- HandleSnapshot: per-page dispatch pipeline.
+    --   snapshot:     the full TickSnapshot
+    --   tabName:      page name from the router's classifier (or nil)
+    --   isFirstEntry: true when this is the first snapshot of a fresh
+    --                 activation of this handler on this page
+    -- ---------------------------------------------------------------
+    local function HandleSnapshot(snapshot, tabName, isFirstEntry)
+        local focusedElement = snapshot.focusedElement
+        if not focusedElement or not focusedElement.elemType then
+            return
+        end
+
+        local userInitiated = snapshot.focusChanged
+            or snapshot.selectionChanged
+            or snapshot.inlineCarouselChanged
+            or snapshot.valueChanged
+
+        -- Capture the standalone carousel value BEFORE clearing so we
+        -- can suppress the post-settle item-nav speech that repeats
+        -- what the standalone carousel already spoke.  Clear after
+        -- capture so stale values don't persist across unrelated ticks.
+        local standaloneCarouselJustSpoke =
+            ccState.lastStandaloneCarouselValue
+        if snapshot.focusChanged or snapshot.selectionChanged then
+            ccState.lastStandaloneCarouselValue = nil
+        end
+
+        local elemId = focusedElement.elemId or ""
+        local hasCarousel = snapshot.inlineCarouselChanged
+            and snapshot.inlineCarouselValue
+            and snapshot.inlineCarouselValue ~= ""
+
+        -- Classification.  Handler-change is the screen-entry trigger;
+        -- everything else is item nav or in-place change.
+        local focusedSectionLabel = GetSectionLabel(focusedElement)
+        local effectiveIsTab = focusedElement.isTab
+            and not focusedSectionLabel
+        local isScreenEntry = isFirstEntry == true
+
+        local isItemNav = (snapshot.focusChanged
+                or snapshot.selectionChanged)
+            and not isScreenEntry
+        local isCarouselOnly = hasCarousel and not snapshot.focusChanged
+        local isValueOnly = not isScreenEntry and not isItemNav
+            and not isCarouselOnly and snapshot.valueChanged
+
+        if not isScreenEntry and not isItemNav
+            and not isCarouselOnly and not isValueOnly then
+            return
+        end
+
+        -- =============================================================
+        -- Standalone inline carousel change (no focus shift).
+        -- =============================================================
+        if isCarouselOnly then
+            local carouselValue = snapshot.inlineCarouselValue
+            local carouselDescription = nil
+            local effectiveTab = tabName or ccState.lastMainTab
+                or ccState.lastSpokenTab
+            if effectiveTab
+                and not CC_TAB_STATIC_DATA_TYPE[effectiveTab]
+                and Helpers.LookupStaticDataDescription("God",
+                    effectiveTab) then
+                effectiveTab = "Deity"
+                ccState.lastMainTab = "Deity"
+            end
+            if effectiveTab
+                and CC_TAB_STATIC_DATA_TYPE[effectiveTab]
+                and focusedElement.dcProps
+                and focusedElement.dcType == "gui::DCCharacterCreation" then
+                local carouselDesc = GetGodObjectDescription(
+                    focusedElement.dcProps, effectiveTab, carouselValue)
+                if carouselDesc and carouselDesc ~= "" then
+                    carouselDescription = carouselDesc
+                end
+            end
+            if carouselValue ~= handlerState.lastSpokenFullText then
+                handlerState.lastSpokenName = elemId
+                handlerState.lastCarouselTick = Ext.Utils.MonotonicTime()
+                local carouselSpeech = Helpers.CreateSpeechData()
+                carouselSpeech:Add("carouselValue", carouselValue, "brief")
+                if carouselDescription then
+                    carouselSpeech:Add("carouselDesc",
+                        carouselDescription, "normal")
+                end
+                local carouselFormatted = carouselSpeech:Format()
+                handlerState.lastSpokenFullText = carouselFormatted
+                Log.Info("CAROUSEL [" .. config.name .. "]: "
+                    .. carouselFormatted)
+                Ext.Tolk.Speak(carouselFormatted, true)
+            end
+            return
+        end
+
+        -- Suppress INPC follow-up from standalone carousel that already
+        -- spoke name + description for the same item.
+        if ccState.lastStandaloneCarouselValue
+            and snapshot.inlineCarouselValue
+            and snapshot.inlineCarouselValue
+                == ccState.lastStandaloneCarouselValue then
+            ccState.lastStandaloneCarouselValue = nil
+            Log.Debug("SUPPRESS INPC follow-up (standalone carousel): "
+                .. tostring(snapshot.inlineCarouselValue))
+            return
+        end
+
+        -- Suppress value events that follow a carousel on the same
+        -- element (e.g. Face carousel "Head 3" then stale "Face" value).
+        if isValueOnly and handlerState.lastCarouselTick then
+            local elapsed = Ext.Utils.MonotonicTime()
+                - handlerState.lastCarouselTick
+            if elapsed < 200 then
+                Log.Debug("SUPPRESS POST-CAROUSEL VALUE ["
+                    .. config.name .. "]")
+                return
+            end
+        end
+
+        -- =============================================================
+        -- Value-only INPC change.
+        -- =============================================================
+        if isValueOnly then
+            local itemName, itemValue, itemDescription = GetCCItemData(
+                focusedElement, snapshot, tabName, false)
+
+            if config.customItemFn then
+                local customName, customValue, customDescription =
+                    config.customItemFn(focusedElement, snapshot,
+                        tabName, handlerState)
+                if customName ~= nil then itemName = customName end
+                if customValue ~= nil then itemValue = customValue end
+                if customDescription ~= nil then
+                    itemDescription = customDescription
+                end
+            end
+
+            local hasValueOrDesc = (itemValue and itemValue ~= "")
+                or (itemDescription and itemDescription ~= "")
+            local nameChanged = itemName and itemName ~= ""
+                and itemName ~= handlerState.lastSpokenItemName
+            if not hasValueOrDesc and not nameChanged then
+                return
+            end
+
+            local valueSpeech = Helpers.CreateSpeechData()
+            if focusedElement.dcType == "gui::VMSliderSetting"
+                and itemValue and itemValue ~= "" then
+                -- Sliders: speak only the number; the name was just
+                -- spoken on the initial focus arrival.
+                valueSpeech:Add("itemValue", itemValue, "brief")
+            else
+                if itemName and itemName ~= "" then
+                    valueSpeech:Add("itemName",
+                        Helpers.StripMarkupTags(
+                            itemName:gsub("%s+$", "")), "brief")
+                end
+                if itemValue and itemValue ~= "" then
+                    valueSpeech:Add("itemValue",
+                        Helpers.StripMarkupTags(
+                            itemValue:gsub("%s+$", "")), "brief")
+                end
+                if itemDescription and itemDescription ~= "" then
+                    valueSpeech:Add("itemDesc",
+                        Helpers.StripMarkupTags(
+                            itemDescription:gsub("%s+$", "")), "verbose")
+                end
+            end
+            local fullText = valueSpeech:Format()
+            if fullText and fullText ~= ""
+                and fullText ~= handlerState.lastSpokenFullText then
+                handlerState.lastSpokenFullText = fullText
+                handlerState.lastSpokenName = elemId
+                if itemName and itemName ~= "" then
+                    handlerState.lastSpokenItemName = itemName
+                end
+                Log.Info("VALUE [" .. config.name .. "]: " .. fullText)
+                Ext.Tolk.Speak(fullText, true)
+            end
+            return
+        end
+
+        -- =============================================================
+        -- Screen entry or item navigation.
+        -- =============================================================
+        local speechData = Helpers.CreateSpeechData()
+        local screenTitle = nil
+
+        if isScreenEntry then
+            local effectiveDCType = ccState.currentWidgetDCType
+                or focusedElement.dcType
+            if effectiveDCType == "gui::DCCharacterCreation" then
+                screenTitle = "Character Creation"
+            end
+            local normalTab = tabName
+                and Helpers.NormalizeForCompare(tabName) or ""
+            if screenTitle and normalTab ~= ""
+                and Helpers.NormalizeForCompare(screenTitle) == normalTab then
+                screenTitle = nil
+            end
+            if screenTitle
+                and screenTitle == handlerState.lastSpokenTitle then
+                screenTitle = nil
+            end
+            if screenTitle then
+                handlerState.lastSpokenTitle = screenTitle
+                speechData:Add("title", screenTitle, "brief")
+            end
+
+            if tabName
+                and not handlerState.tabHintsSpoken[tabName] then
+                local tabHint = ResolveHint(tabName, snapshot)
+                if tabHint then
+                    handlerState.tabHintsSpoken[tabName] = true
+                    speechData:Add("hint", tabHint, "normal")
+                elseif tabHint == false then
+                    -- Explicitly suppressed; still mark spoken so we
+                    -- don't try again on this visit.
+                    handlerState.tabHintsSpoken[tabName] = true
+                end
+            end
+
+            if tabName then
+                local showTabName = true
+                if screenTitle and normalTab ~= ""
+                    and Helpers.NormalizeForCompare(screenTitle):find(
+                        normalTab, 1, true) then
+                    showTabName = false
+                end
+                if showTabName then
+                    speechData:Add("tabName", tabName, "brief")
+                end
+            end
+
+            if config.screenBodyFn then
+                local extraBody = config.screenBodyFn(
+                    focusedElement, tabName, handlerState, snapshot)
+                if extraBody and extraBody ~= "" then
+                    speechData:Add("body", extraBody, "normal")
+                end
+            end
+        end
+
+        -- =============================================================
+        -- Item extraction (shared by screen entry and item nav).
+        -- =============================================================
+        local effectiveTabForExtraction = tabName or ccState.lastSpokenTab
+        local itemName, itemValue, itemDescription
+
+        if config.customItemFn then
+            itemName, itemValue, itemDescription = config.customItemFn(
+                focusedElement, snapshot,
+                effectiveTabForExtraction, handlerState)
+        end
+        if itemName == nil and itemValue == nil
+            and itemDescription == nil then
+            itemName, itemValue, itemDescription = GetCCItemData(
+                focusedElement, snapshot,
+                effectiveTabForExtraction, isScreenEntry)
+        end
+
+        -- Selection-based carousel cycling fallback: d-pad cycling an
+        -- outer carousel keeps focus on the god-object container and
+        -- the default extractor returns "Grid".  Recover from the
+        -- selectedElement (VM ListBoxItem) or from the god-object
+        -- sub-table directly.
+        --
+        -- Guard: if an extractor returned a description but no name
+        -- (e.g. ExtractOriginContext -> "Play as an existing
+        -- character..."), that is a legitimate description-only claim
+        -- and the fallback must not override it with a carousel item.
+        local descriptionOnlyClaim = (itemDescription
+            and itemDescription ~= "")
+            and (not itemName or itemName == "")
+        if snapshot.selectionChanged
+            and (not itemName or itemName == "Grid")
+            and not descriptionOnlyClaim
+            and focusedElement.dcProps and effectiveTabForExtraction then
+            local selectedName = nil
+            local selectedDescription = nil
+
+            if snapshot.selectedElement and snapshot.selectedElement.dcType
+                and CC_SECTION_LABELS[snapshot.selectedElement.dcType] then
+                local selectedDCProps = snapshot.selectedElement.dcProps
+                if selectedDCProps then
+                    selectedName = selectedDCProps.Name
+                end
+                if (not selectedName or selectedName == "")
+                    and snapshot.selectedElement.tabName then
+                    selectedName = snapshot.selectedElement.tabName
+                end
+                if selectedName and selectedName ~= "" then
+                    local sectionLabel = GetSectionLabel(
+                        snapshot.selectedElement)
+                    if sectionLabel then
+                        local staticDataType =
+                            CC_TAB_STATIC_DATA_TYPE[sectionLabel]
+                        if staticDataType then
+                            selectedDescription =
+                                Helpers.LookupStaticDataDescription(
+                                    staticDataType, selectedName)
+                        end
+                    end
+                    if not selectedDescription and selectedDCProps then
+                        local vmDescription = selectedDCProps.Description
+                        if type(vmDescription) == "table" then
+                            vmDescription = vmDescription.Text
+                                or vmDescription.Str
+                                or vmDescription.Description
+                        end
+                        if type(vmDescription) == "string"
+                            and vmDescription ~= "" then
+                            selectedDescription =
+                                Helpers.StripMarkupTags(vmDescription)
+                        end
+                    end
+                end
+            end
+
+            if not selectedName then
+                local subTableKey = CC_SELECTED_DESCRIPTION_KEYS[
+                    effectiveTabForExtraction]
+                if subTableKey then
+                    local subTable = focusedElement.dcProps[subTableKey]
+                    if type(subTable) == "table" then
+                        selectedName = subTable.Name
+                            or subTable.DisplayName or subTable.Title
+                    end
+                end
+            end
+
+            if selectedName and selectedName ~= "" then
+                if not selectedDescription then
+                    selectedDescription = GetGodObjectDescription(
+                        focusedElement.dcProps,
+                        effectiveTabForExtraction, selectedName)
+                end
+                itemName = selectedName
+                itemDescription = selectedDescription
+                itemValue = nil
+                Log.Info("CAROUSEL FALLBACK [" .. config.name .. "]: "
+                    .. selectedName .. " tab="
+                    .. tostring(effectiveTabForExtraction))
+            end
+        end
+
+        -- "Grid" suppression: never a valid item name.
+        if itemName == "Grid" then
+            Log.Debug("SUPPRESS GRID [" .. config.name .. "]: "
+                .. tostring(elemId) .. " isItem="
+                .. tostring(isItemNav) .. " isScreen="
+                .. tostring(isScreenEntry))
+            if not isScreenEntry then return end
+            itemName = nil
+        end
+
+        -- Item nav dedup.
+        if isItemNav and elemId == handlerState.lastSpokenName
+            and not hasCarousel
+            and not snapshot.valueChanged
+            and not snapshot.selectionChanged then
+            local valueDiffers = itemValue
+                and itemValue ~= handlerState.lastSpokenFullText
+            if not valueDiffers then
+                if not itemName
+                    or itemName == handlerState.lastSpokenItemName
+                    or itemName == handlerState.lastSpokenFullText then
+                    Log.Debug("DEDUP SKIP [" .. config.name .. "]: "
+                        .. tostring(elemId))
+                    return
+                end
+            end
+        end
+
+        -- Section header / tab-restate suppression.
+        if itemName then
+            local effectiveTab = tabName or ccState.lastSpokenTab
+            local normalTab = effectiveTab
+                and Helpers.NormalizeForCompare(effectiveTab) or ""
+            local normalItem = Helpers.NormalizeForCompare(itemName)
+            if normalTab ~= "" and normalItem == normalTab then
+                Log.Debug("SUPPRESS TAB DUP [" .. config.name .. "]: "
+                    .. itemName)
+                itemName = nil
+            elseif CC_SECTION_HEADERS[normalItem] then
+                Log.Debug("SUPPRESS HEADER [" .. config.name .. "]: "
+                    .. itemName)
+                itemName = nil
+            elseif isScreenEntry and focusedSectionLabel
+                and normalTab ~= "" and not itemValue
+                and normalItem:find(normalTab, 1, true) then
+                Log.Debug("SUPPRESS SECTION RESTATE ["
+                    .. config.name .. "]: " .. itemName)
+                itemName = nil
+            end
+
+            if not itemName and (itemDescription or itemValue) then
+                handlerState.lastSpokenName = elemId
+                handlerState.lastSpokenItemName = nil
+            end
+        end
+
+        -- Cross-element dedup: name alone already spoken.
+        if isItemNav and itemName and not itemDescription
+            and not itemValue
+            and handlerState.lastSpokenFullText then
+            local normalItem = Helpers.NormalizeForCompare(itemName)
+            local normalLast = Helpers.NormalizeForCompare(
+                handlerState.lastSpokenFullText)
+            if normalItem == normalLast
+                or (normalLast:sub(-#normalItem) == normalItem) then
+                Log.Debug("DEDUP SKIP cross-element ["
+                    .. config.name .. "]: " .. itemName)
+                return
+            end
+        end
+
+        -- Value-only cycling on the same label (e.g. body type cycling).
+        if itemName and itemValue
+            and handlerState.lastSpokenItemName
+            and itemName == handlerState.lastSpokenItemName then
+            handlerState.lastSpokenFullText = itemValue
+            handlerState.lastSpokenName = elemId
+            handlerState.lastSpokenItemName = itemName
+            local cycleSpeech = Helpers.CreateSpeechData()
+            cycleSpeech:Add("cycleValue", itemValue, "brief")
+            Log.Info("VALUE CYCLE [" .. config.name .. "]: " .. itemValue)
+            Ext.Tolk.Speak(cycleSpeech:Format(), true)
+            return
+        end
+
+        -- Section-transition label: when focus moves from the carousel
+        -- into the feature/sub-item list for the first time on this
+        -- page visit, prepend "You acquire the following class
+        -- features:" (or racial/subrace/subclass variant) so the
+        -- player knows these are granted items, not selections.
+        if not handlerState.sectionLabelSpoken
+            and not isScreenEntry
+            and focusedElement.dcType
+            and IsFeatureOrSubItemDCType(focusedElement.dcType) then
+            local currentPage = tabName or ccState.currentPage
+            local sectionLabel =
+                CC_SECTION_TRANSITION_LABELS[currentPage]
+            if sectionLabel then
+                handlerState.sectionLabelSpoken = true
+                speechData:Add("sectionLabel", sectionLabel, "brief")
+                Log.Info("SECTION LABEL [" .. config.name .. "]: "
+                    .. sectionLabel)
+            end
+        end
+
+        if itemName then
+            handlerState.lastSpokenItemName = itemName
+            handlerState.lastSpokenName = elemId
+            handlerState.lastSpokenFullText = itemName
+            Log.Info("ITEM [" .. config.name .. "]: "
+                .. tostring(focusedElement.elemType)
+                .. "  name=" .. itemName
+                .. (itemValue and ("  val=" .. itemValue) or "")
+                .. (itemDescription
+                    and ("  desc="
+                        .. tostring(itemDescription):sub(1, 40))
+                    or ""))
+        end
+        speechData:Add("itemName", itemName, "brief")
+        speechData:Add("itemValue", itemValue, "brief")
+        speechData:Add("itemDesc", itemDescription, "verbose")
+
+        if not itemName and not itemValue and not itemDescription then
+            Log.Info("SILENT ELEMENT [" .. config.name .. "]: elemId="
+                .. tostring(elemId) .. " elemType="
+                .. tostring(focusedElement.elemType) .. " elemText="
+                .. tostring(focusedElement.elemText) .. " dcType="
+                .. tostring(focusedElement.dcType))
+        end
+
+        -- Suppress post-settle speech when the standalone carousel
+        -- handler already spoke the same item with name + description.
+        -- The standalone fires on the carousel-changed tick (no
+        -- focus/selection), then the post-settle tick arrives with
+        -- focusChanged + selectionChanged and re-extracts the same
+        -- item.  Without this gate the user hears every carousel step
+        -- twice.
+        Log.Info("POST-SETTLE CHECK [" .. config.name .. "]: carousel='"
+            .. tostring(standaloneCarouselJustSpoke)
+            .. "' itemName='" .. tostring(itemName) .. "'")
+        if standaloneCarouselJustSpoke and itemName
+            and standaloneCarouselJustSpoke == itemName then
+            Log.Info("SUPPRESS post-settle duplicate ["
+                .. config.name .. "]: " .. itemName)
+            return
+        end
+
+        -- Store for tooltip exact-match Diff.
+        ccState.lastHandlerSpeechData = speechData
+        speechData:Speak(ccState, isScreenEntry, nil, userInitiated)
+    end
+
+    local function ResetNavigation()
+        handlerState.lastSpokenName = nil
+        handlerState.lastSpokenFullText = nil
+        handlerState.lastSpokenItemName = nil
+        handlerState.screenEntryJustSpoke = false
+        handlerState.sectionLabelSpoken = false
+    end
+
+    local function ResetState()
+        ResetNavigation()
+        handlerState.lastSpokenTitle = nil
+        handlerState.lastCarouselTick = nil
+        handlerState.tabHintsSpoken = {}
+        handlerState.handlerExtras = {}
+        if config.onReset then
+            config.onReset(handlerState)
+        end
+    end
+
+    return {
+        name               = config.name,
+        pages              = config.pages or {},
+        HandlesPage        = HandlesPage,
+        HandleSnapshot     = HandleSnapshot,
+        ResetNavigation    = ResetNavigation,
+        ResetState         = ResetState,
+    }
+end
+
+-- ============================================================================
+-- Per-page handler instances
+-- ============================================================================
+
+-- CarouselDescHandler: Race / Subrace / Class / Subclass / Background /
+-- Deity / Feat / Origin.  All share the same pattern (carousel of items,
+-- StaticData-backed descriptions).  GetCCItemData + GetGodObjectDescription
+-- already do all the extraction work; no per-handler overrides needed.
+-- Origin is included here because its body-type and identity sub-items
+-- already route through ExtractOriginContext inside GetCCItemData.
+local CarouselDescHandler = CreateCCPageHandler({
+    name  = "CCCarouselDesc",
+    pages = { "Race", "Subrace", "Class", "Subclass", "Background",
+              "Deity", "Feat", "Origin" },
+})
+
+-- AbilitiesHandler: abilities grid with points-remaining + rules hint.
+-- CC_TAB_HINTS["Abilities"] is nil on purpose -- screenBodyFn owns the
+-- extra body text so rules hint and points count are one announcement.
+local AbilitiesHandler = CreateCCPageHandler({
+    name  = "CCAbilities",
+    pages = { "Abilities" },
+    screenBodyFn = function(focusedElement, tabName, handlerState,
+                            snapshot)
+        if not focusedElement.dcProps then return nil end
+        local bodyParts = {}
+        if not handlerState.handlerExtras.abilityRulesSpoken then
+            handlerState.handlerExtras.abilityRulesSpoken = true
+            table.insert(bodyParts,
+                "Every 2 points above 10 gives plus 1 to related rolls")
+        end
+        local unusedPoints = focusedElement.dcProps.UnusedAbilityPoints
+        if unusedPoints then
+            table.insert(bodyParts,
+                tostring(unusedPoints) .. " points remaining")
+        end
+        if #bodyParts == 0 then return nil end
+        return table.concat(bodyParts, ". ")
+    end,
+})
+
+-- SkillsHandler: LocaString-resolved hint ("Choose N skills").
+local SkillsHandler = CreateCCPageHandler({
+    name  = "CCSkills",
+    pages = { "Skills" },
+    hintFn = function(tabName)
+        return GetPageInstructionText(tabName)
+    end,
+})
+
+-- SpellSelectionHandler: Cantrip + Spell + High Elf Cantrip all share
+-- the spell grid.  hintFn prioritizes CC_TAB_HINTS (hand-written
+-- navigation guidance like "cantrips don't use spell slots") over the
+-- LocaString instruction text ("Selected. Available") which is just
+-- XAML header labels and not useful for orientation.
+local SpellSelectionHandler = CreateCCPageHandler({
+    name  = "CCSpellSelection",
+    pages = { "Cantrip", "Spell", "High Elf Cantrip" },
+    hintFn = function(tabName)
+        return CC_TAB_HINTS[tabName] or GetPageInstructionText(tabName)
+    end,
+})
+
+-- AppearanceHandler: sliders, inline carousels, toggles.  Body Type /
+-- Identity / Voice rows also appear on Appearance; the shared
+-- extractors (ExtractOriginContext inside GetCCItemData) already handle
+-- them, so no customItemFn is needed.
+local AppearanceHandler = CreateCCPageHandler({
+    name  = "CCAppearance",
+    pages = { "Appearance" },
+})
+
+-- AbilityBonusHandler: the "Ability Bonus" sub-page under Race / Class.
+-- Kept as its own handler so "Bonus to Strength" naming and cycling
+-- announcements have a dedicated tab-hint slot (nil in CC_TAB_HINTS
+-- falls through to "no hint").  Inherits the default generic pipeline.
+local AbilityBonusHandler = CreateCCPageHandler({
+    name  = "CCAbilityBonus",
+    pages = { "Ability Bonus" },
+})
+
+-- ============================================================================
+-- Page handler routing
+-- ============================================================================
+
+local PAGE_HANDLERS = {
+    ["Origin"]           = CarouselDescHandler,
+    ["Race"]             = CarouselDescHandler,
+    ["Subrace"]          = CarouselDescHandler,
+    ["Class"]            = CarouselDescHandler,
+    ["Subclass"]         = CarouselDescHandler,
+    ["Background"]       = CarouselDescHandler,
+    ["Deity"]            = CarouselDescHandler,
+    ["Feat"]             = CarouselDescHandler,
+    ["Abilities"]        = AbilitiesHandler,
+    ["Ability Bonus"]    = AbilityBonusHandler,
+    ["Skills"]           = SkillsHandler,
+    ["Cantrip"]          = SpellSelectionHandler,
+    ["Spell"]            = SpellSelectionHandler,
+    ["High Elf Cantrip"] = SpellSelectionHandler,
+    ["Appearance"]       = AppearanceHandler,
+}
+
+-- Fallback handler for unclassified pages (e.g. rapid transitions).
+-- CarouselDescHandler's pipeline is page-agnostic.
+local defaultPageHandler = CarouselDescHandler
+
+local function ResolveHandlerForPage(pageName)
+    if not pageName then return defaultPageHandler end
+    return PAGE_HANDLERS[pageName] or defaultPageHandler
+end
+
+local function ResetAllPageHandlers()
+    CarouselDescHandler.ResetState()
+    AbilitiesHandler.ResetState()
+    SkillsHandler.ResetState()
+    SpellSelectionHandler.ResetState()
+    AppearanceHandler.ResetState()
+    AbilityBonusHandler.ResetState()
+end
+
+-- Wire the forward-declared hook so ResetCCState resets per-handler
+-- state too.
+resetHandlersHook = ResetAllPageHandlers
+
+-- ============================================================================
+-- HandleCCSnapshot (router)
+-- ============================================================================
+--
+-- Responsibilities:
+--   1. Transition lockouts (Naming / MainCC) and guardian teardown
+--      suppression.
+--   2. Interactive instruction gate (text input screens).
+--   3. Track SelectedOrigin, isCustomOrigin, currentWidgetDCType.
+--   4. Intro-awaiting gate: drop snapshots while LT is pending.
+--   5. Classify the current page; switch active handler on page change.
+--   6. First-entry speech (main CC intro / level up / guardian).
+--   7. Dispatch to the active handler's HandleSnapshot.
+
 local function HandleCCSnapshot(snapshot)
     local focusedElement = snapshot.focusedElement
 
-    -- User-initiated: true when the snapshot was triggered by user
-    -- input (d-pad, button, carousel switch, value toggle).
-    local userInitiated = snapshot.focusChanged
-        or snapshot.selectionChanged
-        or snapshot.inlineCarouselChanged
-        or snapshot.valueChanged
-
-    -- =================================================================
-    -- Guardian teardown suppression: after B from guardian, suppress ALL
-    -- CC snapshots until the next button press (Y or B).  The naming
-    -- screen was already spoken by the B callback; these are stale
-    -- guardian elements being torn down by Noesis.
-    -- =================================================================
     if ccState.suppressGuardianTeardown then
         Log.Debug("SUPPRESS: dropping guardian teardown snapshot")
         return
     end
 
-
-    -- =================================================================
-    -- Transition lockout: when Y or B triggers a known screen change,
-    -- pendingTransition is set to the destination.  Drop all snapshots
-    -- until the UI catches up to that destination.  This prevents
-    -- lingering stale snapshots from interrupting the correct speech.
-    -- =================================================================
     if ccState.pendingTransition then
-        local hasRealDCType = focusedElement.dcType
+        local hasRealDCType = focusedElement
+            and focusedElement.dcType
             and focusedElement.dcType ~= "(none)"
             and focusedElement.dcType ~= ""
+        -- Genuine navigation: focus or selection changed, not just a
+        -- residual INPC value tick from the old page's god-object.
+        local hasGenuineNav = snapshot.focusChanged
+            or snapshot.selectionChanged
         if ccState.pendingTransition == "Naming" then
-            -- The naming screen was already spoken by the Y-button callback.
-            -- Drop empty snapshots (naming screen has no focusable elements).
-            -- Clear the lockout when a real element arrives (guardian page
-            -- or returning CC page) and fall through to process it.
-            if hasRealDCType then
+            -- The naming screen was spoken by the Y-button callback.
+            -- Only clear the lockout when focus genuinely moves to a
+            -- new element (the guardian page loading after user pressed
+            -- A).  Residual value-only ticks from the old CC page
+            -- fire with dcType=gui::DCCharacterCreation but no
+            -- focus/selection change -- those must be dropped so the
+            -- guardian speech doesn't fire prematurely.
+            if hasRealDCType and hasGenuineNav then
                 ccState.pendingTransition = nil
                 ccState.lastSpokenTab = nil
-                -- Keep lastMainTab = "Naming" so guardian detection
-                -- (inPostNamingCC) can fire and B-handler works.
-                Log.Debug("LOCKOUT: cleared (real element arrived)")
-                -- Fall through to process this snapshot normally.
+                Log.Debug("LOCKOUT: cleared (real focused element arrived)")
             else
-                -- Empty snapshot during naming screen — nothing to process.
                 return
             end
         elseif ccState.pendingTransition == "MainCC" then
-            -- Waiting for main CC (real focused element).  Drop stale
-            -- naming/transition snapshots until a real CC element arrives.
             if hasRealDCType then
                 ccState.pendingTransition = nil
                 ccState.lastMainTab = nil
                 ccState.lastSpokenTab = nil
                 ccState.inPostNamingCC = false
+                ccState.currentPage = nil
+                ccState.activePageHandler = nil
                 Log.Debug("LOCKOUT: arrived at MainCC (state reset)")
-                -- Fall through to process this snapshot normally.
             else
-                Log.Debug("LOCKOUT: dropping snapshot (waiting for MainCC)")
+                Log.Debug("LOCKOUT: dropping (waiting for MainCC)")
                 return
             end
         end
     end
 
-    -- Interactive element instructions: text boxes, custom inputs, etc.
-    -- Speak the instruction once and suppress all subsequent snapshots
-    -- for the same element (e.g. each keystroke fires a value change).
+    -- Widget DC type caching + post-cutscene detection.
+    -- Runs BEFORE the focusedElement guard so that:
+    --   (a) Post-cutscene gate is armed on the same tick as the widget
+    --       re-add (HandleCCSnapshot runs before EventRouter's widget
+    --       event loop, which calls HandleWidgetAdded).
+    --   (b) DEV-ONLY: on mid-session reload, currentWidgetDCType and
+    --       inCharacterCreation are set even when focusedElement is nil
+    --       (the C++ focus cache was wiped by the reset).  On a real
+    --       first entry the widget and focus arrive on the same tick
+    --       after the settle cycle, so this early path only matters for
+    --       the dev reload scenario.
+    if snapshot.widgetEvents then
+        for _, widgetEvent in ipairs(snapshot.widgetEvents) do
+            if widgetEvent.dcType == "gui::DCCharacterCreation"
+                or widgetEvent.dcType == "gui::DCCharacterLevelUp" then
+                ccState.currentWidgetDCType = widgetEvent.dcType
+                -- NOTE: do NOT set inCharacterCreation here.  Setting
+                -- it early causes HandleWidgetAdded (which runs AFTER
+                -- HandleCCSnapshot on the same tick) to see
+                -- inCharacterCreation=true and fire a blurb-return
+                -- partial reset, wiping the introAwaitingContinue flag
+                -- and LT listeners that the first-entry speech just
+                -- armed.  currentWidgetDCType persists to the next
+                -- tick; inCharacterCreation is set naturally at the
+                -- guard below when focusedElement arrives.
+                -- Arm post-cutscene gate: the CC widget re-appeared
+                -- while we're already in CC (origin cutscene return).
+                -- firstEntrySpoken distinguishes a genuine first entry
+                -- (where we WANT the welcome) from a blurb return.
+                if widgetEvent.dcType == "gui::DCCharacterCreation"
+                    and ccState.firstEntrySpoken
+                    and not ccState.awaitingPostCutsceneNav then
+                    Log.Info("CC POST-CUTSCENE: arming gate"
+                        .. " (CC widget re-added while in CC)")
+                    ccState.awaitingPostCutsceneNav = true
+                    ccState.postCutsceneHintSpoken = false
+                    ccState.postCutsceneArmedAt =
+                        Ext.Utils.MonotonicTime()
+                end
+                break
+            end
+        end
+    end
+
+    -- Post-cutscene return gate.  Suppresses all speech (carousels,
+    -- focus events, handler dispatch) during the noise burst after
+    -- an origin-preview cutscene ends.  Speaks a hint once, then
+    -- silence until the user re-engages (focus/selection change
+    -- arriving 1000ms+ after the gate was armed).
+    if ccState.awaitingPostCutsceneNav then
+        local elapsed = Ext.Utils.MonotonicTime()
+            - ccState.postCutsceneArmedAt
+        if elapsed >= 1000
+            and (snapshot.focusChanged
+                or snapshot.selectionChanged) then
+            Log.Info("CC POST-CUTSCENE: user navigated after "
+                .. tostring(elapsed) .. "ms, resuming")
+            ccState.awaitingPostCutsceneNav = false
+            ccState.postCutsceneHintSpoken = false
+            ccState.postCutsceneArmedAt = 0
+            -- Clear handler dedup so the element under focus speaks
+            -- fresh (the user may land on the same origin character
+            -- they were on before the cutscene).
+            if ccState.activePageHandler then
+                ccState.activePageHandler.ResetNavigation()
+            end
+            -- Fall through to normal processing below.
+        else
+            if not ccState.postCutsceneHintSpoken then
+                ccState.postCutsceneHintSpoken = true
+                local hintSpeech = Helpers.CreateSpeechData()
+                hintSpeech:Add("hint",
+                    "Press down twice to return to the character list",
+                    "brief")
+                local hintText = hintSpeech:Format()
+                Log.Info("CC POST-CUTSCENE HINT: " .. hintText)
+                Ext.Tolk.Speak(hintText, true)
+            end
+            return
+        end
+    end
+
+    -- Standalone carousel events (inline appearance carousels) arrive
+    -- from C++ ClassSelectionDelegate with no focus change.  The
+    -- snapshot has carousel=1 + carVal but no focusedElement (or an
+    -- empty elemType).  Handle BEFORE the focusedElement guard so
+    -- they don't fall through EventRouter to Menus (which would
+    -- speak the bare name, then the INPC follow-up speaks name+desc,
+    -- causing double-reads).
+    local hasStandaloneCarousel = snapshot.inlineCarouselChanged
+        and snapshot.inlineCarouselValue
+        and snapshot.inlineCarouselValue ~= ""
+        and not snapshot.focusChanged
+    if hasStandaloneCarousel
+        and (not focusedElement
+            or not focusedElement.elemType
+            or focusedElement.elemType == "") then
+        local carouselValue = snapshot.inlineCarouselValue
+        if carouselValue ~= ccState.lastSpokenFullText then
+            -- Look up description via StaticData API for the current
+            -- page so the standalone carousel speaks name + description.
+            local carouselDescription = nil
+            local currentTab = ccState.lastMainTab
+            if currentTab then
+                local staticDataType = CC_TAB_STATIC_DATA_TYPE[currentTab]
+                if staticDataType then
+                    carouselDescription =
+                        Helpers.LookupStaticDataDescription(
+                            staticDataType, carouselValue)
+                end
+            end
+            local carouselSpeech = Helpers.CreateSpeechData()
+            carouselSpeech:Add("carouselValue", carouselValue, "brief")
+            if carouselDescription and carouselDescription ~= "" then
+                carouselSpeech:Add("carouselDesc",
+                    carouselDescription, "normal")
+            end
+            local carouselFormatted = carouselSpeech:Format()
+            ccState.lastSpokenFullText = carouselFormatted
+            ccState.lastStandaloneCarouselValue = carouselValue
+            Log.Info("CAROUSEL (standalone): " .. carouselFormatted)
+            Ext.Tolk.Speak(carouselFormatted, true)
+        end
+        return
+    end
+
+    if not focusedElement then return end
+
+    -- Interactive instruction screens (text input).  Speak the
+    -- instruction once per focus arrival, suppress subsequent ticks.
     if focusedElement.elemName then
-        local instruction = CC_INTERACTIVE_INSTRUCTIONS[focusedElement.elemName]
+        local instruction = CC_INTERACTIVE_INSTRUCTIONS[
+            focusedElement.elemName]
         if instruction then
             if ccState.activeInstruction ~= focusedElement.elemName then
                 ccState.activeInstruction = focusedElement.elemName
@@ -1316,15 +2554,12 @@ local function HandleCCSnapshot(snapshot)
         end
     end
 
-    -- Mark that we're in CC and subscribe the Y/B button listener.
     if not ccState.inCharacterCreation then
         ccState.inCharacterCreation = true
         SubscribeCCYButton()
     end
 
-    -- Track the selected origin from the god-object DC.  The entity
-    -- API's CharacterName lags behind the UI carousel — SelectedOrigin
-    -- reflects what the game actually displays on the naming screen.
+    -- Track selected origin (used by naming screen character name).
     if focusedElement.dcProps
         and focusedElement.dcType == "gui::DCCharacterCreation" then
         local trackedOrigin = focusedElement.dcProps.SelectedOrigin
@@ -1337,7 +2572,7 @@ local function HandleCCSnapshot(snapshot)
         end
     end
 
-    -- Detect guardian CC: first real CC element after naming screen.
+    -- Guardian detection: first real CC element after naming screen.
     if not ccState.inPostNamingCC
         and ccState.lastMainTab == "Naming"
         and focusedElement.dcType
@@ -1347,602 +2582,105 @@ local function HandleCCSnapshot(snapshot)
         Log.Debug("Guardian CC detected (post-naming)")
     end
 
-    -- Entity diagnostic disabled -- data collected 2026-03-27.
-    -- See memory/project_cc_entity_components.md for results.
-    -- DumpCCEntityComponents()
-
-    -- =================================================================
-    -- Classify the change.
-    -- =================================================================
-    local elemId = focusedElement.elemId or ""
-    local hasCarousel = snapshot.inlineCarouselChanged
-        and snapshot.inlineCarouselValue
-        and snapshot.inlineCarouselValue ~= ""
-
-    -- Determine section labels.
-    local focusedSectionLabel = GetSectionLabel(focusedElement)
-    local selectedSectionLabel = nil
-    if snapshot.selectedElement then
-        selectedSectionLabel = GetSectionLabel(snapshot.selectedElement)
-    end
-    local detectedSectionLabel = selectedSectionLabel or focusedSectionLabel
-
-    -- Determine tab name from selectedElement.tabName (header carousel tab
-    -- like "Appearance" whose VM type isn't in CC_SECTION_LABELS).
-    local selectedTabName = nil
-    if snapshot.selectedElement and snapshot.selectedElement.isTab
-        and snapshot.selectedElement.tabName then
-        selectedTabName = snapshot.selectedElement.tabName
+    -- Intro-awaiting gate: welcome spoken, waiting on LT.  Drop all
+    -- snapshots until the LT handler clears the flag.
+    if ccState.introAwaitingContinue then
+        return
     end
 
-    -- Best available section/tab identifier.
-    local bestTabLabel = detectedSectionLabel or selectedTabName
+    -- =============================================================
+    -- Classify current page.
+    -- =============================================================
+    local pageName = ClassifyPage(snapshot)
 
-    Log.Info("CC CLASSIFY: selSec=" .. tostring(selectedSectionLabel)
-        .. " selTab=" .. tostring(selectedTabName)
-        .. " lastTab=" .. tostring(ccState.lastSpokenTab)
+    -- Sync lastMainTab with the classifier's result so description
+    -- lookups (GetGodObjectDescription) have the correct key across
+    -- all paths that still consult it.
+    if pageName and PAGE_HANDLERS[pageName] then
+        ccState.lastMainTab = pageName
+    end
+
+    Log.Info("CC CLASSIFY: page=" .. tostring(pageName)
         .. " mainTab=" .. tostring(ccState.lastMainTab)
         .. " sel=" .. tostring(snapshot.selectionChanged)
         .. " foc=" .. tostring(snapshot.focusChanged))
-    -- Diagnostic: log selectedElement dcType to discover unknown VM types.
-    if snapshot.selectedElement and snapshot.selectedElement.dcType then
-        Log.Info("CC CLASSIFY selDcType=" .. snapshot.selectedElement.dcType)
+
+    -- Handler switch: when the classified page changes to a KNOWN
+    -- page, deactivate the old handler's navigation state and
+    -- activate the new one.  A nil pageName (classifier had no
+    -- strong signal) stays on the current page -- flipping to nil
+    -- and back to the same page would re-fire screen entry and
+    -- re-speak title/hint/tab/item, which the user observed as
+    -- "the Custom desc repeated".
+    local isFirstEntry = false
+    if pageName and pageName ~= ccState.currentPage then
+        if ccState.activePageHandler then
+            ccState.activePageHandler.ResetNavigation()
+        end
+        ccState.currentPage = pageName
+        ccState.activePageHandler = ResolveHandlerForPage(pageName)
+        isFirstEntry = true
+        ccState.lastSpokenTab = pageName
     end
 
-    local isScreenEntry = false
-    if snapshot.selectionChanged then
-        -- Check known signals for tab switch vs in-page cycling.
-        if selectedSectionLabel then
-            -- Known CC VM type: same section = in-page, different = tab switch.
-            if selectedSectionLabel ~= ccState.lastSpokenTab then
-                isScreenEntry = true
+    -- =============================================================
+    -- First-entry speech (main CC intro / level up / guardian).
+    -- Guardian entry is a distinct speech that fires AFTER the main CC
+    -- intro has already played; namingScreenWasSpoken is the explicit
+    -- signal for that transition and overrides firstEntrySpoken.
+    -- Main CC / Level Up entries only fire if firstEntrySpoken is
+    -- still false (they happen exactly once per CC session).
+    -- =============================================================
+    if namingScreenWasSpoken or not ccState.firstEntrySpoken then
+        local firstEntrySpeech = nil
+        if namingScreenWasSpoken then
+            firstEntrySpeech = SpeakGuardianEntry()
+            namingScreenWasSpoken = false
+        elseif ccState.currentWidgetDCType == "gui::DCCharacterLevelUp" then
+            firstEntrySpeech = SpeakLevelUpEntry(focusedElement)
+        elseif ccState.currentWidgetDCType == "gui::DCCharacterCreation" then
+            firstEntrySpeech = SpeakMainCCEntry(focusedElement)
+        end
+        if firstEntrySpeech then
+            ccState.firstEntrySpoken = true
+            ccState.lastMainTab = pageName or ccState.lastMainTab
+            -- Anchor currentPage so the NEXT tick's classifier result
+            -- (which may finally resolve to "Origin" once the VM
+            -- type on selected is visible) doesn't read as a fresh
+            -- page change and re-fire the handler's screen-entry
+            -- speech right after the welcome.  Default to "Origin"
+            -- for main CC entry if the classifier couldn't identify
+            -- the page yet -- the first visible page of every main
+            -- CC session is Origin.
+            if not ccState.currentPage then
+                ccState.currentPage = pageName or "Origin"
+                ccState.activePageHandler = ResolveHandlerForPage(
+                    ccState.currentPage)
+                ccState.lastSpokenTab = ccState.currentPage
             end
-        elseif selectedTabName
-            and not selectedTabName:find("^ListBoxItem:")
-            and selectedTabName ~= ccState.lastSpokenTab then
-            -- Header carousel tab changed (skip raw ListBoxItem indices
-            -- which are body type cycling on the Appearance page).
-            isScreenEntry = true
-        elseif not selectedSectionLabel and not selectedTabName then
-            -- No recognized signals at all.  Catches pages like Appearance.
-            -- Body type/identity cycling has selectedSectionLabel="Origin"
-            -- (non-nil) so it never reaches this branch.
-            isScreenEntry = true
-        end
-    elseif snapshot.focusChanged and focusedElement.isTab then
-        isScreenEntry = true
-    end
-
-    -- Section-change detection: focus moves to an element whose section
-    -- label differs from lastSpokenTab (e.g. Spell page buttons).
-    if not isScreenEntry and snapshot.focusChanged
-        and focusedSectionLabel and focusedSectionLabel ~= ccState.lastSpokenTab then
-        isScreenEntry = true
-        Log.Info("CC section change detected: " .. tostring(focusedSectionLabel))
-    end
-
-    -- Appearance page detection: selectedTabName is "ListBoxItem: N"
-    -- which gets filtered above, so isScreenEntry is never set.  Detect
-    -- via the focused element's elemName containing "Appearance" or
-    -- "newRandom" (the Randomise button unique to the Appearance page).
-    if not isScreenEntry and snapshot.selectionChanged
-        and focusedElement.elemName
-        and (focusedElement.elemName:find("Appearance", 1, true)
-            or focusedElement.elemName:find("newRandom", 1, true))
-        and ccState.lastSpokenTab ~= "Appearance" then
-        isScreenEntry = true
-        Log.Info("CC Appearance page detected via elemName")
-    end
-
-    local isItemNav = snapshot.focusChanged
-        and not focusedElement.isTab and not isScreenEntry
-    local isCarouselOnly = hasCarousel and not snapshot.focusChanged
-    local isValueOnly = not isScreenEntry and not isItemNav
-        and not isCarouselOnly and snapshot.valueChanged
-
-    -- Naming screen is handled directly by the Y-button callback
-    -- (SubscribeCCYButton / SpeakNamingScreen).  No snapshot detection
-    -- needed — the controller input event IS the signal.
-
-    -- Nothing to do?
-    if not isScreenEntry and not isItemNav
-        and not isCarouselOnly and not isValueOnly then
-        return
-    end
-
-    -- =================================================================
-    -- Standalone carousel or value change.
-    -- =================================================================
-    if isCarouselOnly then
-        local carouselValue = snapshot.inlineCarouselValue
-        local carouselDescription = nil
-
-        -- Append description via StaticData API for tabs that have one.
-        local effectiveTab = ccState.lastMainTab or ccState.lastSpokenTab
-        -- Deity detection: tab name is a deity name, not "Deity".
-        if effectiveTab
-            and not CC_TAB_STATIC_DATA_TYPE[effectiveTab]
-            and Helpers.LookupStaticDataDescription("God", effectiveTab) then
-            effectiveTab = "Deity"
-            ccState.lastMainTab = "Deity"
-        end
-        if effectiveTab
-            and CC_TAB_STATIC_DATA_TYPE[effectiveTab]
-            and focusedElement.dcProps
-            and focusedElement.dcType == "gui::DCCharacterCreation" then
-            local carouselDesc = GetGodObjectDescription(
-                focusedElement.dcProps, effectiveTab, carouselValue)
-            if carouselDesc and carouselDesc ~= "" then
-                carouselDescription = carouselDesc
-            end
-        end
-
-        if carouselValue ~= ccState.lastSpokenFullText then
-            ccState.lastSpokenName = elemId
-            ccState.lastCarouselTick = Ext.Utils.MonotonicTime()
-            local carouselSpeech = Helpers.CreateSpeechData()
-            carouselSpeech:Add("carouselValue", carouselValue, "brief")
-            if carouselDescription then
-                carouselSpeech:Add("carouselDesc",
-                    carouselDescription, "normal")
-            end
-            local carouselFormatted = carouselSpeech:Format()
-            ccState.lastSpokenFullText = carouselFormatted
-            Log.Info("CAROUSEL: " .. carouselFormatted)
-            Ext.Tolk.Speak(carouselFormatted, true)
-        end
-        return
-    end
-
-    -- Suppress value-only events that immediately follow a carousel event
-    -- on the same element (e.g., Face carousel fires "Head 3", then a
-    -- stale value event fires just "Face" and interrupts).
-    if isValueOnly and ccState.lastCarouselTick then
-        local elapsed = Ext.Utils.MonotonicTime() - ccState.lastCarouselTick
-        if elapsed < 200 then
-            Log.Debug("SUPPRESS POST-CAROUSEL VALUE: " .. tostring(focusedElement.elemText))
+            local speech = firstEntrySpeech:Format()
+            Log.Info("CC FIRST ENTRY SPEECH: " .. speech)
+            Ext.Tolk.Speak(speech, true)
+            ccState.lastSpokenFullText = speech
+            -- Suppress handler dispatch on first-entry tick so the
+            -- welcome / level-up / guardian speech is not interrupted.
+            -- When the intro-split listener is armed, subsequent ticks
+            -- remain suppressed until LT clears introAwaitingContinue.
             return
         end
     end
 
-    if isValueOnly then
-        -- Unified extraction: GetCCItemData handles all value-only
-        -- extraction (structured, toggles, appearance, bonus ability,
-        -- deity detection, god-object description).
-        local valueName, valueValue, valueDescription = GetCCItemData(
-            focusedElement, snapshot, nil, false)
-
-        -- Slider settings: speak only the changing number, not the name.
-        -- The name was already spoken when focus arrived (isItemNav path).
-        -- Repeating it on every left/right press is too verbose.
-        local valueSpeech = Helpers.CreateSpeechData()
-        if focusedElement.dcType == "gui::VMSliderSetting"
-            and valueValue and valueValue ~= "" then
-            valueSpeech:Add("itemValue", valueValue, "brief")
-        else
-            if valueName and valueName ~= "" then
-                valueSpeech:Add("itemName",
-                    Helpers.StripMarkupTags(
-                        valueName:gsub("%s+$", "")), "brief")
-            end
-            if valueValue and valueValue ~= "" then
-                valueSpeech:Add("itemValue",
-                    Helpers.StripMarkupTags(
-                        valueValue:gsub("%s+$", "")), "brief")
-            end
-            if valueDescription and valueDescription ~= "" then
-                valueSpeech:Add("itemDesc",
-                    Helpers.StripMarkupTags(
-                        valueDescription:gsub("%s+$", "")), "verbose")
-            end
-        end
-
-        local fullText = valueSpeech:Format()
-        if fullText and fullText ~= ""
-            and fullText ~= ccState.lastSpokenFullText then
-            ccState.lastSpokenFullText = fullText
-            ccState.lastSpokenName = elemId
-            if valueName and valueName ~= "" then
-                ccState.lastSpokenItemName = valueName
-            end
-            Log.Info("VALUE: " .. fullText)
-            Ext.Tolk.Speak(fullText, true)
-        end
-        return
+    -- =============================================================
+    -- Dispatch to the active handler.
+    -- =============================================================
+    if ccState.activePageHandler then
+        ccState.activePageHandler.HandleSnapshot(
+            snapshot, pageName, isFirstEntry)
     end
-
-    -- =================================================================
-    -- Screen entry or item navigation.
-    -- =================================================================
-    local speechData = Helpers.CreateSpeechData()
-    local tabName = nil
-
-    if isScreenEntry then
-        -- ----- Derive tab name -----
-        if focusedElement.isTab then
-            tabName = focusedElement.tabName
-        end
-        -- Priority: selectedSectionLabel (Race, Subrace, etc.) is most
-        -- reliable.  When nil, prefer selectedTabName ("High Elf Cantrip")
-        -- over focusedSectionLabel ("Spell") for better labels.
-        if not tabName and selectedSectionLabel then
-            tabName = selectedSectionLabel
-        end
-        if not tabName and selectedTabName
-            and not selectedTabName:find("^ListBoxItem:") then
-            tabName = selectedTabName
-        end
-        if not tabName and focusedSectionLabel then
-            tabName = focusedSectionLabel
-        end
-
-        -- Appearance page: no CC VM type, no recognized tab name.
-        -- Detect by the Randomise button (unique to Appearance) or
-        -- by element names containing "Appearance".
-        if not tabName then
-            if focusedElement.elemName
-                and (focusedElement.elemName:find("Appearance", 1, true)
-                    or focusedElement.elemName:find("newRandom", 1, true)) then
-                tabName = "Appearance"
-            elseif focusedElement.elemText
-                and focusedElement.elemText == "Randomise" then
-                tabName = "Appearance"
-            end
-        end
-
-        -- Dedup: skip screen entry announcement if same tab, but DON'T
-        -- return — let the rest of the function handle value cycling.
-        if tabName and tabName == ccState.lastSpokenTab then
-            Log.Debug("SKIP CC screen entry (same tab): " .. tabName)
-            isScreenEntry = false
-        end
-
-        Log.Info("SCREEN ENTRY: tab=" .. tostring(tabName)
-            .. " sel=" .. tostring(snapshot.selectionChanged)
-            .. " widget=" .. tostring(snapshot.widgetAdded))
-
-        -- Update lastSpokenTab.  Never overwrite with nil — preserve
-        -- the previous value so pages without recognized tab names
-        -- (like Appearance) don't trigger first-entry logic repeatedly.
-        local previousTab = ccState.lastSpokenTab
-        if tabName then
-            ccState.lastSpokenTab = tabName
-        end
-        ccState.lastSpokenItemName = nil  -- reset so label speaks on new page
-        ccState.lastSpokenName = nil
-
-        -- Track main RB tab separately from lastSpokenTab.
-        -- Update on RB tab switches (selectionChanged=true) and on
-        -- section-change detection (focusChanged into sub-sections
-        -- like Subclass, Skills, Spell).  This ensures description
-        -- lookups read the correct source: e.g. SelectedSubClass for
-        -- domains instead of InfoClassDescription for the parent class.
-        if snapshot.selectionChanged then
-            ccState.lastMainTab = detectedSectionLabel or tabName
-        elseif snapshot.focusChanged then
-            -- If we focused a sub-section (Skills, Spell), use it.
-            -- If we focused the god-object wrapper (nil), fall back
-            -- to the currently selected carousel tab (Race, Class).
-            -- If both are nil, keep the current ccState.
-            ccState.lastMainTab = focusedSectionLabel
-                or selectedSectionLabel or ccState.lastMainTab
-        end
-
-        -- Deity page detection: deity carousel items inherit the
-        -- god-object DC (no unique VM type like ls.VMSelectableSubClass),
-        -- so detectedSectionLabel is always nil.  Instead, check if the
-        -- tab name is actually a deity display name from the StaticData
-        -- cache.  If so, this is the deity page.
-        if ccState.lastMainTab
-            and not CC_TAB_STATIC_DATA_TYPE[ccState.lastMainTab]
-            and Helpers.LookupStaticDataDescription("God", ccState.lastMainTab) then
-            ccState.lastMainTab = "Deity"
-            if tabName and not CC_TAB_STATIC_DATA_TYPE[tabName] then
-                tabName = "Deity"
-            end
-        end
-
-        -- ----- Title -----
-        local screenTitle = nil
-        local effectiveDCType = ccState.currentWidgetDCType
-            or focusedElement.dcType
-            or (snapshot.widgetData and snapshot.widgetData.dcType)
-        if effectiveDCType == "gui::DCCharacterCreation" then
-            screenTitle = "Character Creation"
-        end
-        local normalTab = tabName and Helpers.NormalizeForCompare(tabName) or ""
-        if screenTitle and normalTab ~= ""
-            and Helpers.NormalizeForCompare(screenTitle) == normalTab then
-            screenTitle = nil
-        end
-        if screenTitle and screenTitle == ccState.lastSpokenTitle then
-            screenTitle = nil
-        end
-        if screenTitle then
-            ccState.lastSpokenTitle = screenTitle
-            speechData:Add("title", screenTitle, "brief")
-        end
-
-        -- ----- Hint -----
-        if not ccState.tabHintSpoken then
-            ccState.tabHintSpoken = true
-            speechData:Add("hint", "Use bumpers to switch tabs.", "normal")
-        end
-
-        -- ----- Tab name -----
-        if tabName then
-            local showTabName = true
-            if screenTitle and Helpers.NormalizeForCompare(screenTitle):find(normalTab, 1, true) then
-                showTabName = false
-            end
-            if showTabName then
-                speechData:Add("tabName", tabName, "brief")
-            end
-        end
-
-        -- Abilities page: speak points remaining and first-time rules hint.
-        -- Body text: ability info or tab hint (tab hint overwrites ability
-        -- info when both are present).
-        local screenBody = nil
-        if tabName == "Abilities" and focusedElement.dcProps then
-            local bodyParts = {}
-            if not ccState.abilityHintSpoken then
-                ccState.abilityHintSpoken = true
-                table.insert(bodyParts,
-                    "Every 2 points above 10 gives plus 1 to related rolls")
-            end
-            local unusedPoints = focusedElement.dcProps.UnusedAbilityPoints
-            if unusedPoints then
-                table.insert(bodyParts, unusedPoints .. " points remaining")
-            end
-            if #bodyParts > 0 then
-                screenBody = table.concat(bodyParts, ". ")
-            end
-        end
-
-        -- Tab hint: spoken once per tab on first visit.
-        -- Only fire on selection-based entry (bumper press), not on
-        -- focus-only section crossings (summary panel scrolling).
-        local hintKey = tabName
-        if not hintKey and detectedSectionLabel then
-            hintKey = detectedSectionLabel
-        end
-        if hintKey and not ccState.tabHintsSpoken then
-            ccState.tabHintsSpoken = {}
-        end
-        if hintKey and ccState.tabHintsSpoken
-            and not ccState.tabHintsSpoken[hintKey]
-            and snapshot.selectionChanged then
-            local hint = CC_TAB_HINTS[hintKey]
-            if hint then
-                ccState.tabHintsSpoken[hintKey] = true
-                screenBody = hint  -- overwrites ability info
-                Log.Info("TAB HINT: " .. hintKey .. " -> " .. hint:sub(1, 60))
-            end
-        end
-
-        -- First CC entry: natural introduction speech.
-        -- Overrides title/hint/body with a custom introduction.
-        if not previousTab then
-            -- Reset speechData for the introduction (discard any
-            -- title/hint/tabName added above).
-            speechData = Helpers.CreateSpeechData()
-            if namingScreenWasSpoken then
-                -- Guardian character creation entry (from naming screen).
-                speechData:Add("title", "Guardian Appearance", "brief")
-                speechData:Add("hint",
-                    "Choose your guardian's appearance."
-                    .. " D-pad up and down to browse options."
-                    .. " D-pad left and right to change values."
-                    .. " Press Y to venture forth and start the game."
-                    .. " Press B to return to character naming.", "normal")
-                ccState.lastSpokenTitle = "Guardian Appearance"
-                namingScreenWasSpoken = false
-                Log.Info("CC SLOTS: guardian entry")
-            elseif ccState.currentWidgetDCType
-                == "gui::DCCharacterLevelUp" then
-                -- Level up entry.
-                local levelUpClass = nil
-                if snapshot.focusedElement
-                    and snapshot.focusedElement.namedTexts then
-                    levelUpClass =
-                        snapshot.focusedElement.namedTexts.classLevelText
-                end
-                local levelUpTitle = "Level Up"
-                if levelUpClass and levelUpClass ~= "" then
-                    levelUpTitle = "Level Up: " .. levelUpClass
-                end
-                speechData:Add("title", levelUpTitle, "brief")
-                speechData:Add("hint",
-                    "Up and down to review gains."
-                    .. " Press Y to accept."
-                    .. " Press X to add a class."
-                    .. " Press B to exit.", "normal")
-                ccState.lastSpokenTitle = levelUpTitle
-                Log.Info("CC SLOTS: level up entry, "
-                    .. tostring(levelUpClass))
-            else
-                -- Main character creation entry.
-                speechData:Add("title", "Character Creation", "brief")
-                speechData:Add("hint", "You are on the "
-                    .. (tabName or "origin")
-                    .. " page. Use bumpers to switch tabs.", "normal")
-                ccState.lastSpokenTitle = "Character Creation"
-                Log.Info("CC SLOTS: first entry, tab=" .. tostring(tabName))
-            end
-            ccState.tabHintSpoken = true
-            ccState.lastMainTab = detectedSectionLabel or tabName
-            ccState.lastSpokenName = elemId
-            speechData:Speak(ccState, true, nil, userInitiated)
-            return
-        end
-
-        -- Add body text (ability info or tab hint) for non-first-entry
-        -- screen entries.
-        if screenBody then
-            speechData:Add("body", screenBody, "normal")
-        end
-    end
-
-    -- =================================================================
-    -- Unified item extraction: parse ONCE via GetCCItemData.
-    -- Both screen entry and item nav use the same result.
-    -- =================================================================
-    local effectiveTabForExtraction = tabName or ccState.lastSpokenTab
-    local itemName, itemValue, itemDesc = GetCCItemData(
-        focusedElement, snapshot, effectiveTabForExtraction,
-        isScreenEntry)
-
-    -- Item navigation dedup: same elemId and same extracted name.
-    -- Skip dedup when valueChanged (DC swapped on recycled element)
-    -- or when the value differs from what was last spoken (body type
-    -- cycling: same "Body Type" name but different value each time).
-    if isItemNav and elemId == ccState.lastSpokenName and not hasCarousel
-        and not snapshot.valueChanged then
-        local valueDiffers = itemValue
-            and itemValue ~= ccState.lastSpokenFullText
-        if not valueDiffers then
-            if not itemName or itemName == ccState.lastSpokenItemName
-                or itemName == ccState.lastSpokenFullText then
-                Log.Debug("DEDUP SKIP: " .. tostring(elemId))
-                return
-            end
-        end
-    end
-
-    -- ----- Section header suppression -----
-    -- Applied to the parsed name, not re-extracted.  GetCCItemData
-    -- returns raw data; the handler decides what to suppress.
-    if itemName then
-        local effectiveTab = tabName or ccState.lastSpokenTab
-        local normalTab = effectiveTab
-            and Helpers.NormalizeForCompare(effectiveTab) or ""
-        local normalItem = Helpers.NormalizeForCompare(itemName)
-
-        if normalTab ~= "" and normalItem == normalTab then
-            -- Name duplicates tab; suppress name but keep desc/value.
-            Log.Debug("SUPPRESS TAB DUP: " .. itemName)
-            itemName = nil
-        elseif CC_SECTION_HEADERS[normalItem] then
-            -- Known section header (Skill Proficiency, Cantrip, Spell).
-            Log.Debug("SUPPRESS HEADER: " .. itemName)
-            itemName = nil
-        elseif isScreenEntry and focusedSectionLabel
-            and normalTab ~= "" and not itemValue
-            and normalItem:find(normalTab, 1, true) then
-            -- Name restates section header; suppress name but keep desc.
-            Log.Debug("SUPPRESS SECTION RESTATE: " .. itemName)
-            itemName = nil
-        end
-
-        -- When name is suppressed but desc/value will still speak,
-        -- update ccState.lastSpokenName so the dedup check on the NEXT
-        -- element doesn't compare against the stale elemId from two
-        -- visits ago.  Without this, Custom->Origin(suppressed)->Custom
-        -- causes the second Custom to dedup-skip because
-        -- lastSpokenName still points at the first Custom's elemId.
-        if not itemName and (itemDesc or itemValue) then
-            ccState.lastSpokenName = elemId
-            ccState.lastSpokenItemName = nil
-        end
-    end
-
-    -- AUTO-RECOVERY: If lastMainTab points to a sub-section (Skills)
-    -- but we're focused on an item that matches a god-object selected
-    -- category (SelectedRace.Name == "Elf"), auto-correct lastMainTab.
-    -- This handles d-pad up from Skills back to the Race carousel
-    -- where focusedSectionLabel is nil (god-object DC) and
-    -- selectedSectionLabel is unavailable (no selection change).
-    if itemName and not isScreenEntry and isItemNav
-        and focusedElement.dcType == "gui::DCCharacterCreation"
-        and focusedElement.dcProps then
-        for recoveryTab, selectedPropKey
-            in pairs(CC_SELECTED_DESCRIPTION_KEYS) do
-            local selectedPropData =
-                focusedElement.dcProps[selectedPropKey]
-            if type(selectedPropData) == "table" then
-                local currentActiveName = selectedPropData.Name
-                    or selectedPropData.DisplayName
-                    or selectedPropData.Title
-                if currentActiveName and currentActiveName ~= ""
-                    and currentActiveName:lower()
-                    == itemName:lower() then
-                    if ccState.lastMainTab ~= recoveryTab then
-                        Log.Debug("AUTO-RECOVER lastMainTab: "
-                            .. tostring(ccState.lastMainTab) .. " -> "
-                            .. recoveryTab)
-                        ccState.lastMainTab = recoveryTab
-                    end
-                    break
-                end
-            end
-        end
-    end
-
-    -- Cross-element dedup.
-    if isItemNav and itemName and not itemDesc and not itemValue
-        and ccState.lastSpokenFullText then
-        local normalItem = Helpers.NormalizeForCompare(itemName)
-        local normalLast = Helpers.NormalizeForCompare(ccState.lastSpokenFullText)
-        if normalItem == normalLast
-            or (normalLast:sub(-#normalItem) == normalItem) then
-            Log.Debug("DEDUP SKIP (cross-element): " .. tostring(itemName))
-            return
-        end
-    end
-
-    -- Value-only speech: when cycling values on the same item (e.g.,
-    -- left/right on Body Type), suppress the label and speak only the
-    -- new value.  Mimics Options menu behavior (label on first visit,
-    -- value-only on subsequent changes).
-    if itemName and itemValue and ccState.lastSpokenItemName
-        and itemName == ccState.lastSpokenItemName then
-        -- Same label, different value -> speak value only.
-        ccState.lastSpokenFullText = itemValue
-        ccState.lastSpokenName = elemId
-        ccState.lastSpokenItemName = itemName
-        local cycleSpeech = Helpers.CreateSpeechData()
-        cycleSpeech:Add("cycleValue", itemValue, "brief")
-        Log.Info("VALUE CYCLE: " .. itemValue)
-        Ext.Tolk.Speak(cycleSpeech:Format(), true)
-        return
-    end
-
-    if itemName then
-        ccState.lastSpokenItemName = itemName
-        ccState.lastSpokenName = elemId
-        ccState.lastSpokenFullText = itemName
-        Log.Info("ITEM: " .. tostring(focusedElement.elemType)
-            .. "  name=" .. itemName
-            .. (itemValue and ("  val=" .. itemValue) or "")
-            .. (itemDesc and ("  desc=" .. tostring(itemDesc):sub(1, 40)) or ""))
-    end
-    speechData:Add("itemName", itemName, "brief")
-    speechData:Add("itemValue", itemValue, "brief")
-    speechData:Add("itemDesc", itemDesc, "verbose")
-
-    -- DIAG: log when all extraction paths produced nothing (silent element).
-    if not itemName and not itemValue and not itemDesc then
-        Log.Info("SILENT ELEMENT: elemId=" .. tostring(elemId)
-            .. " elemType=" .. tostring(focusedElement.elemType)
-            .. " elemText=" .. tostring(focusedElement.elemText)
-            .. " dcType=" .. tostring(focusedElement.dcType)
-            .. " isScreen=" .. tostring(isScreenEntry)
-            .. " isItem=" .. tostring(isItemNav))
-        if focusedElement.dcProps then
-            local propList = {}
-            for propName, propValue in pairs(focusedElement.dcProps) do
-                table.insert(propList, propName .. "=" .. tostring(propValue))
-            end
-            Log.Info("SILENT dcProps: " .. table.concat(propList, " | "))
-        end
-    end
-
-    speechData:Speak(ccState, isScreenEntry, nil, userInitiated)
 end
 
 -- ============================================================================
--- State query and reset (exported for Manager)
+-- State query and widget-added (exported for the Manager)
 -- ============================================================================
 
 --- IsInCC: returns true if currently in character creation.
@@ -1951,26 +2689,104 @@ local function IsInCC()
     return ccState.inCharacterCreation
 end
 
---- HandleWidgetAdded: called by the Manager for every widgetAdded event,
---- the same way Menus.HandleWidgetAdded is called.  CC owns all logic about
---- what to do when its widget re-appears after a dialog or cutscene.
+--- ProcessTooltip: thin wrapper around Helpers.ProcessTooltip.  CC
+--- routes here (via EventRouter) instead of WorldUI.ProcessTooltip
+--- because CC tooltips need full-detail text (skill / feature / passive
+--- descriptions).  The only CC-specific concern is the "not in CC"
+--- early exit; all dedup, diff, subset/superset, and speech is handled
+--- Two-event pattern: handler speaks immediately (name + value +
+--- API description), tooltip follows when ready with supplementary
+--- detail.  Exact-match Diff strips fields the handler already
+--- spoke (typically just the item name).  No buffering, no latency.
+--- @param snapshot table  The full TickSnapshot from C++.
+local function ProcessTooltip(snapshot)
+    if not ccState.inCharacterCreation then return end
+    Helpers.ProcessTooltip(snapshot, {
+        stateHolder = ccState,
+        defaultMinimal = false,
+        getHandlerSpeechData = function()
+            return ccState.lastHandlerSpeechData
+        end,
+        logPrefix = "CC TOOLTIP",
+    })
+end
+
+--- MarkMidSessionReload: called by EventRouter at startup when it
+--- detects a Lua reload that happened while character creation was
+--- already open (CCState component present in entities).  Pre-arms
+--- ccState to skip the intro welcome and LT-await gate so the
+--- returning user can navigate normally instead of getting stuck
+--- waiting for an LT press they already made.
+local function MarkMidSessionReload()
+    ccState.firstEntrySpoken = true
+    ccState.introAwaitingContinue = false
+    -- Assume we're on the Origin page by default so the classifier
+    -- and standalone carousel have a valid tab context until the
+    -- user navigates and the classifier re-syncs.  Also assign the
+    -- active handler: without this, the first several post-reload
+    -- snapshots (where the classifier returns nil from god-object-
+    -- only elements) would fail the "if ccState.activePageHandler"
+    -- dispatch check and silently no-op -- which the user observes
+    -- as "can't d-pad on origin, nothing speaks."
+    if not ccState.lastMainTab then
+        ccState.lastMainTab = "Origin"
+    end
+    if not ccState.currentPage then
+        ccState.currentPage = "Origin"
+        ccState.activePageHandler = ResolveHandlerForPage("Origin")
+    end
+    -- Force the C++ monitor to re-evaluate focus on the next tick so
+    -- its cached sLastFocusedElement pointer (which survives Lua
+    -- reset but may now point at a stale Noesis element after the
+    -- CC widget rebuilt during reset) is refreshed.  Without this,
+    -- the ClassSelectionDelegate's "focused element is descendant of
+    -- source ListBox" gate fails on the next carousel event and
+    -- suppresses the carousel capture -- user observes this as
+    -- "d-pad on race carousel does nothing after reset."
+    pcall(Ext.UI.ForceGlobalFocusUpdate)
+end
+
+--- HandleWidgetAdded: called by the Manager for every widgetAdded
+--- event.  CC owns the policy for what to do when its widget reappears
+--- after a dialog, cutscene, or origin-preview blurb.
 ---
---- When the CC widget (gui::DCCharacterCreation) is re-added while already
---- in CC (e.g. returning from an origin preview blurb), treat it as a fresh
---- first entry.  This clears stale navigation dedup so d-pad works correctly
---- rather than inheriting focus state from before the blurb.
+--- Blurb-return reset preserves firstEntrySpoken so the LT intro is
+--- not replayed.  Guardian / level-up entries use their own detection
+--- paths (namingScreenWasSpoken / currentWidgetDCType) and are not
+--- affected by this reset.
 local function HandleWidgetAdded(widgetData)
     if not widgetData or not widgetData.dcType then return end
-    -- Track the widget DC type so we know if we're in CC vs Level Up.
-    if widgetData.dcType == "gui::DCCharacterCreation"
-        or widgetData.dcType == "gui::DCCharacterLevelUp" then
-        ccState.currentWidgetDCType = widgetData.dcType
-    end
     if not ccState.inCharacterCreation then return end
     if widgetData.dcType ~= "gui::DCCharacterCreation" then return end
+    -- Don't reset when the intro LT gate is armed.  HandleCCSnapshot
+    -- runs before HandleWidgetAdded on the same tick; if the first-
+    -- entry speech just armed introAwaitingContinue, a blurb-return
+    -- reset here would wipe the flag and unsubscribe the LT listeners.
+    if ccState.introAwaitingContinue then return end
     Log.Info("CC: DCCharacterCreation re-added while in CC"
         .. " -- resetting for fresh entry (blurb return)")
+    -- Preserve session-continuity flags across the blurb-return reset.
+    -- firstEntrySpoken keeps the intro welcome from re-firing.
+    -- customBackstoryText keeps the Custom backstory cached for LT.
+    -- currentPage + activePageHandler + lastMainTab keep the page
+    -- handler wired up so the next snapshot dispatches correctly
+    -- (without these, activePageHandler becomes nil and every
+    -- subsequent snapshot silently no-ops at the dispatch line).
+    local keepFirstEntry = ccState.firstEntrySpoken
+    local keepBackstory = ccState.customBackstoryText
+    local keepCurrentPage = ccState.currentPage
+    local keepActiveHandler = ccState.activePageHandler
+    local keepLastMainTab = ccState.lastMainTab
     ResetCCState()
+    ccState.firstEntrySpoken = keepFirstEntry
+    ccState.customBackstoryText = keepBackstory
+    ccState.currentPage = keepCurrentPage
+    ccState.activePageHandler = keepActiveHandler
+    ccState.lastMainTab = keepLastMainTab
+    -- Post-cutscene gate arming is handled in HandleCCSnapshot
+    -- (widget event detection), not here.  HandleCCSnapshot runs
+    -- BEFORE HandleWidgetAdded in EventRouter's dispatch order,
+    -- so the gate must be armed there to suppress the first tick.
 end
 
 -- ============================================================================
@@ -1981,6 +2797,8 @@ BG3Access.Client.CC = {
     IsCCSnapshot         = IsCCSnapshot,
     HandleCCSnapshot     = HandleCCSnapshot,
     HandleWidgetAdded    = HandleWidgetAdded,
+    ProcessTooltip       = ProcessTooltip,
+    MarkMidSessionReload = MarkMidSessionReload,
     GetSectionLabel      = GetSectionLabel,
     GetBodyTypeName      = GetBodyTypeName,
     CC_SECTION_LABELS    = CC_SECTION_LABELS,

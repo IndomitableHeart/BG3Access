@@ -134,13 +134,15 @@ local function HandleDialogWidget(dcProps)
     -- with the same first choice still speaks it.
     dialogState.lastAnswerText = nil
 
-    -- Re-arm the C++ focus monitor's Strategy 3 (IsSelected tree
-    -- walk) so it runs on the next tick.  On dialog re-entry the
-    -- widget set count may not change (BG3 reuses the widget), so
-    -- the normal "widgetCount increased" reset doesn't fire and
-    -- Strategy 3 stays gated by initialSelectionDone_.
-    -- ForceGlobalFocusUpdate sets forceNext_ AND resets
-    -- initialSelectionDone_ (see ForceNextFire in Module.inl).
+    -- Enable the C++ dialogue poll so it detects d-pad navigation
+    -- through answer choices (IsSelected changes on ListBoxItems).
+    -- The poll only runs when this flag is true AND no menu has focus.
+    pcall(Ext.UI.SetDialoguePollActive, true)
+
+    -- Re-arm the C++ focus monitor so it runs a forced walk on the
+    -- next tick.  On dialog re-entry the widget set count may not
+    -- change (BG3 reuses the widget), so the normal "widgetCount
+    -- increased" reset doesn't fire.
     pcall(Ext.UI.ForceGlobalFocusUpdate)
 
     if not dcProps then return end
@@ -358,37 +360,70 @@ local AD_TRACKS = {
 -- on subsequent Running transitions (e.g. after a save/load cycle).
 local adPlayedThisSession = false
 
--- Set true when the user goes through the new game flow (difficulty
--- selection via DCNewGameSettings).  Prevents AD from firing on
--- "Continue" or "Load Game", which use the same StopLoading ->
--- PrepareRunning transition but skip the new game screens.
-local newGameInitiated = false
-
 -- Delay (ms) between the Running state and AD playback start.
 -- Tune this to align with the actual cutscene start.
 local AD_START_DELAY_MS = 200
 
--- Called by EventRouter when a DCNewGameSettings widget appears
--- (difficulty selection screen), signalling a genuine new game flow.
-local function NotifyNewGameInitiated()
-    newGameInitiated = true
-    Log.Info("AD: New game flow detected (difficulty selection)")
+--- IsFreshCharacter: decide if the party's main character is a
+--- just-created new-game character vs an existing save being loaded.
+---
+--- Approach: check Experience.NextLevelExperience (the player's current
+--- cumulative XP, despite the counterintuitive field name -- see
+--- CharSheet.lua:712 for the same read).  A newly-created character
+--- has 0 XP.  A Continue or Load Game has some progress and therefore
+--- XP > 0 (or is at least level 2+).
+---
+--- This runs on PrepareRunning, by which point the player's party
+--- member entities are loaded and their components are populated.
+---
+--- @return boolean true if the main character appears to be a fresh
+---                 new-game character, false otherwise or on error.
+local function IsFreshCharacter()
+    local queryOk, partyMembers = pcall(
+        Ext.Entity.GetAllEntitiesWithComponent, "PartyMember")
+    if not queryOk or not partyMembers or #partyMembers == 0 then
+        Log.Info("AD: IsFreshCharacter could not find party members")
+        return false
+    end
+
+    -- Any party member with XP > 0 means we're loading an existing save.
+    -- Only a fresh new game has every party member at exactly 0 XP.
+    -- (The opening cinematic plays before any XP could be gained.)
+    for _, partyEntity in ipairs(partyMembers) do
+        local xpOk, currentXP = pcall(function()
+            local xpComponent = partyEntity.Experience
+            if not xpComponent then return nil end
+            return xpComponent.NextLevelExperience or 0
+        end)
+        if xpOk and currentXP and currentXP > 0 then
+            Log.Info("AD: Party member XP=" .. tostring(currentXP)
+                .. " -- treating as loaded save, not a new game")
+            return false
+        end
+    end
+
+    Log.Info("AD: All party members have 0 XP -- treating as new game")
+    return true
 end
 
 -- Called from the Manager on every GameStateChanged event.
 local function HandleGameStateForAD(fromState, toState)
     Log.Info("AD CHECK: " .. fromState .. " -> " .. toState
-        .. " played=" .. tostring(adPlayedThisSession)
-        .. " newGame=" .. tostring(newGameInitiated))
+        .. " played=" .. tostring(adPlayedThisSession))
 
     -- The opening cutscene begins on StopLoading -> PrepareRunning.
     -- This transition fires for BOTH new games AND continued saves.
-    -- Only play AD when the user went through the new game flow
-    -- (difficulty selection), not on Continue or Load Game.
+    -- Distinguish by inspecting character state: a fresh new game has
+    -- party members at 0 XP; a Continue/Load has accumulated XP.
+    -- No persistent state required (the previous newGameInitiated flag
+    -- approach was broken by the Menu->Game VM reset that happens
+    -- between difficulty selection and PrepareRunning).
     if fromState == "StopLoading" and toState == "PrepareRunning"
-        and not adPlayedThisSession and newGameInitiated then
+        and not adPlayedThisSession then
+        if not IsFreshCharacter() then
+            return
+        end
         adPlayedThisSession = true
-        newGameInitiated = false
         local adFile = AD_TRACKS.opening
         if adFile then
             local fullPath = AD_BASE_PATH .. adFile
@@ -410,11 +445,9 @@ local function HandleGameStateForAD(fromState, toState)
         end
     end
 
-    -- Returning to the main menu cancels any playing AD and resets the
-    -- new game flag so it doesn't carry over from an abandoned attempt.
+    -- Returning to the main menu cancels any playing AD.
     if toState == "Menu" then
         pcall(Ext.Audio.StopFile)
-        newGameInitiated = false
         Log.Debug("AD: Stopped (returned to menu)")
     end
 end
@@ -430,6 +463,9 @@ local function ResetDialogState()
     dialogState.lastAnswerText = nil
     dialogState.inDialog = false
     dialogState.inCutscene = false
+    -- Disable the C++ dialogue poll so no tree walks run during
+    -- exploration (DCDialogue is always loaded in-game but inactive).
+    pcall(Ext.UI.SetDialoguePollActive, false)
     Log.Debug("Dialog/cutscene state reset")
 end
 
@@ -445,6 +481,5 @@ BG3Access.Client.Cutscene = {
     HandleDialogAnswerFocus    = HandleDialogAnswerFocus,
     HandleDialogAnswerSnapshot = HandleDialogAnswerSnapshot,
     HandleGameStateForAD       = HandleGameStateForAD,
-    NotifyNewGameInitiated     = NotifyNewGameInitiated,
     ResetDialogState           = ResetDialogState,
 }

@@ -161,6 +161,11 @@ local function CreateMenuHandler(config)
         screenEntryJustSpoke = false,
         -- Optional: set by onWidgetAdded hooks for body text override.
         bodyOverride         = nil,
+        -- Set by HandleWidgetAdded for the current tick.  HandleSnapshot
+        -- consumes (and clears) this on the same tick so widget-derived
+        -- title/body/namedTexts come from THIS handler's event, not a
+        -- shared "best" event picked by the router.
+        pendingWidgetEvent   = nil,
     }
 
     -- -----------------------------------------------------------------
@@ -194,11 +199,16 @@ local function CreateMenuHandler(config)
             and snapshot.inlineCarouselValue
             and snapshot.inlineCarouselValue ~= ""
 
+        -- pendingWidgetEvent: the widget event that activated this
+        -- handler on this tick (set by HandleWidgetAdded).  Consume once
+        -- below so widget-derived text doesn't leak into later ticks.
+        local widgetEvent = handlerState.pendingWidgetEvent
+        handlerState.pendingWidgetEvent = nil
+
         local isScreenEntry = false
         if snapshot.selectionChanged then
             isScreenEntry = true
-        elseif snapshot.widgetAdded and snapshot.widgetData
-            and not handlerState.lastSpokenTab then
+        elseif widgetEvent and not handlerState.lastSpokenTab then
             isScreenEntry = true
         elseif snapshot.focusChanged and focusedElement.isTab then
             isScreenEntry = true
@@ -212,10 +222,9 @@ local function CreateMenuHandler(config)
 
         -- Widget text update: DC property changed (e.g., "Finding lobbies..."
         -- -> "No lobbies found") or dialog appeared without focus change.
-        if not isScreenEntry and not isItemNav
-            and snapshot.widgetAdded and snapshot.widgetData then
+        if not isScreenEntry and not isItemNav and widgetEvent then
             local _, widgetBody, widgetActions = Helpers.ExtractFromWidgetData(
-                snapshot.widgetData)
+                widgetEvent)
             local updateText = widgetBody or widgetActions
             if updateText and updateText ~= ""
                 and updateText ~= handlerState.lastSpokenFullText then
@@ -315,8 +324,8 @@ local function CreateMenuHandler(config)
                     allNamedTexts[elementName] = elementText
                 end
             end
-            if snapshot.widgetData and snapshot.widgetData.namedTexts then
-                for elementName, elementText in pairs(snapshot.widgetData.namedTexts) do
+            if widgetEvent and widgetEvent.namedTexts then
+                for elementName, elementText in pairs(widgetEvent.namedTexts) do
                     if not allNamedTexts[elementName] then
                         allNamedTexts[elementName] = elementText
                     end
@@ -330,7 +339,7 @@ local function CreateMenuHandler(config)
                     allNamedTexts)
             end
             local widgetTitle, widgetBody, widgetActions =
-                Helpers.ExtractFromWidgetData(snapshot.widgetData)
+                Helpers.ExtractFromWidgetData(widgetEvent)
 
             -- Title.
             screenTitle = nsTitle or widgetTitle
@@ -507,9 +516,11 @@ local function CreateMenuHandler(config)
     -- -----------------------------------------------------------------
     -- HandleWidgetAdded: process widget added events.
     -- Called by the router when a widgetAdded event arrives for this
-    -- handler's DC type.
+    -- handler's DC type.  Stashes the event on handlerState for
+    -- HandleSnapshot to consume on the same tick.
     -- -----------------------------------------------------------------
     local function HandleWidgetAdded(widgetData)
+        handlerState.pendingWidgetEvent = widgetData
         if config.onWidgetAdded then
             config.onWidgetAdded(widgetData, handlerState)
         end
@@ -528,6 +539,7 @@ local function CreateMenuHandler(config)
         handlerState.tabHintSpoken = false
         handlerState.screenEntryJustSpoke = false
         handlerState.bodyOverride = nil
+        handlerState.pendingWidgetEvent = nil
         if config.onReset then
             config.onReset(handlerState)
         end
@@ -802,9 +814,11 @@ local function IsMenuDCType(dcType)
     return DC_TYPE_HANDLERS[dcType] ~= nil
 end
 
---- HandleWidgetAdded: called by the Manager when a non-CC, non-cutscene
---- widget is added.  Updates the active handler and calls its hook.
---- @param widgetData table  The widget data from the snapshot.
+--- HandleWidgetAdded: called by the Manager once per widget event
+--- that routes to Menus (non-CC, non-cutscene).  Updates the active
+--- handler and calls its hook.
+--- @param widgetData table  The widget event data (one entry from
+---                          snapshot.widgetEvents).
 local function HandleWidgetAdded(widgetData)
     if not widgetData or not widgetData.dcType then return end
 
@@ -818,14 +832,21 @@ local function HandleWidgetAdded(widgetData)
         return
     end
 
-    -- Check widget name overrides first (e.g. shortcutsMenu vs pause
-    -- menu both share gui::DCGameMenu but need different handlers).
+    -- Widget name override (e.g. shortcutsMenu vs pause menu both
+    -- share gui::DCGameMenu but need different handlers).  Checked
+    -- per-event, so elemName is accurate for this specific widget.
     local newHandler = nil
     local isExplicitMatch = false
+    local resolvedWidgetName = nil
+
     if widgetData.elemName and WIDGET_NAME_HANDLERS[widgetData.elemName] then
         newHandler = WIDGET_NAME_HANDLERS[widgetData.elemName]
+        resolvedWidgetName = widgetData.elemName
         isExplicitMatch = true
-    else
+    end
+
+    -- Fall back to DC type routing.
+    if not newHandler then
         newHandler = ResolveHandler(widgetData.dcType)
         isExplicitMatch = DC_TYPE_HANDLERS[widgetData.dcType] ~= nil
     end
@@ -847,9 +868,11 @@ local function HandleWidgetAdded(widgetData)
             activeHandler.ResetState()
         end
         activeHandler = newHandler
-        activeHandlerWidgetName = widgetData.elemName
+        activeHandlerWidgetName = resolvedWidgetName or widgetData.elemName
         Log.Info("Active handler: " .. activeHandler.name
-            .. " (dc=" .. widgetData.dcType .. ")")
+            .. " (dc=" .. widgetData.dcType
+            .. (resolvedWidgetName
+                and " widget=" .. resolvedWidgetName or "") .. ")")
     end
 
     activeHandler.HandleWidgetAdded(widgetData)
@@ -940,51 +963,56 @@ local function RouteSnapshot(snapshot)
         return
     end
 
-    -- Clear stale widget-name-based handler: if the handler was activated
-    -- by a specific widget (e.g. "shortcutsMenu") and that widget is no
-    -- longer present in the snapshot, the menu closed -- reset.
+    -- Clear stale handler: if the handler's widget is no longer
+    -- present in widgetDCTypes (cached scan, refreshes when the widget
+    -- set changes), the menu closed -- reset.  Runs on EVERY snapshot
+    -- including focus/selection ticks; the previous "idle ticks only"
+    -- gate let stale handlers grab focus events from world entities
+    -- (e.g. ShortcutsMenu would speak "Tav" when the user closed
+    -- shortcuts and focus naturally moved to a party member).
     --
-    -- ONLY check on widget rescan snapshots (no user interaction).
-    -- During active navigation, focusChanged/selectionChanged are true
-    -- and the handler must stay alive even without its widget in the
-    -- snapshot metadata.
+    -- widgetDCTypes is authoritative: it reflects ALL currently
+    -- visible widget DC types, not just ones that fired callbacks
+    -- this tick.  In-menu navigation does not change the widget set,
+    -- so the cached value still contains the menu's DC type and the
+    -- handler stays alive.  When the menu closes, the widget set
+    -- changes and the cache refreshes without the menu's DC type.
     if activeHandlerWidgetName and activeHandler
-        and activeHandler ~= defaultHandler
-        and not snapshot.focusChanged and not snapshot.selectionChanged
-        and not snapshot.valueChanged and not snapshot.widgetAdded then
+        and activeHandler ~= defaultHandler then
         local widgetStillPresent = false
+        -- Direct callback this tick = widget present.
         if snapshot.visualTextWidgetName
             and snapshot.visualTextWidgetName == activeHandlerWidgetName then
             widgetStillPresent = true
         end
-        if snapshot.widgetData
-            and snapshot.widgetData.elemName == activeHandlerWidgetName then
-            widgetStillPresent = true
-        end
-        -- Widget callbacks only fire for changed widgets, not all
-        -- visible ones.  A single tick without the widget name
-        -- doesn't mean the widget closed -- it may just not have
-        -- fired a callback this tick.  Check multiple signals before
-        -- concluding the widget is gone.
-        --
-        -- Focused element present = user is navigating in the menu.
-        if not widgetStillPresent
-            and snapshot.focusedElement
-            and snapshot.focusedElement.elemType
-            and snapshot.focusedElement.elemType ~= "" then
-            widgetStillPresent = true
-        end
-        -- Selected element present = user has a tab/item selected.
-        if not widgetStillPresent
-            and snapshot.selectedElement
-            and snapshot.selectedElement.elemType
-            and snapshot.selectedElement.elemType ~= "" then
-            widgetStillPresent = true
+        if not widgetStillPresent and snapshot.widgetEvents then
+            for _, widgetEvent in ipairs(snapshot.widgetEvents) do
+                if widgetEvent.elemName == activeHandlerWidgetName then
+                    widgetStillPresent = true
+                    break
+                end
+            end
         end
         -- Handler's DC type still in widgetDCTypes = widget visible.
         if not widgetStillPresent and snapshot.widgetDCTypes then
             for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
                 if DC_TYPE_HANDLERS[widgetDCType] == activeHandler then
+                    widgetStillPresent = true
+                    break
+                end
+            end
+        end
+        -- Widget-name handlers (e.g. ShortcutsMenuHandler) share a DC
+        -- type with another handler (gui::DCGameMenu -> PauseMenuHandler).
+        -- For these, also consider present if ANY registered menu DC
+        -- type is in widgetDCTypes -- the underlying widget is loaded.
+        -- This is permissive: it would keep the handler alive if a
+        -- DIFFERENT menu was open under the same DC type, but the
+        -- common case (only one menu of a given DC type at a time)
+        -- works correctly.
+        if not widgetStillPresent and snapshot.widgetDCTypes then
+            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
+                if DC_TYPE_HANDLERS[widgetDCType] then
                     widgetStillPresent = true
                     break
                 end
@@ -996,9 +1024,9 @@ local function RouteSnapshot(snapshot)
             activeHandler.ResetState()
             activeHandler = nil
             activeHandlerWidgetName = nil
-            -- No user interaction on this snapshot (focus/sel/val all
-            -- false), and the menu just closed.  Return to avoid the
-            -- fallback handler speaking HUD junk.
+            -- Menu closed -- return to avoid the fallback handler
+            -- speaking elements that belong to the world (party
+            -- members, HUD widgets) instead of the menu.
             return
         end
     end
@@ -1050,6 +1078,13 @@ local function GetActiveHandler()
     return activeHandler
 end
 
+--- GetActiveHandlerWidgetName: returns the widget name that activated the
+--- current handler.  Used by EventRouter to match widget removal events.
+--- @return string|nil  The widget element name, or nil.
+local function GetActiveHandlerWidgetName()
+    return activeHandlerWidgetName
+end
+
 -- ============================================================================
 -- Exports
 -- ============================================================================
@@ -1063,5 +1098,6 @@ BG3Access.Client.Menus = {
     IsMenuDCType            = IsMenuDCType,
     ResetAllHandlers        = ResetAllHandlers,
     GetActiveHandler        = GetActiveHandler,
+    GetActiveHandlerWidgetName = GetActiveHandlerWidgetName,
     UnsubscribeControllerInput = UnsubscribeControllerInput,
 }

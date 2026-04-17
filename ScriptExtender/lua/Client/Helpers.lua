@@ -1060,29 +1060,25 @@ local function CreateSpeechData()
         --- @param self table  The tooltip SpeechData.
         --- @param other table|nil  The handler's SpeechData to diff against.
         --- @return table  New SpeechData with unmatched fields only.
+        --- Diff: return a new SpeechData with only the fields whose
+        --- normalized values do NOT exactly match any field in `other`.
+        --- Exact match only -- no substring heuristics.
+        --- @param self table  The tooltip SpeechData.
+        --- @param other table|nil  The handler's SpeechData.
+        --- @return table  New SpeechData with unmatched fields only.
         Diff = function(self, other)
             if not other or not other.fields or #other.fields == 0 then
                 return self
             end
+            -- Build a set of normalized values from the other
+            -- SpeechData for O(1) lookup.
+            local otherValues = {}
+            for _, otherField in ipairs(other.fields) do
+                otherValues[NormalizeForCompare(otherField.value)] = true
+            end
             local result = CreateSpeechData()
             for _, field in ipairs(self.fields) do
-                local fieldNorm = NormalizeForCompare(field.value)
-                local matched = false
-                for _, otherField in ipairs(other.fields) do
-                    local otherNorm = NormalizeForCompare(otherField.value)
-                    if fieldNorm == otherNorm then
-                        matched = true
-                        break
-                    end
-                    if #fieldNorm > 5 and #otherNorm > 5 then
-                        if otherNorm:find(fieldNorm, 1, true)
-                            or fieldNorm:find(otherNorm, 1, true) then
-                            matched = true
-                            break
-                        end
-                    end
-                end
-                if not matched then
+                if not otherValues[NormalizeForCompare(field.value)] then
                     result:Add(field.name, field.value, field.tier)
                 end
             end
@@ -1266,6 +1262,15 @@ if Ext.Enums and Ext.Enums.Ability then
     end
 end
 
+-- Ability abbreviations used in tooltips (CHA, STR, etc.).
+-- Maps the 3-letter abbreviation to the full ability name so
+-- tooltips can speak "Spellcasting ability, Charisma" instead of "CHA".
+local ABILITY_ABBREVIATIONS = {
+    ["STR"] = "Strength",  ["DEX"] = "Dexterity",
+    ["CON"] = "Constitution", ["INT"] = "Intelligence",
+    ["WIS"] = "Wisdom",    ["CHA"] = "Charisma",
+}
+
 -- Damage type keywords for filtering tooltip detail and grouping in inspect.
 -- Built from game enums so modded damage types are included.
 local DAMAGE_TYPES = {}
@@ -1275,63 +1280,6 @@ if Ext.Enums and Ext.Enums.DamageType then
             DAMAGE_TYPES[damageLabel] = true
         end
     end
-end
-
---- FormatTooltipTexts: default tooltip formatter for radial and generic
---- panel tooltips.  Classifies raw texts into SpeechData fields (damage,
---- cost, usage, warning).  Title/description dedup is handled by the
---- SpeechData.Diff mechanism in ProcessTooltip.
---- @param tooltipTexts table  Raw text array from C++.
---- @return table|nil  SpeechData object, or nil if empty.
-local function FormatTooltipTexts(tooltipTexts)
-    if not tooltipTexts or #tooltipTexts == 0 then return nil end
-
-    local speechData = CreateSpeechData()
-
-    for _, text in ipairs(tooltipTexts) do
-        if text and text ~= ""
-            and not TOOLTIP_JUNK_LABELS[text] then
-            local cleaned = StripMarkupTags(text)
-            if cleaned and cleaned ~= "" and cleaned ~= "." then
-                -- Damage range: "4~9 Damage" -> "4 to 9 Damage"
-                -- Healing range: "4~10 Healing" -> "4 to 10 Healing"
-                if cleaned:match("^%d+~%d+ %a+$") then
-                    local rangeMin, rangeMax, rangeType =
-                        cleaned:match("^(%d+)~(%d+) (%a+)$")
-                    if rangeType == "Damage" or rangeType == "Healing" then
-                        speechData:Add("damage",
-                            rangeMin .. " to " .. rangeMax
-                            .. " " .. rangeType, "brief")
-                    end
-
-                -- Cost: "Action" / "Bonus Action"
-                elseif cleaned == "Action" then
-                    speechData:Add("cost", "Costs Action", "normal")
-                elseif cleaned == "Bonus Action" then
-                    speechData:Add("cost", "Costs Bonus Action", "normal")
-
-                -- Usage: "Single Use" (consumables, scrolls)
-                elseif cleaned == "Single Use" then
-                    speechData:Add("usage", "Single Use", "normal")
-
-                -- Warning messages (red text in tooltip, e.g.
-                -- "No ranged weapon equipped.")
-                elseif cleaned:match("^No .+ equipped%.$") then
-                    local warning = cleaned
-                    if warning:sub(-1) == "." then
-                        warning = warning:sub(1, -2)
-                    end
-                    speechData:Add("warning", warning, "brief")
-
-                -- Everything else is inspect-level detail or already
-                -- spoken by the handler -- skip for the basic tooltip.
-                end
-            end
-        end
-    end
-
-    if #speechData.fields == 0 then return nil end
-    return speechData
 end
 
 -- ---------------------------------------------------------------------------
@@ -1560,15 +1508,25 @@ local CHARSHEET_TOOLTIP_JUNK = {
     ["."] = true, [":"] = true, [""] = true,
 }
 
---- FormatFullTooltip: builds SpeechData from all tooltip texts except junk.
---- Each text becomes a "detail" field.  Diff handles dedup against handler.
+--- FormatFullTooltip: builds SpeechData from tooltip texts.  Default mode
+--- emits every non-junk text classified as effect (short) or description
+--- (long).  Minimal mode emits only spell-specific signals (damage range,
+--- "Costs Action", "Single Use", warnings) -- the legacy radial / generic
+--- panel behavior.  Diff handles dedup against handler SpeechData in the
+--- ProcessTooltip dispatch.
 --- @param tooltipTexts table  Raw tooltip text array from C++.
+--- @param options table|nil  {minimal=bool}.  Minimal returns only the
+---                            spell-specific fields (radial defaults).
 --- @return table|nil  SpeechData object, or nil if empty.
-local function FormatFullTooltip(tooltipTexts)
+local function FormatFullTooltip(tooltipTexts, options)
+    if not tooltipTexts or #tooltipTexts == 0 then return nil end
+    local minimal = options and options.minimal
     local speechData = CreateSpeechData()
     local seen = {}
     for _, text in ipairs(tooltipTexts) do
-        if text and text ~= "" and not CHARSHEET_TOOLTIP_JUNK[text] then
+        if text and text ~= ""
+            and not TOOLTIP_JUNK_LABELS[text]
+            and not CHARSHEET_TOOLTIP_JUNK[text] then
             if text:match("^[%d%.]+$")
                 or text:find("s_HandleUnknown")
                 or text:find("%[ForceUpdate%]")
@@ -1576,23 +1534,126 @@ local function FormatFullTooltip(tooltipTexts)
                 -- skip
             else
                 local cleaned = StripMarkupTags(text)
-                if cleaned and cleaned ~= "" then
+                if cleaned and cleaned ~= "" and cleaned ~= "." then
                     cleaned = cleaned:gsub("[%.:%s]+$", "")
                     cleaned = cleaned:gsub("(%d+)~(%d+)", "%1 to %2")
                     if cleaned ~= "" then
                         local normalizedKey = cleaned:lower()
                         if not seen[normalizedKey] then
                             seen[normalizedKey] = true
-                            -- Short texts without sentence structure
-                            -- are effects or labels (normal tier).
-                            -- Long texts with periods are descriptions
-                            -- (verbose tier).
-                            if #cleaned > 40 then
-                                speechData:Add("description",
-                                    cleaned, "verbose")
+                            if minimal then
+                                -- Spell-specific patterns only.  Damage /
+                                -- healing range: "4 to 9 Damage".
+                                local rangeMin, rangeMax, rangeType =
+                                    cleaned:match(
+                                        "^(%d+) to (%d+) (%a+)$")
+                                if rangeType == "Damage"
+                                    or rangeType == "Healing" then
+                                    speechData:Add("damage",
+                                        rangeMin .. " to " .. rangeMax
+                                        .. " " .. rangeType, "brief")
+                                elseif cleaned == "Action" then
+                                    speechData:Add("cost",
+                                        "Costs Action", "normal")
+                                elseif cleaned == "Bonus Action" then
+                                    speechData:Add("cost",
+                                        "Costs Bonus Action", "normal")
+                                elseif cleaned == "Single Use" then
+                                    speechData:Add("usage",
+                                        "Single Use", "normal")
+                                elseif cleaned:match(
+                                        "^No .+ equipped$") then
+                                    speechData:Add("warning",
+                                        cleaned, "brief")
+                                end
+                                -- Everything else suppressed in minimal
+                                -- mode (handler already spoke it, or
+                                -- it's inspect-level detail).
                             else
-                                speechData:Add("effect",
-                                    cleaned, "normal")
+                                -- Full mode: classify raw tooltip
+                                -- texts into human-readable phrases.
+
+                                -- Distance: "60ft", "9m", "1.5m".
+                                -- Expand units only; don't label as
+                                -- "Casting range" since the distance
+                                -- may be sight (Darkvision), movement
+                                -- (Base Racial Speed), or actual
+                                -- casting range (spells).  The
+                                -- tooltip context already conveys
+                                -- what the distance represents.
+                                local rangeFeet =
+                                    cleaned:match("^(%d+)ft$")
+                                local rangeMetric =
+                                    cleaned:match(
+                                        "^([%d%.]+)%s?m$")
+                                    or cleaned:match(
+                                        "^([%d%.]+) metres?$")
+                                if rangeFeet then
+                                    speechData:Add("range",
+                                        rangeFeet .. " feet",
+                                        "normal")
+                                elseif rangeMetric then
+                                    speechData:Add("range",
+                                        rangeMetric .. " metres",
+                                        "normal")
+                                -- Ability abbreviation: CHA, STR, etc.
+                                elseif ABILITY_ABBREVIATIONS[cleaned]
+                                    then
+                                    speechData:Add("ability",
+                                        "Spellcasting ability, "
+                                        .. ABILITY_ABBREVIATIONS[
+                                            cleaned],
+                                        "normal")
+                                -- Concentration
+                                elseif cleaned == "Concentration" then
+                                    speechData:Add("concentration",
+                                        "Requires concentration",
+                                        "normal")
+                                -- Action cost
+                                elseif cleaned == "Action" then
+                                    speechData:Add("cost",
+                                        "Costs Action", "normal")
+                                elseif cleaned == "Bonus Action" then
+                                    speechData:Add("cost",
+                                        "Costs Bonus Action", "normal")
+                                -- Duration: "10 turns", "1 turn"
+                                elseif cleaned:match(
+                                        "^%d+ turns?$") then
+                                    speechData:Add("duration",
+                                        "Duration, " .. cleaned,
+                                        "normal")
+                                -- Recharge
+                                elseif cleaned == "Per turn" then
+                                    speechData:Add("cooldown",
+                                        "Once per turn", "normal")
+                                elseif cleaned == "Short Rest"
+                                    or cleaned == "Long Rest" then
+                                    speechData:Add("cooldown",
+                                        "Recharges on " .. cleaned,
+                                        "normal")
+                                -- Usage
+                                elseif cleaned == "Single Use" then
+                                    speechData:Add("usage",
+                                        "Single Use", "normal")
+                                -- Damage / healing range
+                                elseif cleaned:match(
+                                        "^%d+ to %d+ %a+$") then
+                                    speechData:Add("damage",
+                                        cleaned, "brief")
+                                -- Warning
+                                elseif cleaned:match(
+                                        "^No .+ equipped$") then
+                                    speechData:Add("warning",
+                                        cleaned, "brief")
+                                -- Long text: description
+                                elseif #cleaned > 40 then
+                                    speechData:Add("description",
+                                        cleaned, "verbose")
+                                -- Everything else: effect label
+                                else
+                                    speechData:Add("effect",
+                                        cleaned, "normal")
+                                end
                             end
                         end
                     end
@@ -1812,6 +1873,109 @@ local function FormatCombatStatTooltip(tooltipTexts)
     return speechData
 end
 
+-- ---------------------------------------------------------------------------
+-- Tooltip dispatch core (shared between WorldUI and CharCreation)
+-- ---------------------------------------------------------------------------
+
+--- ProcessTooltip: unified tooltip dispatch.  Resets dedup on focus /
+--- selection change, builds SpeechData via custom or default formatter,
+--- diffs against handler SpeechData when provided, collapses subset /
+--- superset waves, and speaks the remainder.
+---
+--- @param snapshot table  Full TickSnapshot from C++.
+--- @param config   table  Dispatch configuration:
+---   stateHolder (table, required)       Location of .lastTooltipSpeech
+---                                       for per-context dedup.
+---   focusedDCType (string|nil)          Current focused element DC type,
+---                                       passed to customTooltipFn.
+---   customTooltipFn (function|nil)      Signature
+---                                       (tooltipTexts, focusedDCType)
+---                                       -> SpeechData | nil | "".
+---                                       "" is an explicit suppress
+---                                       sentinel.  nil falls through to
+---                                       the default formatter.
+---   defaultMinimal (bool)               When no custom formatter fires,
+---                                       call FormatFullTooltip with
+---                                       {minimal=true} (WorldUI default)
+---                                       or without (CC default).
+---   getHandlerSpeechData (function|nil) Returns the active handler's
+---                                       last SpeechData for Diff, or nil.
+---                                       Omit to skip the Diff step.
+---   shouldDisableInterrupt (function|nil) Predicate; when true, the
+---                                       "superset grows over subset"
+---                                       interrupt is disabled (used for
+---                                       equipment slot append where the
+---                                       handler's name speech must not
+---                                       be cut).
+---   logPrefix (string|nil)              Log tag.  Default "TOOLTIP".
+local function ProcessTooltip(snapshot, config)
+    local stateHolder = config.stateHolder
+
+    -- Reset dedup when user navigates to a new element.  Runs before the
+    -- bail below so focus-only snapshots still clear stale state.
+    if snapshot.focusChanged or snapshot.selectionChanged then
+        stateHolder.lastTooltipSpeech = nil
+    end
+
+    if not snapshot.tooltipChanged or not snapshot.tooltipTexts then
+        return
+    end
+
+    -- Build SpeechData: per-handler formatter, or default minimal / full.
+    local tooltipData = nil
+    if config.customTooltipFn then
+        tooltipData = config.customTooltipFn(
+            snapshot.tooltipTexts, config.focusedDCType)
+    end
+    if tooltipData == "" then return end  -- explicit suppress
+    if not tooltipData then
+        local formatOptions = nil
+        if config.defaultMinimal then
+            formatOptions = {minimal = true}
+        end
+        tooltipData = FormatFullTooltip(
+            snapshot.tooltipTexts, formatOptions)
+    end
+    if not tooltipData then return end
+
+    -- Diff against handler SpeechData.  Handlers can set
+    -- tooltipData.skipDiff = true to bypass (e.g., Examine, where the
+    -- item name naturally overlaps but both should be spoken).
+    if not tooltipData.skipDiff and config.getHandlerSpeechData then
+        local handlerData = config.getHandlerSpeechData()
+        if handlerData then
+            tooltipData = tooltipData:Diff(handlerData)
+        end
+    end
+
+    local tooltipSpeech = tooltipData:Format()
+    if not tooltipSpeech or tooltipSpeech == "" then return end
+
+    local lastSpeech = stateHolder.lastTooltipSpeech
+    if tooltipSpeech == lastSpeech then return end
+
+    -- Subset: new wave shrank as TextBlocks disappeared between Noesis
+    -- binding passes.  Skip to avoid speaking a partial of what we just
+    -- said.
+    if lastSpeech and lastSpeech:find(tooltipSpeech, 1, true) then
+        return
+    end
+
+    -- Superset: new wave grew.  Interrupt and replace with the fuller
+    -- version so the user doesn't hear partial info repeated.
+    local shouldInterrupt = lastSpeech ~= nil
+        and tooltipSpeech:find(lastSpeech, 1, true) ~= nil
+    if shouldInterrupt and config.shouldDisableInterrupt
+        and config.shouldDisableInterrupt() then
+        shouldInterrupt = false
+    end
+
+    stateHolder.lastTooltipSpeech = tooltipSpeech
+    local logPrefix = config.logPrefix or "TOOLTIP"
+    Log.Info(logPrefix .. ": " .. tooltipSpeech)
+    Ext.Tolk.Speak(tooltipSpeech, shouldInterrupt)
+end
+
 --- FormatItemTooltip: structured tooltip for inventory items (ls.VMItem).
 --- Classifies each tooltip text into semantic fields.  Diff against the
 --- handler's SpeechData (in ProcessTooltip) removes duplicates.
@@ -1943,13 +2107,13 @@ BG3Access.Client.Helpers = {
     DIALOG_BUTTON_HINT           = DIALOG_BUTTON_HINT,
     ExtractFromNamedTexts        = ExtractFromNamedTexts,
     ExtractFromWidgetData        = ExtractFromWidgetData,
-    FormatTooltipTexts           = FormatTooltipTexts,
     FormatInspectTexts           = FormatInspectTexts,
     FormatFullTooltip            = FormatFullTooltip,
     FormatStatTooltip            = FormatStatTooltip,
     FormatAbilityTooltip         = FormatAbilityTooltip,
     FormatCombatStatTooltip      = FormatCombatStatTooltip,
     FormatItemTooltip            = FormatItemTooltip,
+    ProcessTooltip               = ProcessTooltip,
     SetHintsEnabled              = SetHintsEnabled,
     GetHintsEnabled              = GetHintsEnabled,
 }

@@ -41,11 +41,6 @@ local exploreLastSpoken   = nil
 local spokenLoadingTips = {}
 -- True when snapshots should route to WorldUI panel handlers instead of Menus.
 local routeToWorld        = false
--- True when routeToWorld was flipped from true->false for a menu that
--- opened during gameplay (e.g. shortcuts radial).  When the menu's
--- widget disappears from the scan, routeToWorld is restored to true
--- so HUD noise doesn't bleed through Menus routing.
-local worldRouteBeforeMenu = false
 -- True when a dialog overlay spoke on this tick while WorldUI is active.
 -- Suppresses the panel handler so dialog speech isn't interrupted.
 local worldDialogOverlayJustSpoke = false
@@ -66,104 +61,66 @@ local snapshotHasUIFocus = false
 local suppressNextWidgetScan = false
 
 -- ---------------------------------------------------------------------------
--- SelectRoutingDCType: decide which DC type to use for widget routing.
---
--- widgetData.dcType is LIVE data from the actual widget callback -- it
--- reflects the real newly-visible widget.  widgetDCTypes is a cached
--- array that can be one frame behind (rebuilt early in the tick before
--- visibility updates).
---
--- Rule: trust widgetData.dcType when it's a known menu or world type.
--- Only consult widgetDCTypes when widgetData has a generic/background
--- type (ls.Widget, ls.DCPartyLine) that can't drive routing.
--- ---------------------------------------------------------------------------
-local function SelectRoutingDCType(snapshot)
-    local widgetDataType = snapshot.widgetData
-        and snapshot.widgetData.dcType
-    if not widgetDataType then return nil end
-
-    -- If widgetData.dcType is a known menu or world type, use it
-    -- directly.  It's live data from the actual widget callback.
-    local World = BG3Access.Client.WorldUI
-    if Menus.IsMenuDCType(widgetDataType) then
-        return widgetDataType
-    end
-    if World and World.IsWorldDCType(widgetDataType) then
-        return widgetDataType
-    end
-
-    -- widgetData has a generic type (ls.Widget, ls.DCPartyLine, etc.).
-    -- Check widgetDCTypes for a better match.  This handles the case
-    -- where a background widget (PartyLine_c) was processed last by
-    -- C++ and overwrote widgetData with its generic type.
-    if snapshot.widgetDCTypes then
-        local bestType = nil
-        local bestPriority = 0  -- 0=none, 1=world panel, 2=menu
-        for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-            if Menus.IsMenuDCType(widgetDCType) then
-                if 2 > bestPriority then
-                    bestType = widgetDCType
-                    bestPriority = 2
-                end
-            elseif World and World.IsWorldDCType(widgetDCType) then
-                if 1 > bestPriority then
-                    bestType = widgetDCType
-                    bestPriority = 1
-                end
-            end
-        end
-        if bestType then return bestType end
-    end
-
-    -- No better match found, use the original generic type.
-    return widgetDataType
-end
-
--- ---------------------------------------------------------------------------
 -- HandleTickSnapshot: thin router.
--- Dispatches to the correct handler module based on snapshot content.
+--
+-- Iterates snapshot.widgetEvents (one entry per new/changed widget this
+-- tick) and dispatches each event to the handler that cares about it.
+-- Each handler receives its own event data -- no shared "best" event is
+-- computed here.  Routing state (routeToWorld) is updated based on which
+-- handler kinds activated; menu wins over world if both appeared.
 -- ---------------------------------------------------------------------------
 local function HandleTickSnapshot(snapshot)
-    -- Per-tick flag: true when the widget routing block just switched
-    -- routing to Menus on this tick.  Prevents the world-restore check
-    -- from immediately undoing the switch on the same snapshot.
-    local menuRoutedThisTick = false
+    local widgetEvents = snapshot.widgetEvents or {}
+    local hasWidgetEvents = #widgetEvents > 0
+    -- Track whether a menu handler activated this tick.  Used to gate
+    -- the late world-panel detection at the bottom of this function so
+    -- a freshly-opened menu (pause, shortcuts, etc.) isn't immediately
+    -- hijacked by a leftover world panel discovered in widgetDCTypes.
+    local menuActivatedThisTick = false
 
     -- =================================================================
     -- Dialog/cutscene widget events: handle BEFORE focus check since
-    -- cutscenes have no focused element.
+    -- cutscenes have no focused element.  Process every cutscene event
+    -- this tick (typically at most one).
     -- =================================================================
-    if snapshot.widgetAdded and snapshot.widgetData
-        and snapshot.widgetData.dcType
-        and Cutscene.IsDialogOrCutscene(snapshot.widgetData.dcType) then
-        Cutscene.HandleDialogWidgetEvent(snapshot.widgetData)
+    local anyCutsceneEvent = false
+    if hasWidgetEvents then
+        for _, widgetEvent in ipairs(widgetEvents) do
+            if widgetEvent.dcType
+                and Cutscene.IsDialogOrCutscene(widgetEvent.dcType) then
+                anyCutsceneEvent = true
+                Cutscene.HandleDialogWidgetEvent(widgetEvent)
+            end
+        end
         -- If no focused element data, nothing else to do (pure cutscene).
-        if not snapshot.focusedElement
-            or not snapshot.focusedElement.elemType then
+        if anyCutsceneEvent
+            and (not snapshot.focusedElement
+                or not snapshot.focusedElement.elemType) then
             return
         end
     end
 
     -- =================================================================
-    -- Loading tips: read _loadingHint_ keys from widgetData.namedTexts.
-    -- C++ CollectLoadingHints finds the LoadingHints ItemsControl by name,
-    -- walks its TextBlock children, reads Inlines text, and stores as
-    -- _loadingHint_1, _loadingHint_2, etc.  Runs FIRST before any routing
-    -- logic that might return early (loading screen has no focused element).
+    -- Loading tips: read _loadingHint_ keys from any ls.LoadingScreen
+    -- widget event's namedTexts.  Runs FIRST before any routing logic
+    -- that might return early (loading screen has no focused element).
     -- =================================================================
-    if snapshot.widgetAdded and snapshot.widgetData
-        and snapshot.widgetData.dcType == "ls.LoadingScreen"
-        and snapshot.widgetData.namedTexts then
-        for textKey, textValue in pairs(snapshot.widgetData.namedTexts) do
-            if textKey:find("^_loadingHint_") then
-                if textValue and textValue ~= ""
-                    and not textValue:match("^%d+%%?$")
-                    and not spokenLoadingTips[textValue] then
-                    spokenLoadingTips[textValue] = true
-                    local tipSpeech = Helpers.CreateSpeechData()
-                    tipSpeech:Add("loadingTip", textValue, "normal")
-                    Log.Info("LOADING TIP: " .. textValue)
-                    Ext.Tolk.Speak(tipSpeech:Format(), false)
+    if snapshot.widgetAdded and hasWidgetEvents then
+        for _, widgetEvent in ipairs(widgetEvents) do
+            if widgetEvent.dcType == "ls.LoadingScreen"
+                and widgetEvent.namedTexts then
+                for textKey, textValue in pairs(widgetEvent.namedTexts) do
+                    if textKey:find("^_loadingHint_") then
+                        if textValue and textValue ~= ""
+                            and not textValue:match("^%d+%%?$")
+                            and not spokenLoadingTips[textValue] then
+                            spokenLoadingTips[textValue] = true
+                            local tipSpeech = Helpers.CreateSpeechData()
+                            tipSpeech:Add("loadingTip", textValue, "normal")
+                            Log.Info("LOADING TIP: " .. textValue)
+                            Ext.Tolk.Speak(tipSpeech:Format(), false)
+                        end
+                    end
                 end
             end
         end
@@ -192,16 +149,55 @@ local function HandleTickSnapshot(snapshot)
         Cutscene.HandleDialogAnswerSnapshot(snapshot)
         return
     end
+    -- Fallback: dialogue answer data may arrive via selectedElement
+    -- (event-driven mode puts the selected ListBoxItem's data into
+    -- selectedElement when focused is nil during dialogue).
+    if snapshot.selectedElement
+        and snapshot.selectedElement.dcType == "gui::VMDialogueAnswer" then
+        snapshot.focusedElement = snapshot.selectedElement
+        Cutscene.HandleDialogAnswerSnapshot(snapshot)
+        return
+    end
 
     -- =================================================================
     -- CC dispatch (early): CC snapshots may lack elemType during rapid
     -- focus bounces (e.g. guardian page entry).  Route to CC handler
     -- before the elemType filter so they aren't dropped.
     -- =================================================================
-    if focusedElement and not suppressSnapshots
-        and CC.IsCCSnapshot(snapshot) then
-        CC.HandleCCSnapshot(snapshot)
-        return
+    if not suppressSnapshots then
+        local isCC = focusedElement and CC.IsCCSnapshot(snapshot)
+        -- Standalone carousel events during CC (inline appearance
+        -- carousels) arrive with dcType=(none) since focus didn't
+        -- change.  IsCCSnapshot misses them, but they belong to the
+        -- CC carousel and must not fall through to Menus (which would
+        -- speak the bare name, then the INPC follow-up speaks
+        -- name+desc, causing audible double-reads).
+        if not isCC and CC.IsInCC()
+            and snapshot.inlineCarouselChanged then
+            isCC = true
+        end
+        -- DEV-ONLY: CC widget re-appearance on reload ticks.
+        -- After a mid-session Lua reset, the CC widget event fires
+        -- on a tick where focusedElement is nil (C++ focus cache was
+        -- wiped).  Route to HandleCCSnapshot so it picks up
+        -- currentWidgetDCType before the next focused tick.
+        -- Users never hit this (DevConfig.lua is excluded from
+        -- releases; on normal first entry the widget and focus
+        -- arrive on the same tick after the settle cycle).
+        if not isCC and BG3Access.DevMode and hasWidgetEvents then
+            for _, widgetEvent in ipairs(widgetEvents) do
+                if widgetEvent.dcType == "gui::DCCharacterCreation"
+                    or widgetEvent.dcType
+                        == "gui::DCCharacterLevelUp" then
+                    isCC = true
+                    break
+                end
+            end
+        end
+        if isCC then
+            CC.HandleCCSnapshot(snapshot)
+            return
+        end
     end
 
     -- =================================================================
@@ -230,15 +226,14 @@ local function HandleTickSnapshot(snapshot)
     end
 
     -- =================================================================
-    -- Widget added events: process BEFORE focusedElement guard.
-    -- Widget events describe the NEW widget (dcType, dcProps), not the
-    -- focused element.  They must register the panel handler and set
-    -- routeToWorld even when focusedElement is nil (UI rebuilding).
-    -- Skip during loading suppression -- no handler routing needed.
+    -- Widget added events: iterate snapshot.widgetEvents and dispatch
+    -- each event to the handler that owns it.  Process BEFORE the
+    -- focusedElement guard: widget events describe the NEW widget, not
+    -- the focused element, and must register panel handlers even when
+    -- focusedElement is nil (UI rebuilding).  Skip during loading
+    -- suppression -- no handler routing needed.
     -- =================================================================
-    if not suppressSnapshots
-        and snapshot.widgetAdded and snapshot.widgetData
-        and snapshot.widgetData.dcType then
+    if not suppressSnapshots and snapshot.widgetAdded and hasWidgetEvents then
         -- Skip widget scan noise after menu close (e.g., PartyLine_c
         -- re-discovered when returning to world from shortcuts/radials).
         -- Clear widgetAdded so downstream discovery (RoutePanelSnapshot)
@@ -248,74 +243,90 @@ local function HandleTickSnapshot(snapshot)
             snapshot.widgetAdded = false
             Log.Debug("WIDGET EVENT suppressed (menu close re-scan)")
         else
-        -- Use the highest-priority DC type from widgetDCTypes instead
-        -- widgetData.dcType is live data from the actual callback.
-        -- SelectRoutingDCType trusts it for known types, and only
-        -- falls back to widgetDCTypes for generic types.
-        local newDCType = SelectRoutingDCType(snapshot)
-        Log.Debug("WIDGET EVENT: dcType=" .. newDCType
-            .. " (widgetData=" .. snapshot.widgetData.dcType .. ")")
-        -- Reset dialog state when a non-dialog widget appears.
-        if not Cutscene.IsDialogOrCutscene(newDCType) then
-            Cutscene.ResetDialogState()
-        end
-        -- Difficulty selection signals a genuine new game flow (not
-        -- Continue or Load).  The AD system uses this to decide whether
-        -- to play the opening audio description.
-        if newDCType == "gui::DCNewGameSettings" then
-            Cutscene.NotifyNewGameInitiated()
-        end
-        -- Dialog overlays (MessageBox) are handled separately with full
-        -- snapshot context to distinguish real modals from pre-loaded widgets.
-        if Menus.IsDialogOverlay(newDCType) then
-            local dialogSpoke = Menus.HandleDialogOverlay(
-                snapshot, snapshot.widgetData)
-            -- When WorldUI is active, suppress panel routing on this tick
-            -- so the dialog speech isn't immediately interrupted.
-            if dialogSpoke and routeToWorld then
-                worldDialogOverlayJustSpoke = true
-            end
-        else
-            -- CC always gets widget events (detects its own re-appearance).
-            CC.HandleWidgetAdded(snapshot.widgetData)
-
-            -- Route to WorldUI or Menus based on DC type.
             local World = BG3Access.Client.WorldUI
-            if World and World.IsWorldDCType(newDCType) then
-                World.HandlePanelWidgetAdded(snapshot.widgetData)
-                -- Switch routing to WorldUI if not already there.
+
+            -- Reset dialog state once per tick when no cutscene event
+            -- fired.  A new widget that isn't a cutscene means the
+            -- dialogue has ended or been replaced.
+            if not anyCutsceneEvent then
+                Cutscene.ResetDialogState()
+            end
+
+            -- Dispatch each widget event independently.  Track which
+            -- handler kinds activated so we can update routeToWorld
+            -- once after the loop (menu > world priority).
+            local worldActivated = false
+            local menuActivated = false
+            local dialogOverlaySpoke = false
+
+            for _, widgetEvent in ipairs(widgetEvents) do
+                local dcType = widgetEvent.dcType
+                if dcType and not Cutscene.IsDialogOrCutscene(dcType) then
+                    Log.Debug("WIDGET EVENT: dcType=" .. dcType
+                        .. " name=" .. tostring(widgetEvent.elemName))
+
+
+                    if Menus.IsDialogOverlay(dcType) then
+                        -- Dialog overlays (MessageBox): speak, don't
+                        -- switch the active handler.
+                        local spoke = Menus.HandleDialogOverlay(
+                            snapshot, widgetEvent)
+                        if spoke then dialogOverlaySpoke = true end
+                    else
+                        -- CC always gets widget events (detects its
+                        -- own re-appearance).
+                        CC.HandleWidgetAdded(widgetEvent)
+
+                        if World and World.IsWorldDCType(dcType) then
+                            World.HandlePanelWidgetAdded(widgetEvent)
+                            worldActivated = true
+                        elseif Menus.IsMenuDCType(dcType) then
+                            -- Only switch back to Menus for explicitly
+                            -- handled menu DC types.  Generic types
+                            -- (ls.Widget, ls.DCPartyLine) must NOT
+                            -- reset WorldUI routing.
+                            Menus.HandleWidgetAdded(widgetEvent)
+                            menuActivated = true
+                        else
+                            -- Generic/unknown DC type (HUD noise).
+                            -- Forward to WorldUI only in world mode
+                            -- (WorldUI safely ignores unhandled types).
+                            -- Do NOT forward to Menus -- the default
+                            -- handler would activate for HUD noise.
+                            if routeToWorld and World then
+                                World.HandlePanelWidgetAdded(widgetEvent)
+                            end
+                        end
+                    end
+                end
+            end
+
+            -- Flip routeToWorld based on what activated this tick.
+            -- Menu wins over world: if both a menu and a world widget
+            -- appeared on the same tick, a menu was just opened on top
+            -- of the world (pause, shortcuts, etc.).
+            if menuActivated then
+                menuActivatedThisTick = true
+                if routeToWorld then
+                    if World then World.ResetAllPanelHandlers() end
+                    routeToWorld = false
+                    Log.Info("Routing to Menus (from world)")
+                end
+            elseif worldActivated then
                 if not routeToWorld then
                     Menus.ResetAllHandlers()
                     routeToWorld = true
                     Log.Info("Routing to WorldUI panels")
                 end
-            elseif Menus.IsMenuDCType(newDCType) then
-                -- Only switch back to Menus for explicitly handled menu
-                -- DC types.  Generic types (ls.Widget, ls.DCPartyLine,
-                -- etc.) fire alongside panel widgets during initial scans
-                -- and must NOT reset WorldUI routing.
-                Menus.HandleWidgetAdded(snapshot.widgetData)
-                if routeToWorld then
-                    if World then World.ResetAllPanelHandlers() end
-                    worldRouteBeforeMenu = true
-                    menuRoutedThisTick = true
-                    routeToWorld = false
-                    Log.Info("Routing to Menus (from world)")
-                end
-            else
-                -- Generic/unknown DC type (HUD noise like
-                -- DCCrossplayNotifications, ls.Widget, etc.).
-                -- Only forward to WorldUI which safely ignores
-                -- unhandled types.  Do NOT forward to Menus --
-                -- the default handler (MainMenu) would activate
-                -- for HUD noise and steal routing from WorldUI
-                -- panels like Journal/Quests.
-                if routeToWorld and World then
-                    World.HandlePanelWidgetAdded(snapshot.widgetData)
-                end
             end
-        end
-    end  -- suppressNextWidgetScan else
+
+            -- When WorldUI is active and a dialog overlay spoke,
+            -- suppress the panel handler on this tick so the dialog
+            -- speech isn't immediately interrupted.
+            if dialogOverlaySpoke and routeToWorld then
+                worldDialogOverlayJustSpoke = true
+            end
+        end  -- suppressNextWidgetScan else
     end
 
     -- =================================================================
@@ -327,12 +338,27 @@ local function HandleTickSnapshot(snapshot)
         -- Process tooltip on tooltip changes, AND on focus/selection
         -- changes (to reset dedup state so re-visiting an element
         -- speaks its tooltip again).
+        --
+        -- CC routes to CC.ProcessTooltip; WorldUI routes to
+        -- WorldUI.ProcessTooltip.  Both are thin wrappers around
+        -- Helpers.ProcessTooltip with different formatter defaults:
+        -- WorldUI passes defaultMinimal=true (spell-only radial
+        -- patterns), CC passes defaultMinimal=false (full-detail skill
+        -- / feature / passive descriptions).  Dedup, diff against
+        -- handler SpeechData, and subset/superset collapse are
+        -- identical in both contexts.
         if snapshot.tooltipChanged
             or snapshot.focusChanged
             or snapshot.selectionChanged then
-            local World = BG3Access.Client.WorldUI
-            if World then
-                World.ProcessTooltip(snapshot)
+            if CC.IsInCC and CC.IsInCC() then
+                if CC.ProcessTooltip then
+                    CC.ProcessTooltip(snapshot)
+                end
+            else
+                local World = BG3Access.Client.WorldUI
+                if World then
+                    World.ProcessTooltip(snapshot)
+                end
             end
         end
     end
@@ -361,29 +387,41 @@ local function HandleTickSnapshot(snapshot)
     end
 
     -- =================================================================
-    -- Restore world routing when a gameplay-interrupting menu closes.
-    -- When routeToWorld was flipped false for a menu (shortcuts, pause)
-    -- and no menu widgets remain in the scan, switch back to world.
+    -- Widget removal: C++ detected a widget going invisible.
+    -- If the removed widget matches the active menu handler, switch
+    -- routing back to WorldUI.  Event-driven, no per-tick polling.
     -- =================================================================
-    if not routeToWorld and worldRouteBeforeMenu
-        and not suppressSnapshots and not menuRoutedThisTick then
-        local hasMenuWidget = false
-        if snapshot.widgetDCTypes then
-            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-                if Menus.IsMenuDCType(widgetDCType) then
-                    hasMenuWidget = true
-                    break
-                end
+    if snapshot.widgetRemoved and snapshot.removedWidgetData
+        and not routeToWorld then
+        local removedName = snapshot.removedWidgetData.elemName or ""
+        local removedDCType = snapshot.removedWidgetData.dcType or ""
+        local activeHandler = Menus.GetActiveHandler()
+        local activeWidgetName = Menus.GetActiveHandlerWidgetName
+            and Menus.GetActiveHandlerWidgetName() or nil
+
+        -- Check if the removed widget matches the active handler.
+        -- Match by widget name first (distinguishes shortcuts menu
+        -- from pause menu when both share gui::DCGameMenu), then
+        -- by DC type as fallback.
+        local handlerMatched = false
+        if activeWidgetName and removedName ~= ""
+            and removedName == activeWidgetName then
+            handlerMatched = true
+        elseif activeHandler and removedDCType ~= ""
+            and Menus.IsMenuDCType(removedDCType) then
+            -- DC type match: only if the handler was NOT activated by
+            -- widget name (otherwise we'd false-match on shared types).
+            if not activeWidgetName then
+                handlerMatched = true
             end
         end
-        if not hasMenuWidget and snapshot.widgetDCTypes then
-            worldRouteBeforeMenu = false
-            routeToWorld = true
-            -- Suppress the next widget scan so background widgets
-            -- (PartyLine_c) don't trigger handler activation.
-            suppressNextWidgetScan = true
+
+        if handlerMatched then
             Menus.ResetAllHandlers()
-            Log.Info("Routing back to WorldUI (menu closed)")
+            routeToWorld = true
+            suppressNextWidgetScan = true
+            Log.Info("Routing back to WorldUI (widget removed: "
+                .. removedName .. " dc=" .. removedDCType .. ")")
         end
     end
 
@@ -392,16 +430,21 @@ local function HandleTickSnapshot(snapshot)
     -- focus instead of standard IsFocused/FocusManager, so the C++
     -- focus strategies never report a focusedElement for them.
     -- Deliver the snapshot to Menus before the focusedElement guard
-    -- drops it, so the screen entry announcement fires.
-    -- Use priority DC type (widgetData.dcType may be wrong when a
-    -- background widget like PartyLine_c was processed last by C++).
+    -- drops it, so the screen entry announcement fires.  Trigger when
+    -- any widget event this tick carries a menu DC type.
     -- =================================================================
     if not suppressSnapshots
-        and snapshot.widgetAdded and snapshot.widgetData
-        and snapshot.widgetData.dcType
+        and snapshot.widgetAdded and hasWidgetEvents
         and (not focusedElement or not focusedElement.elemType) then
-        local earlyMenuDCType = SelectRoutingDCType(snapshot)
-        if Menus.IsMenuDCType(earlyMenuDCType) then
+        local hasMenuEvent = false
+        for _, widgetEvent in ipairs(widgetEvents) do
+            if widgetEvent.dcType
+                and Menus.IsMenuDCType(widgetEvent.dcType) then
+                hasMenuEvent = true
+                break
+            end
+        end
+        if hasMenuEvent then
             if not routeToWorld then
                 Menus.RouteSnapshot(snapshot)
             end
@@ -561,8 +604,16 @@ local function HandleTickSnapshot(snapshot)
     -- On subsequent focus changes: read the focused side panel's text
     -- via C++ BFS and speak it (Advantage, Disadvantage, range, etc.).
     -- =================================================================
-    if snapshot.widgetData
-        and snapshot.widgetData.elemName == "PinnedTooltips_c" then
+    local pinnedTooltipsEvent = nil
+    if hasWidgetEvents then
+        for _, widgetEvent in ipairs(widgetEvents) do
+            if widgetEvent.elemName == "PinnedTooltips_c" then
+                pinnedTooltipsEvent = widgetEvent
+                break
+            end
+        end
+    end
+    if pinnedTooltipsEvent then
         inspectWidgetActive = true
         local World = BG3Access.Client.WorldUI
         if World then
@@ -584,12 +635,17 @@ local function HandleTickSnapshot(snapshot)
     -- Dispatch to the active handler module.
     -- =================================================================
 
-    -- Late world panel detection: when the widget callback's widgetData
-    -- carried a generic DC type (ls.Widget) but a panel widget was also
-    -- present, the widget processing block above missed it.  WorldUI
-    -- owns the detection logic (checking focused/selected/widget DC
-    -- types against its handler table).
-    if not routeToWorld
+    -- Late world panel detection: when every widget event this tick
+    -- carried a generic DC type (ls.Widget) but a panel widget is
+    -- actually present, the widget dispatch block above missed it.
+    -- WorldUI owns the detection logic (checking focused/selected/widget
+    -- DC types against its handler table).
+    --
+    -- Skip when a menu activated this tick: the user just opened a
+    -- menu (pause, shortcuts, options), and a leftover world panel
+    -- (e.g. Examine widget still in widgetDCTypes from earlier) must
+    -- not hijack routing back to WorldUI.
+    if not routeToWorld and not menuActivatedThisTick
         and (snapshot.focusChanged or snapshot.selectionChanged) then
         local World = BG3Access.Client.WorldUI
         if World and World.TryActivateFromSnapshot(snapshot) then
@@ -702,7 +758,6 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     exploreLastSpoken = nil
     spokenLoadingTips = {}
     worldDialogOverlayJustSpoke = false
-    worldRouteBeforeMenu = false
     suppressWorldEntryVisualText = false
     suppressNextWidgetScan = false
 
@@ -764,20 +819,48 @@ end)
 -- Startup
 -- ---------------------------------------------------------------------------
 
--- Detect mid-session reload (SE console `reset`).
+-- DEV-ONLY: mid-session reload recovery.
+--
+-- The SE console `reset` command wipes the Lua VM mid-game and reloads
+-- all scripts.  Users never see the console (dev-only tool), so this
+-- block is dead code for them -- gated behind BG3Access.DevMode (set
+-- by Client/DevConfig.lua, which is excluded from releases) to make
+-- that explicit.
+--
 -- During normal startup the mod loads in LoadMenu state and
--- GameStateChanged fires to clear suppressSnapshots.  After reset,
--- Lua reloads in Running state with no state transition.
--- If entities with ClientControl exist, we are in gameplay.
-local resetOk, resetEntities = pcall(
-    Ext.Entity.GetAllEntitiesWithComponent, "ClientControl")
-if resetOk and resetEntities and next(resetEntities) then
-    suppressSnapshots = false
-    -- Also set routeToWorld since we're clearly in gameplay.  Without
-    -- this, IsUIActive returns true in free world because the default
-    -- routeToWorld=false is interpreted as "pre-game menus".
-    routeToWorld = true
-    Log.Info("Mid-session reload detected, suppression cleared")
+-- GameStateChanged fires to clear suppressSnapshots.  After `reset`,
+-- Lua reloads in Running state with no state transition.  If entities
+-- with ClientControl exist, we're in gameplay; if CCState entities
+-- exist, we're in character creation.  Pre-populate state so the
+-- developer can continue testing without re-navigating from the
+-- start of whatever they were testing.
+if BG3Access.DevMode then
+    local resetOk, resetEntities = pcall(
+        Ext.Entity.GetAllEntitiesWithComponent, "ClientControl")
+    if resetOk and resetEntities and next(resetEntities) then
+        suppressSnapshots = false
+        -- Also set routeToWorld since we're clearly in gameplay.
+        -- Without this, IsUIActive returns true in free world because
+        -- the default routeToWorld=false is interpreted as "pre-game
+        -- menus".
+        routeToWorld = true
+        Log.Info("Mid-session reload detected, suppression cleared")
+        -- If the reload happened while character creation was already
+        -- open, tell CC to skip the intro welcome on the next CC
+        -- snapshot.  Without this, mid-session reload would re-arm
+        -- the LT intro-await listener and drop every subsequent CC
+        -- snapshot until the user presses LT again.
+        local ccReloadEntities = nil
+        local ccReloadOk = pcall(function()
+            ccReloadEntities =
+                Ext.Entity.GetAllEntitiesWithComponent("CCState")
+        end)
+        if ccReloadOk and ccReloadEntities and next(ccReloadEntities)
+            and CC and CC.MarkMidSessionReload then
+            CC.MarkMidSessionReload()
+            Log.Info("Mid-session reload detected in CC")
+        end
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -798,6 +881,12 @@ BG3Access.Client.EventRouter = {
     IsUIActive = function()
         -- Pre-game menus: no gameplay running, always UI active.
         if not routeToWorld then return true end
+        -- Character creation: always UI active regardless of
+        -- snapshotHasUIFocus.  CC snapshots flip between "focused"
+        -- (d-pad nav) and "no focus" (inline carousel events) within
+        -- the same CC session.  Without this check WorldNav GPS
+        -- would fire on every carousel tick and consume input.
+        if CC.IsInCC and CC.IsInCC() then return true end
         -- Inspect panel (PinnedTooltips_c) consumes RS input.
         if inspectWidgetActive then return true end
         -- Gameplay: check the cached focus state from the tick monitor.

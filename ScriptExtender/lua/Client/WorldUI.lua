@@ -47,7 +47,10 @@ local DEFAULT_PANEL_HINT = false
 
 local tooltipSuppressed      = false  -- handlers set true to suppress speech
 local tooltipEnabled         = true   -- future settings toggle
-local lastTooltipSpeech      = nil    -- dedup: last spoken tooltip text
+-- Dedup state passed to Helpers.ProcessTooltip.  Its .lastTooltipSpeech
+-- field holds the last spoken tooltip string for subset / superset
+-- collapsing across tooltip waves.  Mutated by Helpers.ProcessTooltip.
+local tooltipState           = {lastTooltipSpeech = nil}
 local lastSpokenRadialTitle  = nil    -- title filter: prevent tooltip re-speaking title (inspect pipeline)
 local lastRawTooltipTexts    = nil    -- full raw texts for inspect readback
 local lastRadialSpeechData   = nil    -- SpeechData from radial slot speech (for tooltip diff)
@@ -458,7 +461,7 @@ local function SpeakRadialSlot(slotData)
 
     -- Track title for inspect panel filtering (separate pipeline).
     lastSpokenRadialTitle = cleanTitle
-    lastTooltipSpeech = nil
+    tooltipState.lastTooltipSpeech = nil
 
     -- API-sourced description (spell/passive flavor text not shown in tooltip).
     if slotData.description and slotData.description ~= "" then
@@ -545,87 +548,48 @@ end
 -- Tooltip handler
 -- ============================================================================
 
---- ProcessTooltip: called by EventRouter with tooltip snapshot data.
---- Builds SpeechData from tooltip texts, diffs against handler's SpeechData
---- to remove already-spoken content, then speaks the remainder.
---- On revisit, the first tooltip wave may contain stale TextBlocks from a
---- previous tooltip popup (Noesis binding timing).  Skip the first wave
---- after a focus change to avoid speaking stale data.
+--- ProcessTooltip: thin wrapper around Helpers.ProcessTooltip.
+--- Handles WorldUI-specific concerns (suppression flag, raw-text
+--- retention for inspect readback), then hands off to the shared
+--- dispatch core for formatter selection, handler-SpeechData diff,
+--- subset/superset collapsing, and speech.
 --- @param snapshot table  The full TickSnapshot from C++.
 local function ProcessTooltip(snapshot)
-    -- Reset dedup when user navigates to a new element.
-    if snapshot.focusChanged or snapshot.selectionChanged then
-        lastTooltipSpeech = nil
-    end
-
-    -- Only process if tooltip data is present and speech is allowed.
-    if not snapshot.tooltipChanged or not snapshot.tooltipTexts then
+    if tooltipSuppressed or not tooltipEnabled then
+        -- Still clear dedup on focus change so re-entering a suppressed
+        -- element doesn't carry stale state into a later un-suppressed
+        -- visit.
+        if snapshot.focusChanged or snapshot.selectionChanged then
+            tooltipState.lastTooltipSpeech = nil
+        end
         return
     end
-    if tooltipSuppressed or not tooltipEnabled then return end
 
     -- Store the full raw texts for inspect readback (right stick).
-    lastRawTooltipTexts = snapshot.tooltipTexts
-
-    -- Build tooltip SpeechData: per-handler or default formatter.
-    -- All formatters return SpeechData objects (or nil to suppress).
-    -- "" from customTooltipFn is a suppress sentinel.
-    local tooltipData = nil
-    if activePanelHandler and activePanelHandler.customTooltipFn then
-        tooltipData = activePanelHandler.customTooltipFn(
-            snapshot.tooltipTexts, lastFocusedDCType)
-    end
-    if tooltipData == "" then return end  -- explicit suppress
-    if not tooltipData then
-        tooltipData = Helpers.FormatTooltipTexts(snapshot.tooltipTexts)
-    end
-    if not tooltipData then return end
-
-    -- Diff against handler's SpeechData: remove fields already spoken.
-    -- Panel handlers store SpeechData via GetLastSpeechData; the radial
-    -- (not a panel handler) stores it in lastRadialSpeechData.
-    -- Handlers can set tooltipData.skipDiff = true to bypass the Diff
-    -- (e.g., Examine tooltips where the item name naturally overlaps
-    -- the tooltip title but both should be spoken).
-    if not tooltipData.skipDiff then
-        local handlerData = nil
-        if activePanelHandler and activePanelHandler.GetLastSpeechData then
-            handlerData = activePanelHandler.GetLastSpeechData()
-        end
-        if not handlerData then
-            handlerData = lastRadialSpeechData
-        end
-        if handlerData then
-            tooltipData = tooltipData:Diff(handlerData)
-        end
+    if snapshot.tooltipChanged and snapshot.tooltipTexts then
+        lastRawTooltipTexts = snapshot.tooltipTexts
     end
 
-    -- Format to string for speech and multi-wave dedup.
-    local tooltipSpeech = tooltipData:Format()
-    if not tooltipSpeech or tooltipSpeech == "" then return end
-    if tooltipSpeech == lastTooltipSpeech then return end
-
-    -- Skip if the new text is a subset of what was already spoken
-    -- (tooltip collapsing between waves as TextBlocks disappear).
-    if lastTooltipSpeech
-        and lastTooltipSpeech:find(tooltipSpeech, 1, true) then
-        return
-    end
-
-    -- Superset: new wave contains everything already spoken plus more.
-    -- Interrupt the old (incomplete) speech and replace with the fuller
-    -- version so the user doesn't hear partial info repeated.
-    local shouldInterrupt = lastTooltipSpeech ~= nil
-        and tooltipSpeech:find(lastTooltipSpeech, 1, true)
-    -- Equipment slots: handler already spoke the item name.  Tooltip
-    -- appends damage details without cutting off the handler's speech.
-    if CharSheet.ShouldAppendEquipmentTooltip() then
-        shouldInterrupt = false
-    end
-
-    lastTooltipSpeech = tooltipSpeech
-    Log.Info("TOOLTIP: " .. tooltipSpeech)
-    Ext.Tolk.Speak(tooltipSpeech, shouldInterrupt)
+    Helpers.ProcessTooltip(snapshot, {
+        stateHolder = tooltipState,
+        focusedDCType = lastFocusedDCType,
+        customTooltipFn = activePanelHandler
+            and activePanelHandler.customTooltipFn or nil,
+        defaultMinimal = true,
+        getHandlerSpeechData = function()
+            -- Panel handlers store SpeechData via GetLastSpeechData;
+            -- the radial (not a panel handler) stores it in
+            -- lastRadialSpeechData.
+            if activePanelHandler
+                and activePanelHandler.GetLastSpeechData then
+                local handlerData = activePanelHandler.GetLastSpeechData()
+                if handlerData then return handlerData end
+            end
+            return lastRadialSpeechData
+        end,
+        shouldDisableInterrupt = CharSheet.ShouldAppendEquipmentTooltip,
+        logPrefix = "TOOLTIP",
+    })
 end
 
 --- HandleInspectNav: called by EventRouter when d-pad moves focus between
@@ -743,7 +707,7 @@ end
 
 --- ResetTooltipState: clear all tooltip state (called on GameStateChanged).
 local function ResetTooltipState()
-    lastTooltipSpeech = nil
+    tooltipState.lastTooltipSpeech = nil
     tooltipSuppressed = false
     lastSpokenRadialTitle = nil
     lastRawTooltipTexts = nil
@@ -777,8 +741,10 @@ end
 ---                                  (e.g., ActiveRoll bonus list).
 ---   customTooltipFn (function)  -- optional: per-handler tooltip formatting.
 ---                                  Called with (tooltipTexts, focusedDCType).
----                                  Returns formatted speech string, or nil to
----                                  use default FormatTooltipTexts behavior.
+---                                  Returns a SpeechData object (to speak), "" to
+---                                  suppress, or nil to fall through to
+---                                  FormatFullTooltip({minimal=true}) (the
+---                                  radial/panel default).
 ---
 --- @return table  Handler with HandleSnapshot, HandleWidgetAdded,
 ---                ResetState, ResetNavigation, ResetHint, customTooltipFn,
@@ -796,6 +762,11 @@ local function CreatePanelHandler(config)
         -- Optional: set by onWidgetAdded hooks for overrides.
         titleOverride        = nil,
         bodyOverride         = nil,
+        -- Set by HandleWidgetAdded for the current tick.  HandleSnapshot
+        -- consumes (and clears) this on the same tick so widget-derived
+        -- title/body/namedTexts come from THIS handler's event, not a
+        -- shared "best" event picked by the router.
+        pendingWidgetEvent   = nil,
     }
 
     -- -----------------------------------------------------------------
@@ -830,6 +801,12 @@ local function CreatePanelHandler(config)
             and snapshot.inlineCarouselValue
             and snapshot.inlineCarouselValue ~= ""
 
+        -- pendingWidgetEvent: the widget event that activated this
+        -- handler on this tick (set by HandleWidgetAdded).  Consume
+        -- once so widget-derived text doesn't leak into later ticks.
+        local widgetEvent = handlerState.pendingWidgetEvent
+        handlerState.pendingWidgetEvent = nil
+
         local isScreenEntry = false
         -- treatTabsAsItems: when true, tab-typed focus changes are
         -- item navigation, not screen entries.  Used by ActiveRoll
@@ -838,8 +815,7 @@ local function CreatePanelHandler(config)
             and focusedElement.isTab
         if snapshot.selectionChanged then
             isScreenEntry = true
-        elseif snapshot.widgetAdded and snapshot.widgetData
-            and not handlerState.lastSpokenTab then
+        elseif widgetEvent and not handlerState.lastSpokenTab then
             isScreenEntry = true
         elseif snapshot.focusChanged and focusedElement.isTab
             and not tabIsItem then
@@ -855,10 +831,9 @@ local function CreatePanelHandler(config)
 
         -- Widget text update: DC property changed (e.g., status text
         -- update) or dialog appeared without focus change.
-        if not isScreenEntry and not isItemNav
-            and snapshot.widgetAdded and snapshot.widgetData then
+        if not isScreenEntry and not isItemNav and widgetEvent then
             local _, widgetBody, widgetActions = Helpers.ExtractFromWidgetData(
-                snapshot.widgetData)
+                widgetEvent)
             local updateText = widgetBody or widgetActions
             if updateText and updateText ~= ""
                 and updateText ~= handlerState.lastSpokenFullText then
@@ -971,8 +946,8 @@ local function CreatePanelHandler(config)
                     allNamedTexts[elementName] = elementText
                 end
             end
-            if snapshot.widgetData and snapshot.widgetData.namedTexts then
-                for elementName, elementText in pairs(snapshot.widgetData.namedTexts) do
+            if widgetEvent and widgetEvent.namedTexts then
+                for elementName, elementText in pairs(widgetEvent.namedTexts) do
                     if not allNamedTexts[elementName] then
                         allNamedTexts[elementName] = elementText
                     end
@@ -981,7 +956,7 @@ local function CreatePanelHandler(config)
             local nsTitle, nsBodyParts = Helpers.ExtractFromNamedTexts(
                 allNamedTexts)
             local widgetTitle, widgetBody, widgetActions =
-                Helpers.ExtractFromWidgetData(snapshot.widgetData)
+                Helpers.ExtractFromWidgetData(widgetEvent)
 
             -- Title.  Handler titleOverride takes priority (e.g., Container
             -- handler sets the container name, which is more specific than
@@ -1201,9 +1176,12 @@ local function CreatePanelHandler(config)
     end
 
     -- -----------------------------------------------------------------
-    -- HandleWidgetAdded: process widget added events.
+    -- HandleWidgetAdded: process widget added events.  Stashes the
+    -- event on handlerState for HandleSnapshot to consume on the same
+    -- tick.
     -- -----------------------------------------------------------------
     local function HandleWidgetAdded(widgetData)
+        handlerState.pendingWidgetEvent = widgetData
         if config.onWidgetAdded then
             config.onWidgetAdded(widgetData, handlerState)
         end
@@ -1225,6 +1203,7 @@ local function CreatePanelHandler(config)
         handlerState.screenEntryJustSpoke = false
         handlerState.titleOverride = nil
         handlerState.bodyOverride = nil
+        handlerState.pendingWidgetEvent = nil
         if config.onReset then
             config.onReset(handlerState)
         end
@@ -2060,9 +2039,13 @@ local SelectionFlyOutHandler = CreatePanelHandler({
         local speechData = Helpers.CreateSpeechData()
 
         -- Title (screen entry only -- collection title from C++).
+        -- Note: HandleSnapshot already consumed pendingWidgetEvent, so
+        -- check widgetEvents directly for the "widget added this tick"
+        -- signal used to gate the screen-entry title.
+        local hasWidgetThisTick = snapshot.widgetEvents
+            and #snapshot.widgetEvents > 0
         local isScreenEntry = snapshot.selectionChanged
-            or (snapshot.widgetAdded and snapshot.widgetData
-                and not handlerState.lastSpokenTab)
+            or (hasWidgetThisTick and not handlerState.lastSpokenTab)
             or (snapshot.focusChanged and focusedElement.isTab)
         if isScreenEntry and handlerState.collectionTitle then
             speechData:Add("title", handlerState.collectionTitle, "brief")
@@ -2551,16 +2534,22 @@ local BookHandler = CreatePanelHandler({
     end,
     customItemFn = function(focusedElement, handlerState, snapshot)
         -- Discovery path fallback: onWidgetAdded gets synthetic
-        -- widgetData without dcProps.  The snapshot has the real data.
-        if not handlerState.bookLines
-            and snapshot.widgetData
-            and snapshot.widgetData.dcProps then
-            local bookText = snapshot.widgetData.dcProps.BookFullText
-            if bookText and bookText ~= ""
-                and not bookText:match("^h%x+g")
-                and not bookText:find("%[ForceUpdate%]") then
-                handlerState.bookLines = SplitBookLines(bookText)
-                OpenBookReader(handlerState)
+        -- widgetData without dcProps.  The snapshot widget events
+        -- carry the real data.  Iterate to find any event with
+        -- BookFullText in its dcProps.
+        if not handlerState.bookLines and snapshot.widgetEvents then
+            for _, widgetEvent in ipairs(snapshot.widgetEvents) do
+                if widgetEvent.dcProps
+                    and widgetEvent.dcProps.BookFullText then
+                    local bookText = widgetEvent.dcProps.BookFullText
+                    if bookText and bookText ~= ""
+                        and not bookText:match("^h%x+g")
+                        and not bookText:find("%[ForceUpdate%]") then
+                        handlerState.bookLines = SplitBookLines(bookText)
+                        OpenBookReader(handlerState)
+                        break
+                    end
+                end
             end
         end
         -- Always return an empty SpeechData to suppress the generic
@@ -2784,6 +2773,12 @@ end
 --- a WorldUI panel is active.
 --- @param snapshot table  The full TickSnapshot from C++.
 local function RoutePanelSnapshot(snapshot)
+    -- Radial is active (RT shortcuts or RB action radial).  Radial slot
+    -- changes are handled by HandleRadialSlot via EventRouter, not by
+    -- panel discovery.  Skip discovery to avoid PartyLine or other
+    -- background DC types activating a panel handler during radial use.
+    if inRadial then return end
+
     if not activePanelHandler then
         -- Attempt handler discovery from snapshot data before falling
         -- back to Menus.  This handles panels whose widget DC type is
@@ -2816,30 +2811,38 @@ local function RoutePanelSnapshot(snapshot)
                 end
             end
         end
-        -- If no non-discovery handler found but widgetData has a
-        -- discovery type, allow it only when no HANDLED non-discovery
-        -- type exists in widgetDCTypes.  Unhandled HUD types like
-        -- gui::DCOverlay, gui::DCCombatants are always present and
-        -- must not block genuine LT opens (PartyLineActive_c is the
-        -- only HANDLED new widget, alongside unhandled HUD noise).
+        -- If no non-discovery handler found but a widget event this
+        -- tick has a discovery type, allow it only when no HANDLED
+        -- non-discovery type exists in widgetDCTypes.  Unhandled HUD
+        -- types like gui::DCOverlay, gui::DCCombatants are always
+        -- present and must not block genuine LT opens (PartyLineActive_c
+        -- is the only HANDLED new widget, alongside unhandled HUD noise).
         if not discoveredHandler
-            and snapshot.widgetAdded and snapshot.widgetData
-            and snapshot.widgetData.dcType
-            and DISCOVERY_ONLY_DC_TYPES[snapshot.widgetData.dcType] then
-            local hasHandledNonDiscovery = false
-            if snapshot.widgetDCTypes then
-                for _, widgetDCType in ipairs(
-                        snapshot.widgetDCTypes) do
-                    if not DISCOVERY_ONLY_DC_TYPES[widgetDCType]
-                        and DC_TYPE_HANDLERS[widgetDCType] then
-                        hasHandledNonDiscovery = true
-                        break
-                    end
+            and snapshot.widgetAdded and snapshot.widgetEvents then
+            local discoveryEvent = nil
+            for _, widgetEvent in ipairs(snapshot.widgetEvents) do
+                if widgetEvent.dcType
+                    and DISCOVERY_ONLY_DC_TYPES[widgetEvent.dcType] then
+                    discoveryEvent = widgetEvent
+                    break
                 end
             end
-            if not hasHandledNonDiscovery then
-                discoveredHandler = DC_TYPE_HANDLERS[
-                    snapshot.widgetData.dcType]
+            if discoveryEvent then
+                local hasHandledNonDiscovery = false
+                if snapshot.widgetDCTypes then
+                    for _, widgetDCType in ipairs(
+                            snapshot.widgetDCTypes) do
+                        if not DISCOVERY_ONLY_DC_TYPES[widgetDCType]
+                            and DC_TYPE_HANDLERS[widgetDCType] then
+                            hasHandledNonDiscovery = true
+                            break
+                        end
+                    end
+                end
+                if not hasHandledNonDiscovery then
+                    discoveredHandler = DC_TYPE_HANDLERS[
+                        discoveryEvent.dcType]
+                end
             end
         end
         -- Fallback: check all widget DC types from this tick, but
@@ -2919,15 +2922,20 @@ local function RoutePanelSnapshot(snapshot)
     -- widget removed), restore the previous handler.
     if previousPanelHandler
         and (snapshot.selectionChanged or snapshot.widgetAdded) then
-        -- Check if the overlay's widget DC is still being reported.
-        -- If widgetData has the overlay's DC type, the overlay is still
-        -- present.  If not (or no widgetData), the overlay closed.
+        -- Check if any widget event this tick has a DC type mapping
+        -- back to the overlay handler.  If yes, overlay is still
+        -- present; otherwise it closed.
         local overlayStillPresent = false
-        if snapshot.widgetData and snapshot.widgetData.dcType then
-            local widgetHandler = DC_TYPE_HANDLERS[
-                snapshot.widgetData.dcType]
-            if widgetHandler == activePanelHandler then
-                overlayStillPresent = true
+        if snapshot.widgetEvents then
+            for _, widgetEvent in ipairs(snapshot.widgetEvents) do
+                if widgetEvent.dcType then
+                    local widgetHandler = DC_TYPE_HANDLERS[
+                        widgetEvent.dcType]
+                    if widgetHandler == activePanelHandler then
+                        overlayStillPresent = true
+                        break
+                    end
+                end
             end
         end
         if not overlayStillPresent then
@@ -3030,12 +3038,17 @@ local function TryActivateFromSnapshot(snapshot)
             panelDCType = snapshot.selectedElement.dcType
         end
     end
-    -- Widget added on this tick: freshly opened panel, allow all types.
+    -- Widget added on this tick: freshly opened panel, allow all
+    -- types.  Iterate all widget events so we don't miss a handled
+    -- panel DC type that fired alongside a generic widget event.
     if not panelDCType
-        and snapshot.widgetAdded and snapshot.widgetData
-        and snapshot.widgetData.dcType then
-        if DC_TYPE_HANDLERS[snapshot.widgetData.dcType] then
-            panelDCType = snapshot.widgetData.dcType
+        and snapshot.widgetAdded and snapshot.widgetEvents then
+        for _, widgetEvent in ipairs(snapshot.widgetEvents) do
+            if widgetEvent.dcType
+                and DC_TYPE_HANDLERS[widgetEvent.dcType] then
+                panelDCType = widgetEvent.dcType
+                break
+            end
         end
     end
     -- Fallback: all widget DC types, skip discovery-only (HUD noise).
