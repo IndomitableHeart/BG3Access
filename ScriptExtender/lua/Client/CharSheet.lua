@@ -1602,7 +1602,7 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                 end
                 if itemName and itemName ~= "" then
                     local speechData = Helpers.CreateSpeechData()
-                    speechData:Add("itemName", itemName, "brief")
+                    speechData:Add("name", itemName, "brief")
                     -- Equipped status: direct from dcProps (no scan needed).
                     local equippedProp = dcProps.Equipped
                     if equippedProp and equippedProp ~= ""
@@ -1628,7 +1628,7 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                                         itemStats.weaponProps, "normal")
                                 end
                                 if itemStats.description then
-                                    speechData:Add("itemDesc",
+                                    speechData:Add("description",
                                         itemStats.description, "verbose")
                                 end
                             end
@@ -1655,9 +1655,9 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                     -- Fallback description from dcProps if entity API
                     -- didn't provide anything.
                     if not speechData:HasField("stats")
-                        and not speechData:HasField("itemDesc")
+                        and not speechData:HasField("description")
                         and itemDescription and itemDescription ~= "" then
-                        speechData:Add("itemDesc",
+                        speechData:Add("description",
                             Helpers.StripMarkupTags(itemDescription),
                             "verbose")
                     end
@@ -1937,6 +1937,7 @@ local function CreateCharacterPanelHandler(createPanelHandler)
             end
             return nil
         end,
+        shouldDisableInterrupt = ShouldAppendEquipmentTooltip,
         buildDetailList = function(focusedData, tooltipTexts)
             if not focusedData then return nil end
             local dcType = focusedData.dcType
@@ -1968,7 +1969,7 @@ local function CreateCharacterPanelHandler(createPanelHandler)
 end
 
 -- ============================================================================
--- Equipment state accessors (for ProcessTooltip in WorldUI)
+-- Equipment state accessors (for tooltip dispatch in WorldUI)
 -- ============================================================================
 
 local function IsEquipmentSlotEmpty()

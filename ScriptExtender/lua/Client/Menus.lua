@@ -157,6 +157,9 @@ local function CreateMenuHandler(config)
         lastSpokenFullText   = nil,
         lastSpokenTab        = nil,
         lastSpokenTitle      = nil,
+        lastTooltipSpeech    = nil,   -- tooltip dedup (for SpeakTooltipWithDedup)
+        spokenFields         = {},    -- set of field names spoken (for tooltip cross-off)
+        spokenValues         = {},    -- set of normalized values spoken (for carousel dedup)
         tabHintSpoken        = false,
         screenEntryJustSpoke = false,
         -- Optional: set by onWidgetAdded hooks for body text override.
@@ -167,6 +170,21 @@ local function CreateMenuHandler(config)
         -- shared "best" event picked by the router.
         pendingWidgetEvent   = nil,
     }
+
+    --- RecordSpokenFields: populate spokenFields (role names) and
+    --- spokenValues (normalized text) from a SpeechData object.
+    --- Called after every speech event so the handler knows what it said.
+    local function RecordSpokenFields(speechData)
+        handlerState.spokenFields = {}
+        handlerState.spokenValues = {}
+        for _, field in ipairs(speechData.fields) do
+            handlerState.spokenFields[field.name] = true
+            if field.value and field.value ~= "" then
+                handlerState.spokenValues[
+                    Helpers.NormalizeForCompare(field.value)] = true
+            end
+        end
+    end
 
     -- -----------------------------------------------------------------
     -- HandleSnapshot: generic menu processing pipeline.
@@ -245,11 +263,15 @@ local function CreateMenuHandler(config)
         -- =============================================================
         if isCarouselOnly then
             local carouselValue = snapshot.inlineCarouselValue
-            if carouselValue ~= handlerState.lastSpokenFullText then
-                local carouselSpeech = Helpers.CreateSpeechData()
-                carouselSpeech:Add("carouselValue", carouselValue, "brief")
-                carouselSpeech:Speak(handlerState, false, nil, userInitiated)
+            -- Skip if the handler already spoke this value.
+            -- The handler tracks all spoken text values in spokenValues.
+            if handlerState.spokenValues[
+                Helpers.NormalizeForCompare(carouselValue)] then
+                return
             end
+            local carouselSpeech = Helpers.CreateSpeechData()
+            carouselSpeech:Add("value", carouselValue, "brief")
+            carouselSpeech:Speak(handlerState, false, nil, userInitiated)
             return
         end
 
@@ -258,7 +280,16 @@ local function CreateMenuHandler(config)
             if config.customItemFn then
                 local customValue = config.customItemFn(
                     focusedElement, handlerState, snapshot)
-                if customValue and customValue ~= ""then
+                -- SpeechData object: speak directly (checkbox toggle, etc.).
+                if type(customValue) == "table" and customValue.fields then
+                    if #customValue.fields > 0 then
+                        RecordSpokenFields(customValue)
+                        customValue:Speak(handlerState, false, nil,
+                            userInitiated)
+                    end
+                    return
+                end
+                if customValue and customValue ~= "" then
                     -- For value-only changes, speak just the state
                     -- portion (e.g., "expanded") not the full text
                     -- (e.g., "Tav, expanded") to avoid repeating the
@@ -267,7 +298,7 @@ local function CreateMenuHandler(config)
                     local toSpeak = stateOnly or customValue
                     if toSpeak ~= handlerState.lastSpokenFullText then
                         local valueSpeech = Helpers.CreateSpeechData()
-                        valueSpeech:Add("customValue", toSpeak, "brief")
+                        valueSpeech:Add("value", toSpeak, "brief")
                         valueSpeech:Speak(handlerState, false, nil,
                             userInitiated)
                     end
@@ -410,7 +441,7 @@ local function CreateMenuHandler(config)
                     and (bodyAssembled .. ". " .. statusText) or statusText
             end
             if bodyAssembled then
-                speechData:Add("body", bodyAssembled, "normal")
+                speechData:Add("description", bodyAssembled, "normal")
             end
             if widgetActions then
                 speechData:Add("actions", widgetActions, "normal")
@@ -438,18 +469,47 @@ local function CreateMenuHandler(config)
 
         -- customItemFn: handler-specific extraction before generic.
         -- Return nil to fall through, string to override item name,
-        -- SpeechData for full control.
+        -- SpeechData for full control (speak + return early).
         local splitName, splitValue, splitDesc, splitValueDesc
         local customHandled = false
+        local customSpeechData = nil
         if config.customItemFn then
             splitName = config.customItemFn(
                 focusedElement, handlerState, snapshot)
-            if splitName ~= nil then
+            -- SpeechData object: speak directly and skip generic pipeline.
+            if type(splitName) == "table" and splitName.fields then
+                customSpeechData = splitName
+                customHandled = true
+            elseif splitName ~= nil then
                 customHandled = true
                 splitValue = nil
                 splitDesc = nil
                 splitValueDesc = nil
             end
+        end
+
+        -- If customItemFn returned a full SpeechData, use it directly.
+        -- On screen entry, merge with screen entry fields (title/hint/body)
+        -- so welcome text isn't lost.
+        if customSpeechData then
+            if #customSpeechData.fields == 0 then return end
+            if isScreenEntry and #speechData.fields > 0 then
+                local merged = Helpers.CreateSpeechData()
+                for _, field in ipairs(speechData.fields) do
+                    merged:Add(field.name, field.value, field.tier)
+                end
+                for _, field in ipairs(customSpeechData.fields) do
+                    merged:Add(field.name, field.value, field.tier)
+                end
+                RecordSpokenFields(merged)
+                merged:Speak(handlerState, isScreenEntry, nil,
+                    userInitiated)
+            else
+                RecordSpokenFields(customSpeechData)
+                customSpeechData:Speak(handlerState, isScreenEntry, nil,
+                    userInitiated)
+            end
+            return
         end
 
         if not customHandled then
@@ -505,11 +565,12 @@ local function CreateMenuHandler(config)
                     or ""))
         end
 
-        speechData:Add("itemName", itemName, "brief")
-        speechData:Add("itemInfo", itemInfo, "normal")
-        speechData:Add("itemValue", itemValue, "brief")
-        speechData:Add("itemDesc", itemDesc, "verbose")
+        speechData:Add("name", itemName, "brief")
+        speechData:Add("info", itemInfo, "normal")
+        speechData:Add("value", itemValue, "brief")
+        speechData:Add("description", itemDesc, "verbose")
 
+        RecordSpokenFields(speechData)
         speechData:Speak(handlerState, isScreenEntry, nil, userInitiated)
     end
 
@@ -573,6 +634,23 @@ local function CreateMenuHandler(config)
         ResetState        = ResetState,
         ResetNavigation   = ResetNavigation,
         ResetHint         = ResetHint,
+        --- HandleTooltip: receive hub-formatted tooltip SpeechData,
+        --- skip fields the handler already spoke, then speak with dedup.
+        HandleTooltip = function(defaultTooltipData, rawTexts)
+            if not defaultTooltipData then return end
+            local filtered = Helpers.CreateSpeechData()
+            for _, field in ipairs(defaultTooltipData.fields) do
+                if not handlerState.spokenFields[field.name] then
+                    filtered:Add(field.name, field.value, field.tier)
+                end
+            end
+            local tooltipSpeech = filtered:Format(
+                config.tooltipVerbosity or "verbose")
+            Helpers.SpeakTooltipWithDedup(handlerState, tooltipSpeech)
+        end,
+        ResetTooltipDedup = function()
+            handlerState.lastTooltipSpeech = nil
+        end,
     }
 end
 
@@ -738,6 +816,41 @@ local DifficultyHandler = CreateMenuHandler({
 local ModManagerHandler = CreateMenuHandler({
     name = "ModManager",
     hint = "Use bumpers to switch tabs. Use up and down to cycle through items",
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        -- Announce checkbox role and checked/unchecked state.
+        if focusedElement.elemType
+            and focusedElement.elemType:find("CheckBox") then
+            local checkedText = nil
+            if focusedElement.isChecked == true then
+                checkedText = "checked"
+            elseif focusedElement.isChecked == false then
+                checkedText = "unchecked"
+            end
+
+            -- Value-only (A press toggle): speak just the state.
+            if snapshot.valueChanged and not snapshot.focusChanged then
+                local speechData = Helpers.CreateSpeechData()
+                if checkedText then
+                    speechData:Add("value", checkedText, "brief")
+                end
+                return speechData
+            end
+
+            -- Focus arrival: speak name + role + state.
+            local speechData = Helpers.CreateSpeechData()
+            local checkboxName = Helpers.ExtractTextFromData(
+                focusedElement, nil, false)
+            if checkboxName and checkboxName ~= "" then
+                speechData:Add("name", checkboxName, "brief")
+            end
+            speechData:Add("info", "checkbox", "brief")
+            if checkedText then
+                speechData:Add("value", checkedText, "brief")
+            end
+            return speechData
+        end
+        return nil
+    end,
 })
 
 local MainMenuHandler = CreateMenuHandler({
@@ -1085,6 +1198,23 @@ local function GetActiveHandlerWidgetName()
     return activeHandlerWidgetName
 end
 
+--- DispatchTooltip: routes hub-formatted tooltip SpeechData to the
+--- active menu handler.  Resets dedup on navigation.
+--- @param defaultTooltipData table|nil  SpeechData from FormatFullTooltip.
+--- @param snapshot table  The full TickSnapshot (for change flags).
+local function DispatchTooltip(defaultTooltipData, snapshot)
+    if snapshot.focusChanged or snapshot.selectionChanged then
+        if activeHandler and activeHandler.ResetTooltipDedup then
+            activeHandler.ResetTooltipDedup()
+        end
+    end
+    if not defaultTooltipData then return end
+    if activeHandler and activeHandler.HandleTooltip then
+        activeHandler.HandleTooltip(
+            defaultTooltipData, snapshot.tooltipTexts)
+    end
+end
+
 -- ============================================================================
 -- Exports
 -- ============================================================================
@@ -1100,4 +1230,5 @@ BG3Access.Client.Menus = {
     GetActiveHandler        = GetActiveHandler,
     GetActiveHandlerWidgetName = GetActiveHandlerWidgetName,
     UnsubscribeControllerInput = UnsubscribeControllerInput,
+    DispatchTooltip         = DispatchTooltip,
 }

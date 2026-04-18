@@ -506,7 +506,7 @@ local function FormatActionSpeech(dcProps)
     end
     if actionName and actionName ~= "" then
         actionName = Helpers.StripMarkupTags(actionName)
-        speechData:Add("itemName", actionName, "brief")
+        speechData:Add("name", actionName, "brief")
     end
 
     -- API description: use LookupFeatureDescription which cascades
@@ -515,7 +515,7 @@ local function FormatActionSpeech(dcProps)
         local apiDesc = Helpers.LookupFeatureDescription(actionName)
         if apiDesc and apiDesc ~= "" then
             apiDesc = Helpers.StripMarkupTags(apiDesc)
-            speechData:Add("itemDesc", apiDesc, "verbose")
+            speechData:Add("description", apiDesc, "verbose")
         end
     end
 

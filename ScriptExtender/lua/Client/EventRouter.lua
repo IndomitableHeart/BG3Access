@@ -196,7 +196,10 @@ local function HandleTickSnapshot(snapshot)
         end
         if isCC then
             CC.HandleCCSnapshot(snapshot)
-            return
+            -- Don't return: the tooltip section below must run for
+            -- CC snapshots too (clears dedup on focus changes,
+            -- processes tooltip data when it arrives).  The isCC
+            -- flag gates subsequent non-CC sections.
         end
     end
 
@@ -333,31 +336,41 @@ local function HandleTickSnapshot(snapshot)
     -- Tooltip events: process BEFORE focusedElement guard.
     -- Tooltip-only snapshots (no focus/selection change) have no
     -- focusedElement and would be dropped by the guard below.
+    --
+    -- Hub-and-spoke: the hub formats raw tooltip texts into SpeechData
+    -- via FormatFullTooltip (all fields with tier labels).  The active
+    -- handler's HandleTooltip decides what to speak based on which
+    -- fields it already covered (spokenFields cross-off) and its
+    -- verbosity setting.  Three-way dispatch: CC, WorldUI, or Menus.
     -- =================================================================
     if not suppressSnapshots then
-        -- Process tooltip on tooltip changes, AND on focus/selection
-        -- changes (to reset dedup state so re-visiting an element
-        -- speaks its tooltip again).
-        --
-        -- CC routes to CC.ProcessTooltip; WorldUI routes to
-        -- WorldUI.ProcessTooltip.  Both are thin wrappers around
-        -- Helpers.ProcessTooltip with different formatter defaults:
-        -- WorldUI passes defaultMinimal=true (spell-only radial
-        -- patterns), CC passes defaultMinimal=false (full-detail skill
-        -- / feature / passive descriptions).  Dedup, diff against
-        -- handler SpeechData, and subset/superset collapse are
-        -- identical in both contexts.
         if snapshot.tooltipChanged
             or snapshot.focusChanged
             or snapshot.selectionChanged then
-            if CC.IsInCC and CC.IsInCC() then
-                if CC.ProcessTooltip then
-                    CC.ProcessTooltip(snapshot)
+            -- Hub formats: extract ALL fields with tier labels.
+            -- Handlers decide verbosity via Format(verbosity).
+            local defaultTooltipData = nil
+            if snapshot.tooltipChanged
+                and snapshot.tooltipTexts
+                and #snapshot.tooltipTexts > 0 then
+                defaultTooltipData = Helpers.FormatFullTooltip(
+                    snapshot.tooltipTexts)
+            end
+
+            -- Dispatch to active context (handler decides speech).
+            local isCC = CC.IsInCC and CC.IsInCC()
+            if isCC then
+                if CC.DispatchTooltip then
+                    CC.DispatchTooltip(defaultTooltipData, snapshot)
+                end
+            elseif routeToWorld then
+                local World = BG3Access.Client.WorldUI
+                if World and World.DispatchTooltip then
+                    World.DispatchTooltip(defaultTooltipData, snapshot)
                 end
             else
-                local World = BG3Access.Client.WorldUI
-                if World then
-                    World.ProcessTooltip(snapshot)
+                if Menus.DispatchTooltip then
+                    Menus.DispatchTooltip(defaultTooltipData, snapshot)
                 end
             end
         end
@@ -720,7 +733,7 @@ local LOADING_STATES = {
 -- Without this, suppressSnapshots stays true forever after a reset.
 -- Ext.Client may not exist during initial load, so pcall everything.
 local initOk, currentState = pcall(function()
-    return Ext.Client.GetGameState()
+    return Ext.Utils.GetGameState()
 end)
 if initOk and currentState then
     local stateStr = tostring(currentState)

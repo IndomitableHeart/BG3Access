@@ -252,14 +252,24 @@ local function FormatDCTextSplit(dcProps, dcType)
 
     if not text and dcProps.Title then
         text = dcProps.Title
-        -- Savegame items: append location and difficulty.
+        -- Savegame items: return location and difficulty as separate
+        -- fields (value, desc) instead of concatenating into the name.
+        -- This enables proper semantic field tracking (spokenValues).
         local levelName = dcProps.LevelName
         if type(levelName) == "string" and levelName ~= "" then
-            text = text .. ", " .. levelName
+            if not value then
+                value = levelName
+            else
+                text = text .. ", " .. levelName
+            end
         end
         local difficulty = dcProps.Difficulty
         if type(difficulty) == "string" and difficulty ~= "" then
-            text = text .. ", " .. difficulty
+            if not desc then
+                desc = difficulty
+            else
+                value = (value or "") .. ", " .. difficulty
+            end
         end
     end
     -- Character assignment player slots (VMCharacterAssignPlayerSlot):
@@ -966,7 +976,7 @@ local hintsEnabled = true
 ---
 --- Usage:
 ---   local speech = Helpers.CreateSpeechData()
----   speech:Add("itemName", "Shortsword", "brief")
+---   speech:Add("name", "Shortsword", "brief")
 ---   speech:Add("damage", "4 to 9 Piercing damage", "brief")
 ---   speech:Add("description", "A common sword...", "verbose")
 ---   speech:Speak(handlerState, isScreenEntry)
@@ -1147,10 +1157,10 @@ local function CreateSpeechData()
 
             -- Visual text (loading tips): body-only, no title/tab/hint/item.
             -- Always append so tips queue naturally.
-            if self:HasField("body") and not self:HasField("title")
+            if self:HasField("description") and not self:HasField("title")
                 and not self:HasField("tabName")
                 and not self:HasField("hint")
-                and not self:HasField("itemName") then
+                and not self:HasField("name") then
                 interrupt = false
             end
 
@@ -1513,7 +1523,7 @@ local CHARSHEET_TOOLTIP_JUNK = {
 --- (long).  Minimal mode emits only spell-specific signals (damage range,
 --- "Costs Action", "Single Use", warnings) -- the legacy radial / generic
 --- panel behavior.  Diff handles dedup against handler SpeechData in the
---- ProcessTooltip dispatch.
+--- Tooltip formatters (called by handler HandleTooltip or hub).
 --- @param tooltipTexts table  Raw tooltip text array from C++.
 --- @param options table|nil  {minimal=bool}.  Minimal returns only the
 ---                            spell-specific fields (radial defaults).
@@ -1523,6 +1533,7 @@ local function FormatFullTooltip(tooltipTexts, options)
     local minimal = options and options.minimal
     local speechData = CreateSpeechData()
     local seen = {}
+    local nameAssigned = false
     for _, text in ipairs(tooltipTexts) do
         if text and text ~= ""
             and not TOOLTIP_JUNK_LABELS[text]
@@ -1649,7 +1660,13 @@ local function FormatFullTooltip(tooltipTexts, options)
                                 elseif #cleaned > 40 then
                                     speechData:Add("description",
                                         cleaned, "verbose")
-                                -- Everything else: effect label
+                                -- First unclassified short text is
+                                -- the item/feature name; rest are
+                                -- effect labels.
+                                elseif not nameAssigned then
+                                    speechData:Add("name",
+                                        cleaned, "brief")
+                                    nameAssigned = true
                                 else
                                     speechData:Add("effect",
                                         cleaned, "normal")
@@ -1874,84 +1891,25 @@ local function FormatCombatStatTooltip(tooltipTexts)
 end
 
 -- ---------------------------------------------------------------------------
--- Tooltip dispatch core (shared between WorldUI and CharCreation)
+-- Tooltip dedup utility (shared by handler HandleTooltip methods)
 -- ---------------------------------------------------------------------------
 
---- ProcessTooltip: unified tooltip dispatch.  Resets dedup on focus /
---- selection change, builds SpeechData via custom or default formatter,
---- diffs against handler SpeechData when provided, collapses subset /
---- superset waves, and speaks the remainder.
----
---- @param snapshot table  Full TickSnapshot from C++.
---- @param config   table  Dispatch configuration:
----   stateHolder (table, required)       Location of .lastTooltipSpeech
----                                       for per-context dedup.
----   focusedDCType (string|nil)          Current focused element DC type,
----                                       passed to customTooltipFn.
----   customTooltipFn (function|nil)      Signature
----                                       (tooltipTexts, focusedDCType)
----                                       -> SpeechData | nil | "".
----                                       "" is an explicit suppress
----                                       sentinel.  nil falls through to
----                                       the default formatter.
----   defaultMinimal (bool)               When no custom formatter fires,
----                                       call FormatFullTooltip with
----                                       {minimal=true} (WorldUI default)
----                                       or without (CC default).
----   getHandlerSpeechData (function|nil) Returns the active handler's
----                                       last SpeechData for Diff, or nil.
----                                       Omit to skip the Diff step.
----   shouldDisableInterrupt (function|nil) Predicate; when true, the
----                                       "superset grows over subset"
----                                       interrupt is disabled (used for
----                                       equipment slot append where the
----                                       handler's name speech must not
----                                       be cut).
----   logPrefix (string|nil)              Log tag.  Default "TOOLTIP".
-local function ProcessTooltip(snapshot, config)
-    local stateHolder = config.stateHolder
-
-    -- Reset dedup when user navigates to a new element.  Runs before the
-    -- bail below so focus-only snapshots still clear stale state.
-    if snapshot.focusChanged or snapshot.selectionChanged then
-        stateHolder.lastTooltipSpeech = nil
-    end
-
-    if not snapshot.tooltipChanged or not snapshot.tooltipTexts then
-        return
-    end
-
-    -- Build SpeechData: per-handler formatter, or default minimal / full.
-    local tooltipData = nil
-    if config.customTooltipFn then
-        tooltipData = config.customTooltipFn(
-            snapshot.tooltipTexts, config.focusedDCType)
-    end
-    if tooltipData == "" then return end  -- explicit suppress
-    if not tooltipData then
-        local formatOptions = nil
-        if config.defaultMinimal then
-            formatOptions = {minimal = true}
-        end
-        tooltipData = FormatFullTooltip(
-            snapshot.tooltipTexts, formatOptions)
-    end
-    if not tooltipData then return end
-
-    -- Diff against handler SpeechData.  Handlers can set
-    -- tooltipData.skipDiff = true to bypass (e.g., Examine, where the
-    -- item name naturally overlaps but both should be spoken).
-    if not tooltipData.skipDiff and config.getHandlerSpeechData then
-        local handlerData = config.getHandlerSpeechData()
-        if handlerData then
-            tooltipData = tooltipData:Diff(handlerData)
-        end
-    end
-
-    local tooltipSpeech = tooltipData:Format()
+--- SpeakTooltipWithDedup: dedup + subset/superset collapse + speak.
+--- Handlers call this after filtering out fields they already spoke.
+--- The handler owns the speech decision; this utility handles the
+--- mechanical dedup (exact match, subset skip, superset interrupt)
+--- that guards against Noesis binding-pass instability.
+--- @param handlerState table  Must have .lastTooltipSpeech field.
+--- @param tooltipSpeech string|nil  Formatted speech text to speak.
+--- @param shouldDisableInterrupt boolean|nil  True to suppress superset
+---     interrupt (e.g., equipment slot append where the handler's name
+---     speech must not be cut).
+--- @param logPrefix string|nil  Log tag.  Default "TOOLTIP".
+local function SpeakTooltipWithDedup(handlerState, tooltipSpeech,
+        shouldDisableInterrupt, logPrefix)
     if not tooltipSpeech or tooltipSpeech == "" then return end
 
-    local lastSpeech = stateHolder.lastTooltipSpeech
+    local lastSpeech = handlerState.lastTooltipSpeech
     if tooltipSpeech == lastSpeech then return end
 
     -- Subset: new wave shrank as TextBlocks disappeared between Noesis
@@ -1965,20 +1923,18 @@ local function ProcessTooltip(snapshot, config)
     -- version so the user doesn't hear partial info repeated.
     local shouldInterrupt = lastSpeech ~= nil
         and tooltipSpeech:find(lastSpeech, 1, true) ~= nil
-    if shouldInterrupt and config.shouldDisableInterrupt
-        and config.shouldDisableInterrupt() then
+    if shouldInterrupt and shouldDisableInterrupt then
         shouldInterrupt = false
     end
 
-    stateHolder.lastTooltipSpeech = tooltipSpeech
-    local logPrefix = config.logPrefix or "TOOLTIP"
-    Log.Info(logPrefix .. ": " .. tooltipSpeech)
+    handlerState.lastTooltipSpeech = tooltipSpeech
+    Log.Info((logPrefix or "TOOLTIP") .. ": " .. tooltipSpeech)
     Ext.Tolk.Speak(tooltipSpeech, shouldInterrupt)
 end
 
 --- FormatItemTooltip: structured tooltip for inventory items (ls.VMItem).
 --- Classifies each tooltip text into semantic fields.  Diff against the
---- handler's SpeechData (in ProcessTooltip) removes duplicates.
+--- handler's spokenFields cross-off removes duplicates.
 --- @param tooltipTexts table  Raw tooltip text array from C++.
 --- @return table|nil  SpeechData object, or nil if empty.
 local function FormatItemTooltip(tooltipTexts)
@@ -2113,7 +2069,7 @@ BG3Access.Client.Helpers = {
     FormatAbilityTooltip         = FormatAbilityTooltip,
     FormatCombatStatTooltip      = FormatCombatStatTooltip,
     FormatItemTooltip            = FormatItemTooltip,
-    ProcessTooltip               = ProcessTooltip,
+    SpeakTooltipWithDedup        = SpeakTooltipWithDedup,
     SetHintsEnabled              = SetHintsEnabled,
     GetHintsEnabled              = GetHintsEnabled,
 }

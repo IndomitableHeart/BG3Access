@@ -47,15 +47,15 @@ local DEFAULT_PANEL_HINT = false
 
 local tooltipSuppressed      = false  -- handlers set true to suppress speech
 local tooltipEnabled         = true   -- future settings toggle
--- Dedup state passed to Helpers.ProcessTooltip.  Its .lastTooltipSpeech
+-- Dedup state for radial fallback tooltip path.  Its .lastTooltipSpeech
 -- field holds the last spoken tooltip string for subset / superset
--- collapsing across tooltip waves.  Mutated by Helpers.ProcessTooltip.
+-- collapsing across tooltip waves.  Mutated by DispatchTooltip fallback.
 local tooltipState           = {lastTooltipSpeech = nil}
 local lastSpokenRadialTitle  = nil    -- title filter: prevent tooltip re-speaking title (inspect pipeline)
 local lastRawTooltipTexts    = nil    -- full raw texts for inspect readback
 local lastRadialSpeechData   = nil    -- SpeechData from radial slot speech (for tooltip diff)
 
--- Forward declarations: panel handler state needed by ProcessTooltip.
+-- Forward declarations: panel handler state needed by DispatchTooltip.
 -- These are set by HandlePanelWidgetAdded / RoutePanelSnapshot (defined later).
 local activePanelHandler     = nil
 local lastFocusedDCType      = nil
@@ -450,7 +450,7 @@ end
 --- SpeakRadialSlot: speak the slot title and API description.
 --- Combat stats (dice, range, cost) come from the C++ tooltip scanner
 --- which reads them from the popup TextBlocks -- no Lua API duplication.
---- Builds SpeechData so ProcessTooltip can diff against it.
+--- Builds SpeechData so the tooltip handler can diff against it.
 --- @param slotData table  From GatherRadialSlotData.
 local function SpeakRadialSlot(slotData)
     local cleanTitle = Helpers.StripMarkupTags(slotData.title)
@@ -486,7 +486,7 @@ local function SpeakRadialSlot(slotData)
     end
 
     -- Store for tooltip diff (radial isn't a panel handler, so
-    -- ProcessTooltip checks this as fallback).
+    -- DispatchTooltip checks this as radial fallback).
     lastRadialSpeechData = speechData
 
     local fullText = speechData:Format()
@@ -548,48 +548,48 @@ end
 -- Tooltip handler
 -- ============================================================================
 
---- ProcessTooltip: thin wrapper around Helpers.ProcessTooltip.
---- Handles WorldUI-specific concerns (suppression flag, raw-text
---- retention for inspect readback), then hands off to the shared
---- dispatch core for formatter selection, handler-SpeechData diff,
---- subset/superset collapsing, and speech.
---- @param snapshot table  The full TickSnapshot from C++.
-local function ProcessTooltip(snapshot)
-    if tooltipSuppressed or not tooltipEnabled then
-        -- Still clear dedup on focus change so re-entering a suppressed
-        -- element doesn't carry stale state into a later un-suppressed
-        -- visit.
-        if snapshot.focusChanged or snapshot.selectionChanged then
-            tooltipState.lastTooltipSpeech = nil
+--- DispatchTooltip: routes hub-formatted tooltip SpeechData to the
+--- active panel handler.  Handles WorldUI-specific suppression, raw-text
+--- retention for inspect readback, and dedup reset on navigation.
+--- The handler owns all speech decisions via HandleTooltip.
+--- @param defaultTooltipData table|nil  SpeechData from FormatFullTooltip
+---     (nil on focus-only ticks with no tooltip data).
+--- @param snapshot table  The full TickSnapshot (for change flags and
+---     raw texts).
+local function DispatchTooltip(defaultTooltipData, snapshot)
+    -- Reset dedup on navigation (even when suppressed, so re-entering
+    -- a suppressed element doesn't carry stale state).
+    if snapshot.focusChanged or snapshot.selectionChanged then
+        if activePanelHandler and activePanelHandler.ResetTooltipDedup then
+            activePanelHandler.ResetTooltipDedup()
         end
-        return
+        -- Also clear radial fallback dedup.
+        tooltipState.lastTooltipSpeech = nil
     end
 
-    -- Store the full raw texts for inspect readback (right stick).
-    if snapshot.tooltipChanged and snapshot.tooltipTexts then
+    if tooltipSuppressed or not tooltipEnabled then return end
+    if not defaultTooltipData then return end
+
+    -- Store raw texts for inspect readback (right stick).
+    if snapshot.tooltipTexts then
         lastRawTooltipTexts = snapshot.tooltipTexts
     end
 
-    Helpers.ProcessTooltip(snapshot, {
-        stateHolder = tooltipState,
-        focusedDCType = lastFocusedDCType,
-        customTooltipFn = activePanelHandler
-            and activePanelHandler.customTooltipFn or nil,
-        defaultMinimal = true,
-        getHandlerSpeechData = function()
-            -- Panel handlers store SpeechData via GetLastSpeechData;
-            -- the radial (not a panel handler) stores it in
-            -- lastRadialSpeechData.
-            if activePanelHandler
-                and activePanelHandler.GetLastSpeechData then
-                local handlerData = activePanelHandler.GetLastSpeechData()
-                if handlerData then return handlerData end
-            end
-            return lastRadialSpeechData
-        end,
-        shouldDisableInterrupt = CharSheet.ShouldAppendEquipmentTooltip,
-        logPrefix = "TOOLTIP",
-    })
+    -- Dispatch to active panel handler.
+    if activePanelHandler and activePanelHandler.HandleTooltip then
+        activePanelHandler.HandleTooltip(
+            defaultTooltipData, snapshot.tooltipTexts, lastFocusedDCType)
+        return
+    end
+
+    -- Radial fallback: no panel handler active, diff against radial
+    -- SpeechData and speak directly.  Use "brief" verbosity for radial
+    -- context (damage/cost only, matching old minimal behavior).
+    if lastRadialSpeechData then
+        defaultTooltipData = defaultTooltipData:Diff(lastRadialSpeechData)
+    end
+    local tooltipSpeech = defaultTooltipData:Format("brief")
+    Helpers.SpeakTooltipWithDedup(tooltipState, tooltipSpeech)
 end
 
 --- HandleInspectNav: called by EventRouter when d-pad moves focus between
@@ -755,8 +755,11 @@ local function CreatePanelHandler(config)
         lastSpokenFullText   = nil,
         lastSpokenTab        = nil,
         lastSpokenTitle      = nil,
-        lastSpeechData       = nil,   -- SpeechData from last handler speech (for tooltip diff)
+        lastSpeechData       = nil,   -- SpeechData from last handler speech
         lastFocusedData      = nil,   -- last focusedElement data table (for detail view)
+        lastTooltipSpeech    = nil,   -- tooltip dedup (for SpeakTooltipWithDedup)
+        spokenFields         = {},    -- set of field names spoken (for tooltip cross-off)
+        spokenValues         = {},    -- set of spoken values (for carousel dedup)
         tabHintSpoken        = false,
         screenEntryJustSpoke = false,
         -- Optional: set by onWidgetAdded hooks for overrides.
@@ -768,6 +771,23 @@ local function CreatePanelHandler(config)
         -- shared "best" event picked by the router.
         pendingWidgetEvent   = nil,
     }
+
+    -- -----------------------------------------------------------------
+    -- RecordSpokenFields: populate spokenFields and spokenValues from
+    -- a SpeechData's fields so tooltip cross-off and carousel dedup
+    -- can reference what was already spoken.
+    -- -----------------------------------------------------------------
+    local function RecordSpokenFields(speechData)
+        handlerState.spokenFields = {}
+        handlerState.spokenValues = {}
+        for _, field in ipairs(speechData.fields) do
+            handlerState.spokenFields[field.name] = true
+            if field.value and field.value ~= "" then
+                handlerState.spokenValues[
+                    Helpers.NormalizeForCompare(field.value)] = true
+            end
+        end
+    end
 
     -- -----------------------------------------------------------------
     -- HandleSnapshot: generic panel processing pipeline.
@@ -854,9 +874,11 @@ local function CreatePanelHandler(config)
         -- =============================================================
         if isCarouselOnly then
             local carouselValue = snapshot.inlineCarouselValue
-            if carouselValue ~= handlerState.lastSpokenFullText then
+            if carouselValue ~= handlerState.lastSpokenFullText
+                and not handlerState.spokenValues[
+                    Helpers.NormalizeForCompare(carouselValue)] then
                 local carouselSpeech = Helpers.CreateSpeechData()
-                carouselSpeech:Add("carouselValue", carouselValue, "brief")
+                carouselSpeech:Add("value", carouselValue, "brief")
                 carouselSpeech:Speak(handlerState, false, nil, userInitiated)
             end
             return
@@ -887,7 +909,7 @@ local function CreatePanelHandler(config)
                 if customName and customName ~= "" then
                     if customName ~= handlerState.lastSpokenFullText then
                         local valueSpeech = Helpers.CreateSpeechData()
-                        valueSpeech:Add("customValue", customName, "brief")
+                        valueSpeech:Add("value", customName, "brief")
                         valueSpeech:Speak(handlerState, false, nil,
                             userInitiated)
                     end
@@ -1032,7 +1054,7 @@ local function CreatePanelHandler(config)
                     and (bodyAssembled .. ". " .. statusText) or statusText
             end
             if bodyAssembled then
-                speechData:Add("body", bodyAssembled, "normal")
+                speechData:Add("description", bodyAssembled, "normal")
             end
             if widgetActions then
                 speechData:Add("actions", widgetActions, "normal")
@@ -1101,10 +1123,12 @@ local function CreatePanelHandler(config)
                     merged:Add(field.name, field.value, field.tier)
                 end
                 handlerState.lastSpeechData = merged
+                RecordSpokenFields(merged)
                 merged:Speak(handlerState, isScreenEntry, nil,
                     userInitiated)
             else
                 handlerState.lastSpeechData = customSpeechData
+                RecordSpokenFields(customSpeechData)
                 customSpeechData:Speak(handlerState, isScreenEntry, nil,
                     userInitiated)
             end
@@ -1164,14 +1188,16 @@ local function CreatePanelHandler(config)
                     or ""))
         end
 
-        speechData:Add("itemName", itemName, "brief")
-        speechData:Add("itemInfo", itemInfo, "normal")
-        speechData:Add("itemValue", itemValue, "brief")
-        speechData:Add("itemDesc", itemDesc, "verbose")
+        speechData:Add("name", itemName, "brief")
+        speechData:Add("info", itemInfo, "normal")
+        speechData:Add("value", itemValue, "brief")
+        speechData:Add("description", itemDesc, "verbose")
 
         -- Cache focused element data for detail view (RS Left).
         handlerState.lastFocusedData = focusedElement
         handlerState.lastSpeechData = speechData
+        -- Record which fields we spoke (for tooltip cross-off).
+        RecordSpokenFields(speechData)
         speechData:Speak(handlerState, isScreenEntry, nil, userInitiated)
     end
 
@@ -1243,6 +1269,48 @@ local function CreatePanelHandler(config)
             return handlerState.lastFocusedData
         end,
         BuildDetailList   = config.buildDetailList,
+        --- HandleTooltip: receive hub-formatted tooltip SpeechData,
+        --- skip fields the handler already spoke, optionally re-format
+        --- via customTooltipFn, then speak with dedup.
+        --- @param defaultTooltipData table  SpeechData from FormatFullTooltip.
+        --- @param rawTexts table  Raw tooltip text array (for customTooltipFn).
+        --- @param focusedDCType string|nil  DC type of focused element.
+        HandleTooltip = function(defaultTooltipData, rawTexts, focusedDCType)
+            -- Step 1: Specialized formatter override (customTooltipFn).
+            local tooltipData = defaultTooltipData
+            if config.customTooltipFn then
+                local customResult = config.customTooltipFn(
+                    rawTexts, focusedDCType)
+                if customResult == "" then return end
+                if customResult then tooltipData = customResult end
+            end
+            if not tooltipData then return end
+
+            -- Step 2: Skip fields the handler already spoke.
+            local filtered = Helpers.CreateSpeechData()
+            for _, field in ipairs(tooltipData.fields) do
+                if not handlerState.spokenFields[field.name] then
+                    filtered:Add(field.name, field.value, field.tier)
+                end
+            end
+            if tooltipData.skipDiff then
+                filtered.skipDiff = true
+            end
+            tooltipData = filtered
+
+            -- Step 3: Format and speak.  Default "verbose" matches old
+            -- ProcessTooltip behavior (all fields).  Handlers override
+            -- via config.tooltipVerbosity for brief/normal modes.
+            local tooltipSpeech = tooltipData:Format(
+                config.tooltipVerbosity or "verbose")
+            local disableInterrupt = config.shouldDisableInterrupt
+                and config.shouldDisableInterrupt()
+            Helpers.SpeakTooltipWithDedup(
+                handlerState, tooltipSpeech, disableInterrupt)
+        end,
+        ResetTooltipDedup = function()
+            handlerState.lastTooltipSpeech = nil
+        end,
     }
 end
 
@@ -1669,7 +1737,7 @@ local ActiveRollHandler = CreatePanelHandler({
 
             if #parts > 0 then
                 local itemSpeech = Helpers.CreateSpeechData()
-                itemSpeech:Add("itemName",
+                itemSpeech:Add("name",
                     table.concat(parts, " "), "brief")
                 return itemSpeech
             end
@@ -1694,7 +1762,7 @@ local ActiveRollHandler = CreatePanelHandler({
                     and not description:match("^h%x+g") then
                     advantageText = advantageType .. ": " .. description
                 end
-                itemSpeech:Add("itemName", advantageText, "brief")
+                itemSpeech:Add("name", advantageText, "brief")
                 return itemSpeech
             end
         end
@@ -1705,7 +1773,7 @@ local ActiveRollHandler = CreatePanelHandler({
             if name and name ~= ""
                 and not name:match("^h%x+g") then
                 local itemSpeech = Helpers.CreateSpeechData()
-                itemSpeech:Add("itemName", name, "brief")
+                itemSpeech:Add("name", name, "brief")
                 return itemSpeech
             end
         end
@@ -1716,7 +1784,7 @@ local ActiveRollHandler = CreatePanelHandler({
             if name and name ~= ""
                 and not name:match("^h%x+g") then
                 local itemSpeech = Helpers.CreateSpeechData()
-                itemSpeech:Add("itemName", name, "brief")
+                itemSpeech:Add("name", name, "brief")
                 return itemSpeech
             end
         end
@@ -2060,13 +2128,13 @@ local SelectionFlyOutHandler = CreatePanelHandler({
                 focusedElement, handlerState.lastSpokenTab, isScreenEntry)
         end
         if itemName and itemName ~= "" then
-            speechData:Add("itemName", itemName, "brief")
+            speechData:Add("name", itemName, "brief")
         end
         if itemValue and itemValue ~= "" then
-            speechData:Add("itemValue", itemValue, "brief")
+            speechData:Add("value", itemValue, "brief")
         end
         if itemDesc and itemDesc ~= "" then
-            speechData:Add("itemDesc", itemDesc, "verbose")
+            speechData:Add("description", itemDesc, "verbose")
         end
 
         -- Hint AFTER item name (first visit only).
@@ -2698,7 +2766,7 @@ local ALL_PANEL_HANDLERS = {
 -- ============================================================================
 
 -- activePanelHandler and lastFocusedDCType are forward-declared near
--- the top of this file (before ProcessTooltip) so that ProcessTooltip's
+-- the top of this file (before DispatchTooltip) so that DispatchTooltip's
 -- closure captures the same locals that the routing functions set.
 
 -- Previous handler: saved when an overlay panel (Container, etc.)
@@ -3114,7 +3182,7 @@ BG3Access.Client.WorldUI = {
     ResetAllPanelHandlers      = ResetAllPanelHandlers,
     GetActivePanelHandler      = GetActivePanelHandler,
     -- Tooltip
-    ProcessTooltip             = ProcessTooltip,
+    DispatchTooltip            = DispatchTooltip,
     SpeakInspectData           = SpeakInspectData,
     HandleInspectNav           = HandleInspectNav,
     SetTooltipSuppressed       = SetTooltipSuppressed,

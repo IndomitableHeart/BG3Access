@@ -351,8 +351,7 @@ local ccState = {
     -- Suppresses INPC follow-up after standalone carousel already spoke
     -- name + description for the same item.
     lastStandaloneCarouselValue = nil,
-    lastHandlerSpeechData       = nil,
-    -- CC tooltip dedup field.  Helpers.ProcessTooltip mutates this to
+    -- CC tooltip dedup field.  DispatchTooltip routes via this to
     -- collapse subset / superset waves.  Isolated from WorldUI's
     -- tooltipState holder because the two contexts don't share namespace
     -- and must reset independently on CC enter / exit.
@@ -1050,63 +1049,14 @@ local function GetCCItemData(focusedElement, snapshot, tabName,
             end
         end
 
-        -- B. Feature/passive API.  Some features have sparse tooltips
-        -- (Darkvision: just name + range) so the description must
-        -- come from the API.  For features with rich tooltips
-        -- (Perception: description + ability + modifier), the exact-
-        -- match Diff in ProcessTooltip strips duplicates.
-        if not itemDescription and focusedElement.dcType
-            and CC_FEATURE_DC_TYPES[focusedElement.dcType] then
-            local featureSuccess, featureDescription = pcall(
-                Helpers.LookupFeatureDescription, itemName)
-            if featureSuccess and featureDescription then
-                itemDescription =
-                    Helpers.StripMarkupTags(featureDescription)
-            end
-        end
-
-        -- C. Spell API.
-        if not itemDescription and itemName
-            and focusedElement.elemType
-            and (focusedElement.elemType:find("LSButton", 1, true)
-                or focusedElement.elemType:find("spellButton", 1, true))
-            and itemName ~= "spell" then
-            local spellSuccess, spellDescription = pcall(
-                Helpers.LookupSpellDescription, itemName)
-            if spellSuccess and spellDescription then
-                itemDescription =
-                    Helpers.StripMarkupTags(spellDescription)
-            end
-        end
-
-        -- D. Last resort: dcProps.Description (focused or selected).
-        -- For features/spells not found in the API (modded content).
-        if not itemDescription then
-            local rawDescription = nil
-            if dcProps then
-                rawDescription = dcProps.Description
-            end
-            if not rawDescription and snapshot.selectedElement
-                and snapshot.selectedElement.dcProps then
-                rawDescription =
-                    snapshot.selectedElement.dcProps.Description
-            end
-            if type(rawDescription) == "table" then
-                rawDescription = rawDescription.Text
-                    or rawDescription.Str
-                    or rawDescription.Description
-            end
-            if type(rawDescription) == "string"
-                and rawDescription ~= "" then
-                rawDescription = Helpers.StripMarkupTags(rawDescription)
-                if rawDescription:find("%[%d+%]") then
-                    rawDescription =
-                        Helpers.ResolveDescriptionParams(
-                            rawDescription, nil)
-                end
-                itemDescription = rawDescription
-            end
-        end
+        -- Sub-item descriptions (features, spells, skills, passives)
+        -- come from the TOOLTIP, not the handler.  The C++ tooltip
+        -- extraction reads CtxTransStringRunGeneratorBehavior-populated
+        -- TextBlocks (including nested Spans with ls:LSRun parameters),
+        -- producing unit-converted, fully-resolved text that matches
+        -- what the sighted user sees.  The API descriptions were
+        -- previously used as a workaround but have wrong units (metric
+        -- regardless of user settings) and unresolved [N] params.
     end
 
     return itemName, itemValue, itemDescription
@@ -1615,7 +1565,6 @@ local function ResetCCState()
     ccState.introAwaitingContinue = false
     ccState.customBackstoryText = nil
     ccState.lastStandaloneCarouselValue = nil
-    ccState.lastHandlerSpeechData = nil
     ccState.lastTooltipSpeech = nil
     ccState.awaitingPostCutsceneNav = false
     ccState.postCutsceneHintSpoken = false
@@ -1660,6 +1609,9 @@ local function CreateCCPageHandler(config)
         lastSpokenItemName   = nil,
         lastSpokenTitle      = nil,
         lastCarouselTick     = nil,
+        lastTooltipSpeech    = nil,   -- tooltip dedup (for SpeakTooltipWithDedup)
+        spokenFields         = {},    -- set of field names spoken (for tooltip cross-off)
+        spokenValues         = {},    -- set of NormalizeForCompare'd values spoken (carousel dedup)
         tabHintsSpoken       = {},   -- keyed by tab name
         screenEntryJustSpoke = false,
         -- True after the "You acquire the following..." section label
@@ -1691,6 +1643,20 @@ local function CreateCCPageHandler(config)
         end
         if config.hint ~= nil then return config.hint end
         return CC_TAB_HINTS[tabName]
+    end
+
+    -- Record which fields AND values we spoke (for tooltip cross-off
+    -- and carousel dedup).
+    local function RecordSpokenFields(speechData)
+        handlerState.spokenFields = {}
+        handlerState.spokenValues = {}
+        for _, field in ipairs(speechData.fields) do
+            handlerState.spokenFields[field.name] = true
+            if field.value and field.value ~= "" then
+                handlerState.spokenValues[
+                    Helpers.NormalizeForCompare(field.value)] = true
+            end
+        end
     end
 
     -- ---------------------------------------------------------------
@@ -1770,13 +1736,15 @@ local function CreateCCPageHandler(config)
                     carouselDescription = carouselDesc
                 end
             end
-            if carouselValue ~= handlerState.lastSpokenFullText then
+            if carouselValue ~= handlerState.lastSpokenFullText
+                and not handlerState.spokenValues[
+                    Helpers.NormalizeForCompare(carouselValue)] then
                 handlerState.lastSpokenName = elemId
                 handlerState.lastCarouselTick = Ext.Utils.MonotonicTime()
                 local carouselSpeech = Helpers.CreateSpeechData()
-                carouselSpeech:Add("carouselValue", carouselValue, "brief")
+                carouselSpeech:Add("value", carouselValue, "brief")
                 if carouselDescription then
-                    carouselSpeech:Add("carouselDesc",
+                    carouselSpeech:Add("description",
                         carouselDescription, "normal")
                 end
                 local carouselFormatted = carouselSpeech:Format()
@@ -1843,20 +1811,20 @@ local function CreateCCPageHandler(config)
                 and itemValue and itemValue ~= "" then
                 -- Sliders: speak only the number; the name was just
                 -- spoken on the initial focus arrival.
-                valueSpeech:Add("itemValue", itemValue, "brief")
+                valueSpeech:Add("value", itemValue, "brief")
             else
                 if itemName and itemName ~= "" then
-                    valueSpeech:Add("itemName",
+                    valueSpeech:Add("name",
                         Helpers.StripMarkupTags(
                             itemName:gsub("%s+$", "")), "brief")
                 end
                 if itemValue and itemValue ~= "" then
-                    valueSpeech:Add("itemValue",
+                    valueSpeech:Add("value",
                         Helpers.StripMarkupTags(
                             itemValue:gsub("%s+$", "")), "brief")
                 end
                 if itemDescription and itemDescription ~= "" then
-                    valueSpeech:Add("itemDesc",
+                    valueSpeech:Add("description",
                         Helpers.StripMarkupTags(
                             itemDescription:gsub("%s+$", "")), "verbose")
                 end
@@ -1931,7 +1899,7 @@ local function CreateCCPageHandler(config)
                 local extraBody = config.screenBodyFn(
                     focusedElement, tabName, handlerState, snapshot)
                 if extraBody and extraBody ~= "" then
-                    speechData:Add("body", extraBody, "normal")
+                    speechData:Add("description", extraBody, "normal")
                 end
             end
         end
@@ -2118,7 +2086,7 @@ local function CreateCCPageHandler(config)
             handlerState.lastSpokenName = elemId
             handlerState.lastSpokenItemName = itemName
             local cycleSpeech = Helpers.CreateSpeechData()
-            cycleSpeech:Add("cycleValue", itemValue, "brief")
+            cycleSpeech:Add("value", itemValue, "brief")
             Log.Info("VALUE CYCLE [" .. config.name .. "]: " .. itemValue)
             Ext.Tolk.Speak(cycleSpeech:Format(), true)
             return
@@ -2148,6 +2116,8 @@ local function CreateCCPageHandler(config)
             handlerState.lastSpokenItemName = itemName
             handlerState.lastSpokenName = elemId
             handlerState.lastSpokenFullText = itemName
+            -- Store at ccState level for tooltip title filtering.
+            ccState.lastSpokenItemName = itemName
             Log.Info("ITEM [" .. config.name .. "]: "
                 .. tostring(focusedElement.elemType)
                 .. "  name=" .. itemName
@@ -2157,9 +2127,9 @@ local function CreateCCPageHandler(config)
                         .. tostring(itemDescription):sub(1, 40))
                     or ""))
         end
-        speechData:Add("itemName", itemName, "brief")
-        speechData:Add("itemValue", itemValue, "brief")
-        speechData:Add("itemDesc", itemDescription, "verbose")
+        speechData:Add("name", itemName, "brief")
+        speechData:Add("value", itemValue, "brief")
+        speechData:Add("description", itemDescription, "verbose")
 
         if not itemName and not itemValue and not itemDescription then
             Log.Info("SILENT ELEMENT [" .. config.name .. "]: elemId="
@@ -2186,8 +2156,9 @@ local function CreateCCPageHandler(config)
             return
         end
 
-        -- Store for tooltip exact-match Diff.
-        ccState.lastHandlerSpeechData = speechData
+        -- Record which fields/values we spoke (for tooltip cross-off
+        -- and carousel dedup).
+        RecordSpokenFields(speechData)
         speechData:Speak(ccState, isScreenEntry, nil, userInitiated)
     end
 
@@ -2217,6 +2188,25 @@ local function CreateCCPageHandler(config)
         HandleSnapshot     = HandleSnapshot,
         ResetNavigation    = ResetNavigation,
         ResetState         = ResetState,
+        --- HandleTooltip: receive hub-formatted tooltip SpeechData,
+        --- skip fields the handler already spoke, then speak with dedup.
+        HandleTooltip = function(defaultTooltipData, rawTexts)
+            if not defaultTooltipData then return end
+            -- Skip fields the handler already spoke.
+            local filtered = Helpers.CreateSpeechData()
+            for _, field in ipairs(defaultTooltipData.fields) do
+                if not handlerState.spokenFields[field.name] then
+                    filtered:Add(field.name, field.value, field.tier)
+                end
+            end
+            local tooltipSpeech = filtered:Format(
+                config.tooltipVerbosity or "verbose")
+            Helpers.SpeakTooltipWithDedup(
+                handlerState, tooltipSpeech, false, "CC TOOLTIP")
+        end,
+        ResetTooltipDedup = function()
+            handlerState.lastTooltipSpeech = nil
+        end,
     }
 end
 
@@ -2519,9 +2509,9 @@ local function HandleCCSnapshot(snapshot)
                 end
             end
             local carouselSpeech = Helpers.CreateSpeechData()
-            carouselSpeech:Add("carouselValue", carouselValue, "brief")
+            carouselSpeech:Add("value", carouselValue, "brief")
             if carouselDescription and carouselDescription ~= "" then
-                carouselSpeech:Add("carouselDesc",
+                carouselSpeech:Add("description",
                     carouselDescription, "normal")
             end
             local carouselFormatted = carouselSpeech:Format()
@@ -2689,26 +2679,33 @@ local function IsInCC()
     return ccState.inCharacterCreation
 end
 
---- ProcessTooltip: thin wrapper around Helpers.ProcessTooltip.  CC
---- routes here (via EventRouter) instead of WorldUI.ProcessTooltip
---- because CC tooltips need full-detail text (skill / feature / passive
---- descriptions).  The only CC-specific concern is the "not in CC"
---- early exit; all dedup, diff, subset/superset, and speech is handled
---- Two-event pattern: handler speaks immediately (name + value +
---- API description), tooltip follows when ready with supplementary
---- detail.  Exact-match Diff strips fields the handler already
---- spoke (typically just the item name).  No buffering, no latency.
---- @param snapshot table  The full TickSnapshot from C++.
-local function ProcessTooltip(snapshot)
+--- DispatchTooltip: routes hub-formatted tooltip SpeechData to the
+--- active CC page handler.  The handler owns all speech decisions
+--- via HandleTooltip (field cross-off by spokenFields, verbosity).
+--- No pre-filtering of raw texts needed -- the handler skips fields
+--- it already spoke by checking spokenFields.
+--- @param defaultTooltipData table|nil  SpeechData from FormatFullTooltip
+---     (nil on focus-only ticks with no tooltip data).
+--- @param snapshot table  The full TickSnapshot (for change flags).
+local function DispatchTooltip(defaultTooltipData, snapshot)
     if not ccState.inCharacterCreation then return end
-    Helpers.ProcessTooltip(snapshot, {
-        stateHolder = ccState,
-        defaultMinimal = false,
-        getHandlerSpeechData = function()
-            return ccState.lastHandlerSpeechData
-        end,
-        logPrefix = "CC TOOLTIP",
-    })
+
+    -- Reset dedup on navigation.
+    if snapshot.focusChanged or snapshot.selectionChanged then
+        if ccState.activePageHandler
+            and ccState.activePageHandler.ResetTooltipDedup then
+            ccState.activePageHandler.ResetTooltipDedup()
+        end
+    end
+
+    if not defaultTooltipData then return end
+
+    -- Dispatch to active page handler.
+    if ccState.activePageHandler
+        and ccState.activePageHandler.HandleTooltip then
+        ccState.activePageHandler.HandleTooltip(
+            defaultTooltipData, snapshot.tooltipTexts)
+    end
 end
 
 --- MarkMidSessionReload: called by EventRouter at startup when it
@@ -2797,7 +2794,7 @@ BG3Access.Client.CC = {
     IsCCSnapshot         = IsCCSnapshot,
     HandleCCSnapshot     = HandleCCSnapshot,
     HandleWidgetAdded    = HandleWidgetAdded,
-    ProcessTooltip       = ProcessTooltip,
+    DispatchTooltip      = DispatchTooltip,
     MarkMidSessionReload = MarkMidSessionReload,
     GetSectionLabel      = GetSectionLabel,
     GetBodyTypeName      = GetBodyTypeName,
