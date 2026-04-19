@@ -7,6 +7,8 @@ pcall(Ext.Require, "Client/DevConfig.lua")  -- DEV-ONLY: strip on release
 BG3Access.Shared.RequireFiles("Client/", {
 "Logger",
 "Helpers",
+"ColorDescriptions",
+"DetailView",
 "CharCreation",
 "Cutscene",
 "CharSheet",

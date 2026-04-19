@@ -72,160 +72,16 @@ local function SetTooltipEnabled(enabled)
 end
 
 -- ============================================================================
--- Detail view state (RS Left virtual property list)
--- ============================================================================
+-- Detail view: shared module (Client/DetailView.lua).
+-- WorldUI delegates to it via HandleDetailViewToggle / CloseDetailView.
+local DetailView = BG3Access.Client.DetailView
 
-local detailViewOpen                = false  -- true while navigating detail list
-local detailViewList                = nil    -- array of {label, value} entries
-local detailViewIndex               = 1     -- 1-based current position
-local detailViewButtonSubscription  = nil   -- ControllerButtonInput handle
-
---- SpeakDetailItem: speak the current detail list entry.
-local function SpeakDetailItem()
-    if not detailViewList or not detailViewList[detailViewIndex] then return end
-    local entry = detailViewList[detailViewIndex]
-    local speechData = Helpers.CreateSpeechData()
-    speechData:Add("detailLabel", entry.label, "brief")
-    speechData:Add("detailValue", entry.value, "brief")
-    local speech = speechData:Format()
-    if not speech then return end
-    Log.Info("DETAIL [" .. detailViewIndex .. "/" .. #detailViewList
-        .. "]: " .. speech)
-    Ext.Tolk.Speak(speech, true)
-end
-
---- DetailViewNext: advance to next entry (wraps around).
-local function DetailViewNext()
-    if not detailViewList or #detailViewList == 0 then return end
-    detailViewIndex = (detailViewIndex % #detailViewList) + 1
-    SpeakDetailItem()
-end
-
---- DetailViewPrevious: go to previous entry (wraps around).
-local function DetailViewPrevious()
-    if not detailViewList or #detailViewList == 0 then return end
-    detailViewIndex = ((detailViewIndex - 2) % #detailViewList) + 1
-    SpeakDetailItem()
-end
-
---- CloseDetailView: tear down the detail view and unsubscribe input.
---- @param silent boolean|nil  If true, skip the "closed" announcement.
-local function CloseDetailView(silent)
-    if not detailViewOpen then return end
-    if detailViewButtonSubscription then
-        Ext.Events.ControllerButtonInput:Unsubscribe(
-            detailViewButtonSubscription)
-        detailViewButtonSubscription = nil
-    end
-    detailViewOpen = false
-    detailViewList = nil
-    detailViewIndex = 1
-    if not silent then
-        Log.Info("DETAIL VIEW: closed")
-        local speechData = Helpers.CreateSpeechData()
-        speechData:Add("detailStatus", "Detail view closed", "brief")
-        Ext.Tolk.Speak(speechData:Format(), true)
-    else
-        Log.Info("DETAIL VIEW: closed (silent)")
-    end
-end
-
---- HandleDetailViewToggle: open or close the detail view.
---- Called by WorldNav when RS Left is detected.
---- Returns true if handled (caller should not fall through to "Reserved"),
---- false if not handled (no panel active, caller speaks "Reserved").
---- @return boolean
 local function HandleDetailViewToggle()
-    -- Toggle: if already open, close it.  Always handled.
-    if detailViewOpen then
-        CloseDetailView()
-        return true
-    end
+    return DetailView.Toggle(activePanelHandler, lastRawTooltipTexts)
+end
 
-    -- Concrete panel-alive check: if nothing has UI focus, no panel is
-    -- open (user pressed B and returned to the world).  This is a fresh
-    -- C++ read, not cached state -- avoids stale activePanelHandler.
-    local focusCheckOk, focusedElement = pcall(Ext.UI.GetFocusedElement)
-    if not focusCheckOk or not focusedElement then
-        return false
-    end
-
-    -- Need an active panel handler with BuildDetailList.
-    if not activePanelHandler or not activePanelHandler.BuildDetailList then
-        return false  -- not handled: no panel, let caller say "Reserved"
-    end
-
-    -- Get the cached focused element data from the handler.
-    local focusedData = nil
-    if activePanelHandler.GetLastFocusedData then
-        focusedData = activePanelHandler.GetLastFocusedData()
-    end
-    if not focusedData then
-        return false
-    end
-
-    -- Build the detail list from the handler.  Pass cached tooltip
-    -- texts so consumable/spell items can include healing, damage,
-    -- roll, and action cost data from the tooltip pipeline.
-    local buildOk, builtList = pcall(
-        activePanelHandler.BuildDetailList, focusedData,
-        lastRawTooltipTexts)
-    if not buildOk then
-        Log.Error("BuildDetailList: " .. tostring(builtList))
-        return false
-    end
-    if not builtList or #builtList == 0 then
-        local noDetailsSpeech = Helpers.CreateSpeechData()
-        noDetailsSpeech:Add("detailStatus", "No details available", "brief")
-        Ext.Tolk.Speak(noDetailsSpeech:Format(), true)
-        return true  -- handled: panel is active, just no details for this element
-    end
-
-    -- Open the detail view.
-    detailViewOpen = true
-    detailViewList = builtList
-    detailViewIndex = 1
-
-    -- Subscribe d-pad input for navigation.
-    -- Intercept all 4 d-pad directions: up/down navigate the list,
-    -- left/right are blocked to prevent accidental tab switches.
-    detailViewButtonSubscription =
-        Ext.Events.ControllerButtonInput:Subscribe(function(event)
-            if not event.Pressed then return end
-            local buttonName = tostring(event.Button)
-            if buttonName == "DPadDown" then
-                event:PreventAction()
-                DetailViewNext()
-            elseif buttonName == "DPadUp" then
-                event:PreventAction()
-                DetailViewPrevious()
-            elseif buttonName == "DPadLeft"
-                or buttonName == "DPadRight" then
-                -- Block left/right to prevent tab switches while
-                -- detail view is open.
-                event:PreventAction()
-            elseif buttonName == "LeftShoulder"
-                or buttonName == "RightShoulder" then
-                -- Block bumpers to prevent tab switches.
-                event:PreventAction()
-            elseif buttonName == "B" then
-                -- Do NOT prevent B: let it reach the game so it can
-                -- close the panel normally.  But auto-close the detail
-                -- view since the panel is going away.
-                CloseDetailView(true)
-            end
-        end)
-
-    -- Announce entry and speak first item.
-    local firstEntry = detailViewList[1]
-    local openSpeechData = Helpers.CreateSpeechData()
-    openSpeechData:Add("detailStatus", "Detail view", "brief")
-    openSpeechData:Add("detailLabel", firstEntry.label, "brief")
-    openSpeechData:Add("detailValue", firstEntry.value, "brief")
-    local openSpeech = openSpeechData:Format()
-    Log.Info("DETAIL VIEW: opened with " .. #detailViewList .. " items")
-    Ext.Tolk.Speak(openSpeech, true)
-    return true
+local function CloseDetailView(silent)
+    DetailView.Close(silent)
 end
 
 -- ============================================================================
@@ -548,15 +404,14 @@ end
 -- Tooltip handler
 -- ============================================================================
 
---- DispatchTooltip: routes hub-formatted tooltip SpeechData to the
---- active panel handler.  Handles WorldUI-specific suppression, raw-text
---- retention for inspect readback, and dedup reset on navigation.
+--- DispatchTooltip: routes structured tooltip data to the active panel
+--- handler.  Handles WorldUI-specific suppression, raw-text retention
+--- for inspect readback, and dedup reset on navigation.
 --- The handler owns all speech decisions via HandleTooltip.
---- @param defaultTooltipData table|nil  SpeechData from FormatFullTooltip
+--- @param structuredTooltipData table|nil  Array of {role, text} from C++
 ---     (nil on focus-only ticks with no tooltip data).
---- @param snapshot table  The full TickSnapshot (for change flags and
----     raw texts).
-local function DispatchTooltip(defaultTooltipData, snapshot)
+--- @param snapshot table  The full TickSnapshot (for change flags).
+local function DispatchTooltip(structuredTooltipData, snapshot)
     -- Reset dedup on navigation (even when suppressed, so re-entering
     -- a suppressed element doesn't carry stale state).
     if snapshot.focusChanged or snapshot.selectionChanged then
@@ -568,28 +423,45 @@ local function DispatchTooltip(defaultTooltipData, snapshot)
     end
 
     if tooltipSuppressed or not tooltipEnabled then return end
-    if not defaultTooltipData then return end
+    if not structuredTooltipData then return end
 
     -- Store raw texts for inspect readback (right stick).
-    if snapshot.tooltipTexts then
-        lastRawTooltipTexts = snapshot.tooltipTexts
-    end
+    lastRawTooltipTexts = structuredTooltipData
 
     -- Dispatch to active panel handler.
     if activePanelHandler and activePanelHandler.HandleTooltip then
         activePanelHandler.HandleTooltip(
-            defaultTooltipData, snapshot.tooltipTexts, lastFocusedDCType)
+            structuredTooltipData, structuredTooltipData, lastFocusedDCType)
         return
     end
 
-    -- Radial fallback: no panel handler active, diff against radial
-    -- SpeechData and speak directly.  Use "brief" verbosity for radial
+    -- Radial fallback: no panel handler active, build simple SpeechData
+    -- from roles and speak directly.  Use "brief" verbosity for radial
     -- context (damage/cost only, matching old minimal behavior).
-    if lastRadialSpeechData then
-        defaultTooltipData = defaultTooltipData:Diff(lastRadialSpeechData)
+    local fallbackSpeech = Helpers.CreateSpeechData()
+    for _, tooltipEntry in ipairs(structuredTooltipData) do
+        local role = tooltipEntry.role or ""
+        local entryText = Helpers.StripMarkupTags(tooltipEntry.text)
+        if entryText and entryText ~= "" then
+            if role == "Title" then
+                fallbackSpeech:Add("title", entryText, "brief")
+            elseif role == "PropertyText" then
+                fallbackSpeech:Add("property", entryText, "normal")
+            elseif role == "ContentText" then
+                fallbackSpeech:Add("description", entryText, "verbose")
+            end
+        end
     end
-    local tooltipSpeech = defaultTooltipData:Format("brief")
-    Helpers.SpeakTooltipWithDedup(tooltipState, tooltipSpeech)
+    if lastRadialSpeechData then
+        fallbackSpeech = fallbackSpeech:Diff(lastRadialSpeechData)
+    end
+    local tooltipSpeech = fallbackSpeech:Format("brief")
+    if tooltipSpeech and tooltipSpeech ~= ""
+        and tooltipSpeech ~= tooltipState.lastTooltipSpeech then
+        tooltipState.lastTooltipSpeech = tooltipSpeech
+        Log.Info("TOOLTIP (radial fallback): " .. tooltipSpeech)
+        Ext.Tolk.Speak(tooltipSpeech, false)
+    end
 end
 
 --- HandleInspectNav: called by EventRouter when d-pad moves focus between
@@ -689,9 +561,17 @@ local function SpeakInspectData()
     end
 
     -- Fallback: use stored tooltip texts if widget read failed.
+    -- lastRawTooltipTexts is now {role, text} tables; extract flat
+    -- text array for FormatInspectTexts which expects plain strings.
     if lastRawTooltipTexts and #lastRawTooltipTexts > 0 then
+        local flatTexts = {}
+        for _, tooltipEntry in ipairs(lastRawTooltipTexts) do
+            if tooltipEntry.text and tooltipEntry.text ~= "" then
+                flatTexts[#flatTexts + 1] = tooltipEntry.text
+            end
+        end
         local inspectData = Helpers.FormatInspectTexts(
-            lastRawTooltipTexts, lastSpokenRadialTitle)
+            flatTexts, lastSpokenRadialTitle)
         if inspectData then
             local inspectSpeech = inspectData:Format()
             if inspectSpeech then
@@ -743,8 +623,8 @@ end
 ---                                  Called with (tooltipTexts, focusedDCType).
 ---                                  Returns a SpeechData object (to speak), "" to
 ---                                  suppress, or nil to fall through to
----                                  FormatFullTooltip({minimal=true}) (the
----                                  radial/panel default).
+---                                  the default role-based SpeechData
+---                                  builder (the radial/panel default).
 ---
 --- @return table  Handler with HandleSnapshot, HandleWidgetAdded,
 ---                ResetState, ResetNavigation, ResetHint, customTooltipFn,
@@ -757,7 +637,7 @@ local function CreatePanelHandler(config)
         lastSpokenTitle      = nil,
         lastSpeechData       = nil,   -- SpeechData from last handler speech
         lastFocusedData      = nil,   -- last focusedElement data table (for detail view)
-        lastTooltipSpeech    = nil,   -- tooltip dedup (for SpeakTooltipWithDedup)
+        lastTooltipSpeech    = nil,   -- tooltip dedup (inline comparison)
         spokenFields         = {},    -- set of field names spoken (for tooltip cross-off)
         spokenValues         = {},    -- set of spoken values (for carousel dedup)
         tabHintSpoken        = false,
@@ -1269,22 +1149,20 @@ local function CreatePanelHandler(config)
             return handlerState.lastFocusedData
         end,
         BuildDetailList   = config.buildDetailList,
-        --- HandleTooltip: receive hub-formatted tooltip SpeechData,
-        --- skip fields the handler already spoke, optionally re-format
-        --- via customTooltipFn, then speak with dedup.
-        --- @param defaultTooltipData table  SpeechData from FormatFullTooltip.
-        --- @param rawTexts table  Raw tooltip text array (for customTooltipFn).
+        --- HandleTooltip: receive structured tooltip data ({role, text}
+        --- array), optionally re-format via customTooltipFn, skip
+        --- fields the handler already spoke, then speak with dedup.
+        --- @param structuredData table  Array of {role, text} from C++.
+        --- @param rawTexts table  Same structured array (for customTooltipFn).
         --- @param focusedDCType string|nil  DC type of focused element.
-        HandleTooltip = function(defaultTooltipData, rawTexts, focusedDCType)
-            -- Step 1: Specialized formatter override (customTooltipFn).
-            local tooltipData = defaultTooltipData
-            if config.customTooltipFn then
-                local customResult = config.customTooltipFn(
-                    rawTexts, focusedDCType)
-                if customResult == "" then return end
-                if customResult then tooltipData = customResult end
-            end
-            if not tooltipData then return end
+        HandleTooltip = function(structuredData, rawTexts, focusedDCType)
+            -- Each handler decides what to speak via customTooltipFn.
+            -- No customTooltipFn = no tooltip speech.
+            if not config.customTooltipFn then return end
+            local tooltipData = config.customTooltipFn(
+                rawTexts, focusedDCType)
+            if not tooltipData or tooltipData == ""
+                or #tooltipData.fields == 0 then return end
 
             -- Step 2: Skip fields the handler already spoke.
             local filtered = Helpers.CreateSpeechData()
@@ -1298,15 +1176,18 @@ local function CreatePanelHandler(config)
             end
             tooltipData = filtered
 
-            -- Step 3: Format and speak.  Default "verbose" matches old
-            -- ProcessTooltip behavior (all fields).  Handlers override
-            -- via config.tooltipVerbosity for brief/normal modes.
+            -- Step 3: Format and speak with inline dedup.
             local tooltipSpeech = tooltipData:Format(
                 config.tooltipVerbosity or "verbose")
+            if not tooltipSpeech or tooltipSpeech == "" then return end
+            if tooltipSpeech == handlerState.lastTooltipSpeech then return end
+            handlerState.lastTooltipSpeech = tooltipSpeech
             local disableInterrupt = config.shouldDisableInterrupt
                 and config.shouldDisableInterrupt()
-            Helpers.SpeakTooltipWithDedup(
-                handlerState, tooltipSpeech, disableInterrupt)
+            Log.Info("TOOLTIP: " .. tooltipSpeech)
+            -- Queue after item speech (interrupt=false).  The handler
+            -- already spoke the item name; tooltip is supplemental.
+            Ext.Tolk.Speak(tooltipSpeech, false)
         end,
         ResetTooltipDedup = function()
             handlerState.lastTooltipSpeech = nil
@@ -1416,14 +1297,43 @@ local ExamineHandler = CreatePanelHandler({
     customTooltipFn = function(tooltipTexts, focusedDCType)
         if not tooltipTexts or #tooltipTexts == 0 then return nil end
 
-        -- VMRangeStat / VMStat: use FormatStatTooltip for breakdown
-        -- and description.  No skipDiff needed -- FormatStatTooltip
-        -- only adds breakdown + description fields (no name/title),
-        -- so the Diff won't kill them.
+        -- VMRangeStat / VMStat: extract breakdown and description
+        -- from roles.  No skipDiff needed -- only adds breakdown +
+        -- description fields (no name/title), so the Diff won't
+        -- kill them.
         if focusedDCType
             and (focusedDCType:find("VMRangeStat")
                 or focusedDCType:find("VMStat")) then
-            return Helpers.FormatStatTooltip(tooltipTexts)
+            local speechData = Helpers.CreateSpeechData()
+            for _, tooltipEntry in ipairs(tooltipTexts) do
+                local role = tooltipEntry.role or ""
+                local entryText = Helpers.StripMarkupTags(
+                    tooltipEntry.text)
+                if not entryText or entryText == "" then
+                    goto nextStatEntry
+                end
+                entryText = entryText:gsub("[%.:%s]+$", "")
+                if entryText == "" then goto nextStatEntry end
+
+                if role == "PropertyText" then
+                    speechData:Add("breakdown",
+                        entryText, "normal")
+                elseif role == "ContentText"
+                    or role == "BaseDescription"
+                    or role == "AdditionalDescription" then
+                    speechData:Add("description",
+                        entryText, "verbose")
+                elseif role == "" and #entryText > 30
+                    and entryText ~= "Inspect" then
+                    -- Unnamed long text is likely a description
+                    -- (some tooltip TextBlocks lack x:Names).
+                    speechData:Add("description",
+                        entryText, "verbose")
+                end
+                ::nextStatEntry::
+            end
+            if #speechData.fields == 0 then return nil end
+            return speechData
         end
 
         -- VMResistance: tooltip has the description sentences.
@@ -1436,15 +1346,14 @@ local ExamineHandler = CreatePanelHandler({
             and focusedDCType:find("VMResistance") then
             local speechData = Helpers.CreateSpeechData()
             speechData.skipDiff = true
-            for _, text in ipairs(tooltipTexts) do
-                if text and text ~= ""
-                    and text ~= "Inspect" then
-                    local cleaned = Helpers.StripMarkupTags(text)
-                    if cleaned and cleaned ~= ""
-                        and cleaned:find("damage") then
-                        speechData:Add("description",
-                            cleaned, "normal")
-                    end
+            for _, tooltipEntry in ipairs(tooltipTexts) do
+                local entryText = Helpers.StripMarkupTags(
+                    tooltipEntry.text)
+                if entryText and entryText ~= ""
+                    and entryText ~= "Inspect"
+                    and entryText:find("damage") then
+                    speechData:Add("description",
+                        entryText, "normal")
                 end
             end
             if #speechData.fields == 0 then return nil end
@@ -2051,9 +1960,28 @@ local JournalQuestsHandler = CreatePanelHandler({
         return nil
     end,
     customTooltipFn = function(tooltipTexts, focusedDCType)
-        -- Quest entries: full tooltip for objective/description detail.
+        if not tooltipTexts or #tooltipTexts == 0 then return nil end
+        -- Quest entries: build SpeechData from roles for full detail.
         if focusedDCType == "ls.QuestView" then
-            return Helpers.FormatFullTooltip(tooltipTexts)
+            local speechData = Helpers.CreateSpeechData()
+            for _, tooltipEntry in ipairs(tooltipTexts) do
+                local role = tooltipEntry.role or ""
+                local entryText = Helpers.StripMarkupTags(
+                    tooltipEntry.text)
+                if entryText and entryText ~= "" then
+                    if role == "Title" then
+                        speechData:Add("title", entryText, "brief")
+                    elseif role == "PropertyText" then
+                        speechData:Add("property",
+                            entryText, "normal")
+                    elseif role == "ContentText" then
+                        speechData:Add("description",
+                            entryText, "verbose")
+                    end
+                end
+            end
+            if #speechData.fields == 0 then return nil end
+            return speechData
         end
         -- Categories and objectives: suppress (already spoken).
         if focusedDCType == "ls.QuestCategoryContainer"
@@ -2165,6 +2093,15 @@ local RewardHandler = CreatePanelHandler({
 local SavePopupHandler = CreatePanelHandler({
     name = "SavePopup",
     hint = "A to save. Y to rename. B to cancel.",
+    customItemFn = function(focusedElement, snapshot, effectiveTab,
+                            handlerState)
+        if focusedElement.elemType
+            and focusedElement.elemType:find("TextBox") then
+            return "Using your keyboard, type a name for this save."
+                .. " Press A to save, or B to cancel.", nil, nil
+        end
+        return nil, nil, nil
+    end,
     onWidgetAdded = function(widgetData, handlerState)
         -- Extract title from namedTexts (TitleContainer = "Create New Save").
         if widgetData and widgetData.namedTexts then
@@ -2296,9 +2233,10 @@ local PartyLineHandler = CreatePanelHandler({
             local speechData = Helpers.CreateSpeechData()
             local reactionCount = 0
             local inReactions = false
-            for _, text in ipairs(tooltipTexts) do
-                if text and text ~= "" then
-                    local cleaned = Helpers.StripMarkupTags(text)
+            for _, tooltipEntry in ipairs(tooltipTexts) do
+                local entryText = tooltipEntry.text
+                if entryText and entryText ~= "" then
+                    local cleaned = Helpers.StripMarkupTags(entryText)
                     if not cleaned or cleaned == "" then
                         -- skip
                     elseif cleaned == "Inspect" then
@@ -2345,12 +2283,13 @@ local PartyLineHandler = CreatePanelHandler({
             end
         end
 
-        -- Build remaining fields from tooltip texts.
+        -- Build remaining fields from tooltip texts ({role, text}).
         if tooltipTexts then
             local inReactions = false
-            for _, text in ipairs(tooltipTexts) do
-                if text and text ~= "" then
-                    local cleaned = Helpers.StripMarkupTags(text)
+            for _, tooltipEntry in ipairs(tooltipTexts) do
+                local entryText = tooltipEntry.text
+                if entryText and entryText ~= "" then
+                    local cleaned = Helpers.StripMarkupTags(entryText)
                     if not cleaned or cleaned == "" then
                         -- skip
                     elseif cleaned == "Inspect" then

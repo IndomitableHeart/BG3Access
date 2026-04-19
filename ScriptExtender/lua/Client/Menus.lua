@@ -157,7 +157,7 @@ local function CreateMenuHandler(config)
         lastSpokenFullText   = nil,
         lastSpokenTab        = nil,
         lastSpokenTitle      = nil,
-        lastTooltipSpeech    = nil,   -- tooltip dedup (for SpeakTooltipWithDedup)
+        lastTooltipSpeech    = nil,   -- tooltip dedup (inline comparison)
         spokenFields         = {},    -- set of field names spoken (for tooltip cross-off)
         spokenValues         = {},    -- set of normalized values spoken (for carousel dedup)
         tabHintSpoken        = false,
@@ -634,19 +634,45 @@ local function CreateMenuHandler(config)
         ResetState        = ResetState,
         ResetNavigation   = ResetNavigation,
         ResetHint         = ResetHint,
-        --- HandleTooltip: receive hub-formatted tooltip SpeechData,
-        --- skip fields the handler already spoke, then speak with dedup.
-        HandleTooltip = function(defaultTooltipData, rawTexts)
-            if not defaultTooltipData then return end
+        --- HandleTooltip: receive structured tooltip data ({role, text}
+        --- array), build SpeechData from roles, skip fields the handler
+        --- already spoke, then speak with inline dedup.
+        HandleTooltip = function(structuredData, rawTexts)
+            if not structuredData then return end
+            -- Build SpeechData from structured {role, text} entries.
+            local tooltipData = Helpers.CreateSpeechData()
+            for _, tooltipEntry in ipairs(structuredData) do
+                local role = tooltipEntry.role or ""
+                local entryText = Helpers.StripMarkupTags(
+                    tooltipEntry.text)
+                if entryText and entryText ~= "" then
+                    if role == "Title" then
+                        tooltipData:Add("title", entryText, "brief")
+                    elseif role == "PropertyText" then
+                        tooltipData:Add("property",
+                            entryText, "normal")
+                    elseif role == "ContentText" then
+                        tooltipData:Add("description",
+                            entryText, "verbose")
+                    else
+                        tooltipData:Add(role, entryText, "normal")
+                    end
+                end
+            end
+            -- Skip fields the handler already spoke.
             local filtered = Helpers.CreateSpeechData()
-            for _, field in ipairs(defaultTooltipData.fields) do
+            for _, field in ipairs(tooltipData.fields) do
                 if not handlerState.spokenFields[field.name] then
                     filtered:Add(field.name, field.value, field.tier)
                 end
             end
             local tooltipSpeech = filtered:Format(
                 config.tooltipVerbosity or "verbose")
-            Helpers.SpeakTooltipWithDedup(handlerState, tooltipSpeech)
+            if not tooltipSpeech or tooltipSpeech == "" then return end
+            if tooltipSpeech == handlerState.lastTooltipSpeech then return end
+            handlerState.lastTooltipSpeech = tooltipSpeech
+            Log.Info("MENU TOOLTIP: " .. tooltipSpeech)
+            Ext.Tolk.Speak(tooltipSpeech, false)
         end,
         ResetTooltipDedup = function()
             handlerState.lastTooltipSpeech = nil
@@ -1004,11 +1030,19 @@ end
 --- @param widgetData table  The widget data for the dialog overlay.
 --- @return boolean  True if the dialog was spoken, false otherwise.
 local function HandleDialogOverlay(snapshot, widgetData)
-    -- Skip if focus or selection changed on this tick -- the dialog
-    -- is pre-loaded alongside a navigation event, not user-triggered.
+    -- Save/Load pre-load suppression: navigating between save entries
+    -- causes the game to pre-load the delete confirmation MessageBox.
+    -- Suppress dialogs that co-occur with save-related focus changes.
+    -- All other contexts (pause menu, options, etc.) speak normally.
     if snapshot.focusChanged or snapshot.selectionChanged then
-        Log.Debug("Skipping pre-loaded dialog overlay (focus/sel changed)")
-        return false
+        local focusedDCType = snapshot.focusedElement
+            and snapshot.focusedElement.dcType or ""
+        if focusedDCType:find("VMSavegame")
+            or focusedDCType:find("VMPlaythroughHolder") then
+            Log.Debug("Skipping pre-loaded dialog overlay"
+                .. " (save navigation: " .. focusedDCType .. ")")
+            return false
+        end
     end
 
     local _, bodyText, actionsText = Helpers.ExtractFromWidgetData(widgetData)
@@ -1198,20 +1232,20 @@ local function GetActiveHandlerWidgetName()
     return activeHandlerWidgetName
 end
 
---- DispatchTooltip: routes hub-formatted tooltip SpeechData to the
---- active menu handler.  Resets dedup on navigation.
---- @param defaultTooltipData table|nil  SpeechData from FormatFullTooltip.
+--- DispatchTooltip: routes structured tooltip data to the active
+--- menu handler.  Resets dedup on navigation.
+--- @param structuredTooltipData table|nil  Array of {role, text} from C++.
 --- @param snapshot table  The full TickSnapshot (for change flags).
-local function DispatchTooltip(defaultTooltipData, snapshot)
+local function DispatchTooltip(structuredTooltipData, snapshot)
     if snapshot.focusChanged or snapshot.selectionChanged then
         if activeHandler and activeHandler.ResetTooltipDedup then
             activeHandler.ResetTooltipDedup()
         end
     end
-    if not defaultTooltipData then return end
+    if not structuredTooltipData then return end
     if activeHandler and activeHandler.HandleTooltip then
         activeHandler.HandleTooltip(
-            defaultTooltipData, snapshot.tooltipTexts)
+            structuredTooltipData, structuredTooltipData)
     end
 end
 

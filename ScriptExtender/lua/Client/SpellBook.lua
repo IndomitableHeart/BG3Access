@@ -71,17 +71,18 @@ local function ParseActionTooltipForDetails(tooltipTexts, actionName)
     local longestDesc = nil
     local longestDescLength = 0
 
-    -- Pre-process: split concatenated entries like
-    -- "1.5mDisadvantage." into separate texts.
+    -- Pre-process: extract text from {role, text} entries and split
+    -- concatenated entries like "1.5mDisadvantage." into separate texts.
     local processedTexts = {}
-    for _, rawText in ipairs(tooltipTexts) do
-        if rawText then
-            local range, rest = rawText:match("^([%d%.]+m)(.+)$")
+    for _, tooltipEntry in ipairs(tooltipTexts) do
+        local entryText = tooltipEntry.text
+        if entryText then
+            local range, rest = entryText:match("^([%d%.]+m)(.+)$")
             if range and rest then
                 processedTexts[#processedTexts + 1] = range
                 processedTexts[#processedTexts + 1] = rest
             else
-                processedTexts[#processedTexts + 1] = rawText
+                processedTexts[#processedTexts + 1] = entryText
             end
         end
     end
@@ -672,18 +673,20 @@ local function CreateSpellBookHandler(createPanelHandler)
                 local speechData = Helpers.CreateSpeechData()
                 local seen = {}
 
-                -- Pre-process: split concatenated entries like
+                -- Pre-process: extract text from {role, text} entries
+                -- and split concatenated entries like
                 -- "1.5mDisadvantage." into separate texts.
                 local processedTexts = {}
-                for _, rawText in ipairs(tooltipTexts) do
-                    if rawText then
-                        local range, rest = rawText:match(
+                for _, tooltipEntry in ipairs(tooltipTexts) do
+                    local entryText = tooltipEntry.text
+                    if entryText then
+                        local range, rest = entryText:match(
                             "^([%d%.]+m)(.+)$")
                         if range and rest then
                             processedTexts[#processedTexts + 1] = range
                             processedTexts[#processedTexts + 1] = rest
                         else
-                            processedTexts[#processedTexts + 1] = rawText
+                            processedTexts[#processedTexts + 1] = entryText
                         end
                     end
                 end
@@ -846,9 +849,27 @@ local function CreateSpellBookHandler(createPanelHandler)
                 return speechData
             end
 
-            -- VMPassive: full tooltip.
+            -- VMPassive: iterate roles for full tooltip speech.
             if focusedDCType == "ls.VMPassive" then
-                return Helpers.FormatFullTooltip(tooltipTexts)
+                local speechData = Helpers.CreateSpeechData()
+                for _, tooltipEntry in ipairs(tooltipTexts) do
+                    local role = tooltipEntry.role or ""
+                    local entryText = Helpers.StripMarkupTags(
+                        tooltipEntry.text)
+                    if entryText and entryText ~= "" then
+                        if role == "Title" then
+                            speechData:Add("title", entryText, "brief")
+                        elseif role == "PropertyText" then
+                            speechData:Add("property",
+                                entryText, "normal")
+                        elseif role == "ContentText" then
+                            speechData:Add("description",
+                                entryText, "verbose")
+                        end
+                    end
+                end
+                if #speechData.fields == 0 then return nil end
+                return speechData
             end
 
             -- VMActionGroup: suppress tooltip (group name already spoken).

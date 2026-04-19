@@ -232,8 +232,9 @@ local function ExtractEquipmentSlotName(dcProps, snapshot)
     end
     if snapshot and snapshot.tooltipTexts then
         local firstTooltip = snapshot.tooltipTexts[1]
-        if firstTooltip and firstTooltip ~= "" then
-            return firstTooltip
+        if firstTooltip and firstTooltip.text
+            and firstTooltip.text ~= "" then
+            return firstTooltip.text
         end
     end
     return "Equipment Slot"
@@ -776,7 +777,8 @@ local function GatherEquipmentSpeechData(tooltipTexts, slotName, itemName)
     local itemNameLower = itemName and itemName:lower() or nil
     local seen = {}
 
-    for _, text in ipairs(tooltipTexts) do
+    for _, tooltipEntry in ipairs(tooltipTexts) do
+        local text = tooltipEntry.text
         if not text or text == "" then goto nextTooltipText end
         local cleaned = Helpers.StripMarkupTags(text)
         if not cleaned or cleaned == "" then goto nextTooltipText end
@@ -967,7 +969,8 @@ local function ParseTooltipForDetails(tooltipTexts, itemName)
     local longestDesc = nil
     local longestDescLength = 0
 
-    for _, rawText in ipairs(tooltipTexts) do
+    for _, tooltipEntry in ipairs(tooltipTexts) do
+        local rawText = tooltipEntry.text
         if not rawText or rawText == "" then goto nextTooltip end
         local cleaned = Helpers.StripMarkupTags(rawText)
         if not cleaned or cleaned == "" then goto nextTooltip end
@@ -1893,46 +1896,137 @@ local function CreateCharacterPanelHandler(createPanelHandler)
             return nil
         end,
         customTooltipFn = function(tooltipTexts, focusedDCType)
+            if not tooltipTexts or #tooltipTexts == 0 then return nil end
             if focusedDCType then
                 if focusedDCType == "ls.VMEquipmentSlot" then
                     if equipmentSlotEmpty then return "" end
                     return GatherEquipmentSpeechData(
                         tooltipTexts, equipmentSlotName, equipmentItemName)
                 end
-                -- Inventory items.
-                if focusedDCType == "ls.VMItem" then
-                    return Helpers.FormatItemTooltip(tooltipTexts)
-                end
                 -- Action resources: suppress (handler already speaks all data).
                 if focusedDCType == "ls.VMActionResource" then
                     return ""
                 end
-                -- Stats with breakdowns.
+                -- Inventory items (VMItem): Title, damage, properties,
+                -- equipped-by, and description from roles.
+                if focusedDCType == "ls.VMItem" then
+                    local speechData = Helpers.CreateSpeechData()
+                    for _, tooltipEntry in ipairs(tooltipTexts) do
+                        local role = tooltipEntry.role or ""
+                        local entryText = Helpers.StripMarkupTags(
+                            tooltipEntry.text)
+                        if entryText and entryText ~= "" then
+                            if role == "Title" then
+                                speechData:Add("title", entryText, "brief")
+                            elseif role == "DamageLabel"
+                                or role == "DamageType" then
+                                speechData:Add(role, entryText, "normal")
+                            elseif role == "PropertyText" then
+                                speechData:Add("property",
+                                    entryText, "normal")
+                            elseif role == "EquippedByText" then
+                                speechData:Add("equippedBy",
+                                    entryText, "brief")
+                            elseif role == "ContentText" then
+                                speechData:Add("description",
+                                    entryText, "verbose")
+                            end
+                        end
+                    end
+                    if #speechData.fields == 0 then return nil end
+                    return speechData
+                end
+                -- Stats with breakdowns (VMStat, VMRangeStat).
                 if focusedDCType == "ls.VMStat"
                     or focusedDCType == "ls.VMRangeStat" then
-                    return Helpers.FormatStatTooltip(tooltipTexts)
+                    local speechData = Helpers.CreateSpeechData()
+                    for _, tooltipEntry in ipairs(tooltipTexts) do
+                        local role = tooltipEntry.role or ""
+                        local entryText = Helpers.StripMarkupTags(
+                            tooltipEntry.text)
+                        if entryText and entryText ~= "" then
+                            if role == "PropertyText" then
+                                speechData:Add("breakdown",
+                                    entryText, "normal")
+                            elseif role == "ContentText" then
+                                speechData:Add("description",
+                                    entryText, "verbose")
+                            end
+                        end
+                    end
+                    if #speechData.fields == 0 then return nil end
+                    return speechData
                 end
-                -- Combat stats.
+                -- Combat stats (VMCharacterStats).
                 if focusedDCType == "gui::VMCharacterStats" then
-                    return Helpers.FormatCombatStatTooltip(tooltipTexts)
+                    local speechData = Helpers.CreateSpeechData()
+                    for _, tooltipEntry in ipairs(tooltipTexts) do
+                        local role = tooltipEntry.role or ""
+                        local entryText = Helpers.StripMarkupTags(
+                            tooltipEntry.text)
+                        if entryText and entryText ~= "" then
+                            if role == "DamageLabel"
+                                or role == "DiceValue"
+                                or role == "DamageType" then
+                                speechData:Add(role, entryText, "normal")
+                            elseif role == "PropertyText" then
+                                speechData:Add("property",
+                                    entryText, "normal")
+                            elseif role == "ContentText" then
+                                speechData:Add("description",
+                                    entryText, "verbose")
+                            end
+                        end
+                    end
+                    if #speechData.fields == 0 then return nil end
+                    return speechData
                 end
                 -- Abilities, skills, proficiencies.
                 if focusedDCType == "ls.VMAbility"
                     or focusedDCType == "ls.VMSkill"
                     or focusedDCType == "gui::VMEquipmentProficiency" then
-                    return Helpers.FormatAbilityTooltip(tooltipTexts)
+                    local speechData = Helpers.CreateSpeechData()
+                    for _, tooltipEntry in ipairs(tooltipTexts) do
+                        local role = tooltipEntry.role or ""
+                        local entryText = Helpers.StripMarkupTags(
+                            tooltipEntry.text)
+                        if entryText and entryText ~= "" then
+                            if role == "PropertyText" then
+                                speechData:Add("effect",
+                                    entryText, "normal")
+                            elseif role == "ContentText" then
+                                speechData:Add("description",
+                                    entryText, "verbose")
+                            end
+                        end
+                    end
+                    if #speechData.fields == 0 then return nil end
+                    return speechData
                 end
-                -- Class.
-                if focusedDCType == "ls.VMClass" then
-                    return Helpers.FormatFullTooltip(tooltipTexts)
-                end
-                -- Character info.
-                if focusedDCType == "ls.Character" then
-                    return Helpers.FormatStatTooltip(tooltipTexts)
-                end
-                -- Other tooltip-deferred DC types.
-                if TOOLTIP_DEFERRED_DC_TYPES[focusedDCType] then
-                    return Helpers.FormatFullTooltip(tooltipTexts)
+                -- Class, Character info, and tooltip-deferred types:
+                -- speak Title, PropertyText, ContentText.
+                if focusedDCType == "ls.VMClass"
+                    or focusedDCType == "ls.Character"
+                    or TOOLTIP_DEFERRED_DC_TYPES[focusedDCType] then
+                    local speechData = Helpers.CreateSpeechData()
+                    for _, tooltipEntry in ipairs(tooltipTexts) do
+                        local role = tooltipEntry.role or ""
+                        local entryText = Helpers.StripMarkupTags(
+                            tooltipEntry.text)
+                        if entryText and entryText ~= "" then
+                            if role == "Title" then
+                                speechData:Add("title", entryText, "brief")
+                            elseif role == "PropertyText" then
+                                speechData:Add("property",
+                                    entryText, "normal")
+                            elseif role == "ContentText" then
+                                speechData:Add("description",
+                                    entryText, "verbose")
+                            end
+                        end
+                    end
+                    if #speechData.fields == 0 then return nil end
+                    return speechData
                 end
             end
             return nil

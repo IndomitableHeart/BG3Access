@@ -77,6 +77,7 @@ local function HandleTickSnapshot(snapshot)
     -- a freshly-opened menu (pause, shortcuts, etc.) isn't immediately
     -- hijacked by a leftover world panel discovered in widgetDCTypes.
     local menuActivatedThisTick = false
+    local ccHandledThisTick = false
 
     -- =================================================================
     -- Dialog/cutscene widget events: handle BEFORE focus check since
@@ -196,10 +197,10 @@ local function HandleTickSnapshot(snapshot)
         end
         if isCC then
             CC.HandleCCSnapshot(snapshot)
+            ccHandledThisTick = true
             -- Don't return: the tooltip section below must run for
             -- CC snapshots too (clears dedup on focus changes,
-            -- processes tooltip data when it arrives).  The isCC
-            -- flag gates subsequent non-CC sections.
+            -- processes tooltip data when it arrives).
         end
     end
 
@@ -337,40 +338,39 @@ local function HandleTickSnapshot(snapshot)
     -- Tooltip-only snapshots (no focus/selection change) have no
     -- focusedElement and would be dropped by the guard below.
     --
-    -- Hub-and-spoke: the hub formats raw tooltip texts into SpeechData
-    -- via FormatFullTooltip (all fields with tier labels).  The active
-    -- handler's HandleTooltip decides what to speak based on which
-    -- fields it already covered (spokenFields cross-off) and its
-    -- verbosity setting.  Three-way dispatch: CC, WorldUI, or Menus.
+    -- Hub-and-spoke: the hub passes raw structured tooltip data
+    -- (array of {role, text} tables) to the active handler.
+    -- Each handler builds its own SpeechData from the roles it
+    -- cares about via customTooltipFn.  Three-way dispatch:
+    -- CC, WorldUI, or Menus.
     -- =================================================================
     if not suppressSnapshots then
         if snapshot.tooltipChanged
             or snapshot.focusChanged
             or snapshot.selectionChanged then
-            -- Hub formats: extract ALL fields with tier labels.
-            -- Handlers decide verbosity via Format(verbosity).
-            local defaultTooltipData = nil
+            -- Raw structured tooltip data: array of {role, text}.
+            -- nil when no tooltip data arrived this tick.
+            local structuredTooltipData = nil
             if snapshot.tooltipChanged
                 and snapshot.tooltipTexts
                 and #snapshot.tooltipTexts > 0 then
-                defaultTooltipData = Helpers.FormatFullTooltip(
-                    snapshot.tooltipTexts)
+                structuredTooltipData = snapshot.tooltipTexts
             end
 
             -- Dispatch to active context (handler decides speech).
             local isCC = CC.IsInCC and CC.IsInCC()
             if isCC then
                 if CC.DispatchTooltip then
-                    CC.DispatchTooltip(defaultTooltipData, snapshot)
+                    CC.DispatchTooltip(structuredTooltipData, snapshot)
                 end
             elseif routeToWorld then
                 local World = BG3Access.Client.WorldUI
                 if World and World.DispatchTooltip then
-                    World.DispatchTooltip(defaultTooltipData, snapshot)
+                    World.DispatchTooltip(structuredTooltipData, snapshot)
                 end
             else
                 if Menus.DispatchTooltip then
-                    Menus.DispatchTooltip(defaultTooltipData, snapshot)
+                    Menus.DispatchTooltip(structuredTooltipData, snapshot)
                 end
             end
         end
@@ -394,6 +394,7 @@ local function HandleTickSnapshot(snapshot)
         local hasActiveHandler = Menus.GetActiveHandler()
             or (World and World.GetActivePanelHandler
                 and World.GetActivePanelHandler())
+            or (CC.IsInCC and CC.IsInCC())
         if not hasActiveHandler then
             Ext.Tolk.Silence()
         end
@@ -668,19 +669,24 @@ local function HandleTickSnapshot(snapshot)
         end
     end
 
-    if routeToWorld then
-        -- Dialog overlay just spoke on this tick -- suppress the panel
-        -- handler so it doesn't immediately interrupt the dialog speech.
-        if worldDialogOverlayJustSpoke then
-            worldDialogOverlayJustSpoke = false
-            return
+    -- Skip menu/world dispatch when CC already handled this snapshot.
+    -- Without this gate, both CC and Menus (PartyLine) would process
+    -- the same snapshot, causing duplicate speech.
+    if not ccHandledThisTick then
+        if routeToWorld then
+            -- Dialog overlay just spoke on this tick -- suppress the panel
+            -- handler so it doesn't immediately interrupt the dialog speech.
+            if worldDialogOverlayJustSpoke then
+                worldDialogOverlayJustSpoke = false
+                return
+            end
+            local World = BG3Access.Client.WorldUI
+            if World then
+                World.RoutePanelSnapshot(snapshot)
+            end
+        else
+            Menus.RouteSnapshot(snapshot)
         end
-        local World = BG3Access.Client.WorldUI
-        if World then
-            World.RoutePanelSnapshot(snapshot)
-        end
-    else
-        Menus.RouteSnapshot(snapshot)
     end
 
     -- Tooltip events are processed BEFORE the focusedElement guard
@@ -765,6 +771,11 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     if Nav then Nav.ResetState() end
     local Combat = BG3Access.Client.Combat
     if Combat then Combat.ResetState() end
+
+    -- Reset RS input state.
+    lastRSDirection = RS_DIRECTION_NONE
+    rsAxisX = 0
+    rsAxisY = 0
 
     -- Reset router state.
     lastWidgetRootStr = nil
@@ -879,6 +890,163 @@ end
 -- ---------------------------------------------------------------------------
 -- Exports
 -- ---------------------------------------------------------------------------
+-- ============================================================================
+-- Right-stick input dispatch
+-- ============================================================================
+--
+-- Owns the ControllerAxisInput subscription for the right stick.
+-- Dispatches to: DetailView (RS Left in UI), WorldNav GPS (RS Left
+-- in free world), WorldNav HUD reader (RS Up/Down/Right in free world),
+-- Combat turn order (RS Right in combat).
+
+local RS_DIRECTION_NONE  = 0
+local RS_DIRECTION_UP    = 1
+local RS_DIRECTION_DOWN  = 2
+local RS_DIRECTION_RIGHT = 3
+local RS_DIRECTION_LEFT  = 4
+
+local RS_DEFLECT_THRESHOLD = 0.4
+local RS_RELEASE_THRESHOLD = 0.15
+local RS_PREVENT_THRESHOLD = 0.1
+local RS_DEAD_ZONE         = 0.5
+
+local lastRSDirection = RS_DIRECTION_NONE
+local rsAxisX         = 0
+local rsAxisY         = 0
+
+local function GetRSDirection()
+    local absX = math.abs(rsAxisX)
+    local absY = math.abs(rsAxisY)
+    if absX < RS_DEAD_ZONE and absY < RS_DEAD_ZONE then
+        return RS_DIRECTION_NONE
+    end
+    if absY >= absX then
+        if rsAxisY < 0 then return RS_DIRECTION_UP end
+        return RS_DIRECTION_DOWN
+    end
+    if rsAxisX > 0 then return RS_DIRECTION_RIGHT end
+    return RS_DIRECTION_LEFT
+end
+
+--- Find the active handler with BuildDetailList support.
+--- Priority: CC > WorldUI > Menus.
+local function FindActiveDetailHandler()
+    if CC.IsInCC and CC.IsInCC() then
+        local ccHandler = CC.GetActiveHandler
+            and CC.GetActiveHandler()
+        if ccHandler and ccHandler.BuildDetailList then
+            return ccHandler
+        end
+    end
+    local World = BG3Access.Client.WorldUI
+    if World and World.GetActivePanelHandler then
+        local panelHandler = World.GetActivePanelHandler()
+        if panelHandler and panelHandler.BuildDetailList then
+            return panelHandler
+        end
+    end
+    if Menus and Menus.GetActiveHandler then
+        local menuHandler = Menus.GetActiveHandler()
+        if menuHandler and menuHandler.BuildDetailList then
+            return menuHandler
+        end
+    end
+    return nil
+end
+
+--- IsUIActiveForRS: checks whether UI is consuming RS input.
+local function IsUIActiveForRS()
+    if not routeToWorld then return true end
+    if CC.IsInCC and CC.IsInCC() then return true end
+    if inspectWidgetActive then return true end
+    return snapshotHasUIFocus
+end
+
+local function HandleRSDirection(direction)
+    local Nav = BG3Access.Client.WorldNav
+    if not Nav or not Nav.HasPlayerEntity() then return end
+
+    -- RS Left: detail view toggle or GPS cycle.
+    if direction == RS_DIRECTION_LEFT then
+        local DetailView = BG3Access.Client.DetailView
+        if DetailView then
+            local handler = FindActiveDetailHandler()
+            if handler then
+                local handled = DetailView.Toggle(handler)
+                if handled then return end
+            end
+        end
+        if IsUIActiveForRS() then return end
+        if Nav.IsEntityListOpen() then return end
+        Nav.CycleGPSMode()
+        return
+    end
+
+    -- RS Up/Down/Right: HUD reader (free world only).
+    if IsUIActiveForRS() then return end
+
+    if direction == RS_DIRECTION_UP then
+        Nav.SpeakCharacterInfo()
+    elseif direction == RS_DIRECTION_DOWN then
+        Nav.SpeakTargetInfo()
+    elseif direction == RS_DIRECTION_RIGHT then
+        local Combat = BG3Access.Client.Combat
+        if Combat and Combat.IsInCombat and Combat.IsInCombat() then
+            Combat.SpeakTurnOrder()
+        else
+            Nav.SpeakActionResources()
+        end
+    end
+end
+
+local function OnRSAxisInput(event)
+    local axisName = tostring(event.Axis)
+    local value = event.Value or 0
+
+    if axisName == "RightX" then
+        rsAxisX = value
+    elseif axisName == "RightY" then
+        rsAxisY = value
+    else
+        return
+    end
+
+    local absX = math.abs(rsAxisX)
+    local absY = math.abs(rsAxisY)
+    local maxDeflection = absX > absY and absX or absY
+
+    if maxDeflection >= RS_PREVENT_THRESHOLD then
+        pcall(event.PreventAction, event)
+    end
+
+    if lastRSDirection ~= RS_DIRECTION_NONE then
+        if maxDeflection < RS_RELEASE_THRESHOLD then
+            lastRSDirection = RS_DIRECTION_NONE
+        end
+        return
+    end
+
+    if maxDeflection < RS_DEFLECT_THRESHOLD then
+        return
+    end
+
+    local direction = GetRSDirection()
+    if direction == RS_DIRECTION_NONE then return end
+    lastRSDirection = direction
+    HandleRSDirection(direction)
+end
+
+Ext.Events.ControllerAxisInput:Subscribe(function(event)
+    local axisOk, axisErr = pcall(OnRSAxisInput, event)
+    if not axisOk then
+        Log.Error("EventRouter RS axis: " .. tostring(axisErr))
+    end
+end)
+
+-- ============================================================================
+-- Exports
+-- ============================================================================
+
 BG3Access.Client.EventRouter = {
     --- IsUIActive: returns true when any UI is active (pre-game menu,
     --- WorldUI panel, dialog, inspect, etc.) and false only during
@@ -905,6 +1073,8 @@ BG3Access.Client.EventRouter = {
         -- Gameplay: check the cached focus state from the tick monitor.
         return snapshotHasUIFocus
     end,
+
+    GetActiveDetailHandler = FindActiveDetailHandler,
 }
 
 Log.Info("Accessibility ready (GlobalFocusMonitor).")

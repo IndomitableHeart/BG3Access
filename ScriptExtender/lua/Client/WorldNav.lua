@@ -257,21 +257,6 @@ local CATEGORY_NAMES          = {
     "Miscellaneous", -- fallback for anything else (keys, books, notes)
 }
 
--- RS HUD reader: hysteresis thresholds.
--- Deflect threshold: stick must exceed this to trigger a new direction.
--- Release threshold: stick must drop below this before another trigger.
--- Two separate thresholds prevent rapid wobble around a single cutoff
--- from registering as multiple deflections.
-local RS_DEAD_ZONE            = 0.5   -- deflect threshold (legacy name)
-local RS_DEFLECT_THRESHOLD    = 0.4   -- must exceed to register direction
-local RS_RELEASE_THRESHOLD    = 0.15  -- must drop below to allow next
-local RS_PREVENT_THRESHOLD    = 0.1   -- below this, skip PreventAction
-local RS_DIRECTION_NONE       = 0
-local RS_DIRECTION_UP         = 1
-local RS_DIRECTION_DOWN       = 2
-local RS_DIRECTION_RIGHT      = 3
-local RS_DIRECTION_LEFT       = 4
-
 -- ============================================================================
 -- State
 -- ============================================================================
@@ -376,11 +361,6 @@ local currentItemIndex       = 1      -- index into current category
 -- TODO settings hook: gate this on BG3Access.Settings.hintsEnabled
 -- when the settings module exists.
 local routingHintSpoken      = false
-
--- RS HUD reader state.
-local lastRSDirection        = RS_DIRECTION_NONE  -- last detected direction
-local rsAxisX                = 0                  -- current RS X axis value
-local rsAxisY                = 0                  -- current RS Y axis value
 
 -- Tick timing.
 local lastPositionCheckTime  = 0
@@ -3884,30 +3864,8 @@ local function OnTick()
 end
 
 -- ============================================================================
--- RS HUD Reader
+-- Controller Input (entity list navigation only)
 -- ============================================================================
-
---- Determine the dominant RS direction from axis values.
---- Returns RS_DIRECTION_* constant.
-local function GetRSDirection()
-    local absX = math.abs(rsAxisX)
-    local absY = math.abs(rsAxisY)
-
-    -- Both below dead zone = no direction.
-    if absX < RS_DEAD_ZONE and absY < RS_DEAD_ZONE then
-        return RS_DIRECTION_NONE
-    end
-
-    -- Y axis dominates (up/down).  Y negative = stick pushed up (forward).
-    if absY >= absX then
-        if rsAxisY < 0 then return RS_DIRECTION_UP end
-        return RS_DIRECTION_DOWN
-    end
-
-    -- X axis dominates (left/right).
-    if rsAxisX > 0 then return RS_DIRECTION_RIGHT end
-    return RS_DIRECTION_LEFT
-end
 
 --- Format a number as integer if whole, one decimal otherwise.
 local function FormatAmount(value)
@@ -4083,113 +4041,10 @@ local function SpeakActionResources()
     end
 end
 
---- Handle an RS direction input.
---- Called when a new direction is detected after debounce.
---- Gameplay guard: no player entity = not in gameplay, stay silent.
-local function HandleRSDirection(direction)
-    if not GetPlayerEntity() then return end
-
-    -- RS Left: detail view toggle in menus, GPS mode cycle in the world.
-    -- Order matters.  WorldUI.HandleDetailViewToggle returns true when
-    -- it handled the press (panel with a detail list is active).  If it
-    -- returns false, fall through to either the UI gate (silent -- no
-    -- detail view available in this menu) or the GPS cycle (free world).
-    if direction == RS_DIRECTION_LEFT then
-        local World = BG3Access.Client.WorldUI
-        if World and World.HandleDetailViewToggle then
-            local handled = World.HandleDetailViewToggle()
-            if handled then return end
-        end
-        local EventRouter = BG3Access.Client.EventRouter
-        if EventRouter and EventRouter.IsUIActive
-            and EventRouter.IsUIActive() then
-            return
-        end
-        -- Ignore RS Left while the entity list is open; use B to close.
-        if entityListOpen then return end
-        CycleGPSMode()
-        return
-    end
-
-    -- RS Up/Down/Right: HUD reader.  Only fires in free-world nav --
-    -- suppress when any UI is active (menu, panel, inspect, dialog).
-    local EventRouter = BG3Access.Client.EventRouter
-    if EventRouter and EventRouter.IsUIActive
-        and EventRouter.IsUIActive() then
-        return
-    end
-
-    if direction == RS_DIRECTION_UP then
-        SpeakCharacterInfo()
-    elseif direction == RS_DIRECTION_DOWN then
-        SpeakTargetInfo()
-    elseif direction == RS_DIRECTION_RIGHT then
-        -- In combat: RS Right reads turn order instead of resources
-        -- (resources are already announced in the character info).
-        local Combat = BG3Access.Client.Combat
-        if Combat and Combat.IsInCombat and Combat.IsInCombat() then
-            Combat.SpeakTurnOrder()
-        else
-            SpeakActionResources()
-        end
-    end
-end
-
---- Process RS axis input event.
---- Called from the ControllerAxisInput subscription.
-local function OnRSAxisInput(event)
-    local axisName = tostring(event.Axis)
-    local value = event.Value or 0
-
-    -- Only handle right stick axes.
-    if axisName == "RightX" then
-        rsAxisX = value
-    elseif axisName == "RightY" then
-        rsAxisY = value
-    else
-        return  -- not RS, ignore
-    end
-
-    -- Hysteresis: use two thresholds.  Once deflected, stick must drop
-    -- below the release threshold before another action can fire.
-    local absX = math.abs(rsAxisX)
-    local absY = math.abs(rsAxisY)
-    local maxDeflection = absX > absY and absX or absY
-
-    -- Only prevent RS camera movement when the stick is actually
-    -- deflected beyond the deadzone.  Calling PreventAction on every
-    -- near-zero axis event adds measurable latency to the event loop.
-    if maxDeflection >= RS_PREVENT_THRESHOLD then
-        pcall(event.PreventAction, event)
-    end
-
-    if lastRSDirection ~= RS_DIRECTION_NONE then
-        -- Already deflected: only check for release.
-        if maxDeflection < RS_RELEASE_THRESHOLD then
-            lastRSDirection = RS_DIRECTION_NONE
-        end
-        return
-    end
-
-    -- Not yet deflected: check for fresh trigger above deflect threshold.
-    if maxDeflection < RS_DEFLECT_THRESHOLD then
-        return
-    end
-
-    -- Fresh deflection: determine direction and fire once.
-    local direction = GetRSDirection()
-    if direction == RS_DIRECTION_NONE then return end
-    lastRSDirection = direction
-    HandleRSDirection(direction)
-end
-
 -- ============================================================================
--- Controller Input
+-- Controller Input (entity list navigation only)
 -- ============================================================================
 
---- Controller button handler.  The only thing this module now consumes
---- is entity list navigation while the list is open.  GPS mode cycling
---- happens in OnRSAxisInput -> HandleRSDirection via RS Left.
 local function OnControllerButton(event)
     if not entityListOpen or not event.Pressed then return end
 
@@ -4293,9 +4148,6 @@ local function ResetState()
     noPathAnnounced = false
     noPathTickCount = 0
     trackingTicks = 0
-    lastRSDirection = RS_DIRECTION_NONE
-    rsAxisX = 0
-    rsAxisY = 0
     lastPositionCheckTime = 0
     -- Hint gates reset on state transitions (new save load, new
     -- campaign, etc.) so the first Routing mode entry after a
@@ -4343,13 +4195,6 @@ Ext.Events.ControllerButtonInput:Subscribe(function(event)
     end
 end)
 
-Ext.Events.ControllerAxisInput:Subscribe(function(event)
-    local axisOk, axisErr = pcall(OnRSAxisInput, event)
-    if not axisOk then
-        Log.Error("WorldNav RS axis: " .. tostring(axisErr))
-    end
-end)
-
 Ext.RegisterConsoleCommand("bg3a_pathdiag", function()
     PathDiagnostic()
 end)
@@ -4361,9 +4206,16 @@ Log.Debug("WorldNav module loaded")
 -- ============================================================================
 
 BG3Access.Client.WorldNav = {
-    ResetState         = ResetState,
-    PauseGPS           = PauseGPS,
-    ResumeGPS          = ResumeGPS,
-    IsGPSActive        = IsGPSActive,
-    TestPathDiagnostic = PathDiagnostic,
+    ResetState           = ResetState,
+    PauseGPS             = PauseGPS,
+    ResumeGPS            = ResumeGPS,
+    IsGPSActive          = IsGPSActive,
+    TestPathDiagnostic   = PathDiagnostic,
+    -- Exported for EventRouter RS input dispatch.
+    CycleGPSMode         = CycleGPSMode,
+    SpeakCharacterInfo   = SpeakCharacterInfo,
+    SpeakTargetInfo      = SpeakTargetInfo,
+    SpeakActionResources = SpeakActionResources,
+    IsEntityListOpen     = function() return entityListOpen end,
+    HasPlayerEntity      = function() return GetPlayerEntity() ~= nil end,
 }
