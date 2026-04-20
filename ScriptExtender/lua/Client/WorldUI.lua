@@ -2396,6 +2396,73 @@ local TutorialHandler = CreatePanelHandler({
                     and handlerState.bodyOverride:sub(1, 60)))
         end
     end,
+    customItemFn = function(focusedElement, snapshot, tabName,
+                            handlerState)
+        -- Tutorial body arrives on the tick AFTER screen entry
+        -- (dcProps not populated on the widget event tick).
+        -- Check dcProps each tick for the Tutorial sub-object.
+        local dcProps = focusedElement and focusedElement.dcProps
+        if not dcProps then return nil, nil, nil end
+        local tutorial = dcProps.Tutorial
+        if not tutorial or type(tutorial) ~= "table" then
+            return nil, nil, nil
+        end
+        local title = tutorial.Title
+        if title and (title:match("^h%x+g")
+            or title:find("%[ForceUpdate%]")) then
+            title = nil
+        end
+        local body = tutorial.DescriptionController
+            or tutorial.Description
+        if body and (body:match("^h%x+g")
+            or body:find("%[ForceUpdate%]")) then
+            body = nil
+        end
+        if title then title = "Tutorial: " .. title end
+        if body then body = Helpers.StripMarkupTags(body) end
+        return title, nil, body
+    end,
+})
+
+-- Map / waypoint fast travel.
+-- ls.JournalMap is the map widget.  When the user presses Y (Fast
+-- Travel), a waypoint panel opens with focusable ls.VMWaypoint items.
+-- D-pad navigates, A teleports.  The map image itself is not accessible
+-- but the waypoint list provides the core fast travel functionality.
+local MapHandler = CreatePanelHandler({
+    name = "Map",
+    hint = "Press Y for fast travel waypoints. Press A to travel. "
+        .. "B to close.",
+    onWidgetAdded = function(widgetData, handlerState)
+        -- Read current region from namedTexts.
+        if widgetData and widgetData.namedTexts then
+            local regionName =
+                widgetData.namedTexts.SubRegionName
+            if regionName and regionName ~= "" then
+                handlerState.titleOverride = regionName
+            end
+        end
+    end,
+    customItemFn = function(focusedElement, snapshot, tabName,
+                            handlerState)
+        -- Waypoint items: read the Name property.
+        if not focusedElement then return nil, nil, nil end
+        local dcProps = focusedElement.dcProps
+        if not dcProps then return nil, nil, nil end
+
+        local waypointName = dcProps.Name
+            or dcProps.DisplayName or dcProps.Title
+        if not waypointName or waypointName == "" then
+            -- Fallback: element text from the TextBlock.
+            waypointName = focusedElement.elemText
+        end
+        if not waypointName or waypointName == "" then
+            return nil, nil, nil
+        end
+        waypointName = Helpers.StripMarkupTags(waypointName)
+
+        return waypointName, nil, nil
+    end,
 })
 
 -- Book / document viewer.
@@ -2664,6 +2731,9 @@ local DC_TYPE_HANDLERS = {
     -- Book / document viewer
     ["gui::DCBook"]               = BookHandler,
     ["ls.DCBook"]                 = BookHandler,
+    -- Map / waypoint fast travel
+    ["gui::DCJournalMap"]         = MapHandler,
+    ["ls.JournalMap"]             = MapHandler,
 }
 
 -- All handler instances for batch reset.
@@ -2698,6 +2768,7 @@ local ALL_PANEL_HANDLERS = {
     LobbyHandler,
     TutorialHandler,
     BookHandler,
+    MapHandler,
 }
 
 -- ============================================================================
