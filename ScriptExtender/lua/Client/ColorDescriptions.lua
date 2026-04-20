@@ -55,73 +55,90 @@ local function HexToHSL(hexString)
     return hue, saturation * 100, lightness * 100
 end
 
+-- Perceptual luminance (0-100) from linear RGB.
+-- More accurate than HSL lightness for how humans perceive shade.
+local function PerceptualLuminance(hexString)
+    local hex = hexString:gsub("^#", "")
+    if #hex == 8 then hex = hex:sub(3) end
+    if #hex ~= 6 then return 0 end
+
+    local function linearize(channelByte)
+        local normalized = channelByte / 255
+        if normalized <= 0.04045 then
+            return normalized / 12.92
+        end
+        return ((normalized + 0.055) / 1.055) ^ 2.4
+    end
+
+    local red = linearize(tonumber(hex:sub(1, 2), 16))
+    local green = linearize(tonumber(hex:sub(3, 4), 16))
+    local blue = linearize(tonumber(hex:sub(5, 6), 16))
+
+    return (0.2126 * red + 0.7152 * green + 0.0722 * blue) * 100
+end
+
 -- Describe a skin color hex code.
--- Produces descriptions like "fair ivory, warm undertone" or
--- "medium brown, golden undertone" or "light lavender" (fantasy).
+-- Uses perceptual luminance for shade and HSL hue for undertone.
+-- Fantasy skin (purple/pink/green/blue) uses luminance to shift
+-- the COLOR NAME (pink -> purple -> eggplant), not just the shade.
 local function DescribeSkinColor(hexString)
     local hue, saturation, lightness = HexToHSL(hexString)
+    local luminance = PerceptualLuminance(hexString)
 
-    -- Very low saturation = gray/ashen skin (fantasy races like drow)
+    -- Very low saturation = gray/ashen skin (drow, undead)
     if saturation < 8 then
-        if lightness > 80 then return "pale gray"
-        elseif lightness > 60 then return "light gray"
-        elseif lightness > 40 then return "medium gray"
-        elseif lightness > 25 then return "dark gray"
+        if luminance > 70 then return "pale gray"
+        elseif luminance > 50 then return "light gray"
+        elseif luminance > 30 then return "medium gray"
+        elseif luminance > 15 then return "dark gray"
         else return "very dark gray" end
     end
 
-    -- Fantasy hues (non-human skin): green, blue, purple, pink
+    -- Fantasy hues: use luminance to shift the color NAME.
+    -- Pink at high luminance, purple at mid, eggplant at low.
     if hue >= 70 and hue < 160 then
-        -- Green skin (orcs, goblins, etc.)
-        if lightness > 65 then return "light green"
-        elseif lightness > 45 then return "medium green"
-        elseif lightness > 30 then return "dark green"
+        -- Green skin
+        if luminance > 50 then return "light green"
+        elseif luminance > 30 then return "medium green"
+        elseif luminance > 15 then return "dark green"
         else return "very dark green" end
     elseif hue >= 160 and hue < 250 then
-        -- Blue/cool skin (genasi, some tieflings)
-        if lightness > 65 then return "light blue"
-        elseif lightness > 45 then return "medium blue"
-        elseif lightness > 30 then return "dark blue"
+        -- Blue/teal skin
+        if luminance > 50 then return "light blue"
+        elseif luminance > 30 then return "medium blue"
+        elseif luminance > 15 then return "dark blue"
         else return "very dark blue" end
-    elseif hue >= 250 and hue < 290 then
-        -- Purple skin (drow, tieflings)
-        if lightness > 65 then return "light lavender"
-        elseif lightness > 45 then return "medium purple"
-        elseif lightness > 30 then return "dark purple"
-        else return "very dark purple" end
-    elseif hue >= 290 and hue <= 340 then
-        -- Pink skin (tieflings)
-        if lightness > 65 then return "light pink"
-        elseif lightness > 45 then return "medium pink"
-        elseif lightness > 30 then return "dark pink"
-        else return "very dark pink" end
+    elseif (hue >= 250 and hue < 340) then
+        -- Purple/pink/mauve range.  Luminance determines
+        -- whether it reads as pink, purple, or eggplant.
+        if luminance > 55 then return "light pinkish-lavender"
+        elseif luminance > 40 then return "soft lavender"
+        elseif luminance > 28 then return "medium purple"
+        elseif luminance > 18 then return "dark purple"
+        elseif luminance > 10 then return "deep eggplant"
+        else return "very dark eggplant" end
     end
 
-    -- Natural human-range hues (0-70): rosy, warm, golden, olive
-    -- Base color encodes shade.  Finer bins to differentiate adjacent
-    -- game tones (e.g. Ochre Tone 3 vs 4 are ~5 lightness apart).
-    local baseColor
-    if lightness > 85 then baseColor = "fair porcelain"
-    elseif lightness > 78 then baseColor = "light ivory"
-    elseif lightness > 70 then baseColor = "light peach"
-    elseif lightness > 62 then baseColor = "medium peach"
-    elseif lightness > 55 then baseColor = "medium tan"
-    elseif lightness > 48 then baseColor = "light brown"
-    elseif lightness > 42 then baseColor = "medium brown"
-    elseif lightness > 36 then baseColor = "dark tan"
-    elseif lightness > 30 then baseColor = "dark brown"
-    elseif lightness > 24 then baseColor = "deep brown"
-    elseif lightness > 18 then baseColor = "very deep brown"
-    else baseColor = "ebony" end
+    -- Natural human skin tones (hue 0-70).
+    -- Shade from perceptual luminance, undertone from hue.
+    local shade
+    if luminance > 75 then shade = "very pale"
+    elseif luminance > 60 then shade = "pale"
+    elseif luminance > 48 then shade = "light"
+    elseif luminance > 36 then shade = "medium"
+    elseif luminance > 26 then shade = "medium-dark"
+    elseif luminance > 18 then shade = "dark"
+    elseif luminance > 10 then shade = "very dark"
+    else shade = "deep dark" end
 
     -- Undertone from hue
     local undertone
     if hue < 15 or hue > 340 then undertone = "rosy"
-    elseif hue < 30 then undertone = "warm"
-    elseif hue < 45 then undertone = "golden"
+    elseif hue < 25 then undertone = "warm"
+    elseif hue < 38 then undertone = "golden"
     else undertone = "olive" end
 
-    return baseColor .. ", " .. undertone .. " undertone"
+    return shade .. " skin with " .. undertone .. " undertones"
 end
 
 -- Describe a hair color hex code.
@@ -178,51 +195,78 @@ local function DescribeHairColor(hexString)
 end
 
 -- Describe an eye color hex code.
+-- Uses perceptual luminance + hue + saturation for accurate naming.
 local function DescribeEyeColor(hexString)
     local hue, saturation, lightness = HexToHSL(hexString)
+    local luminance = PerceptualLuminance(hexString)
 
-    -- Low saturation = gray eyes
+    -- Low saturation: gray/silver eyes.
+    -- High luminance + low sat = silver/ice.  Low = steel/dark.
     if saturation < 15 then
-        if lightness > 60 then return "light gray"
-        elseif lightness > 40 then return "gray"
-        elseif lightness > 25 then return "dark gray"
+        if luminance > 55 then return "silver"
+        elseif luminance > 40 then return "steel gray"
+        elseif luminance > 25 then return "dark gray"
         else return "very dark gray" end
     end
 
-    -- Hue-based eye naming
+    -- Red eyes
     if hue < 15 or hue > 350 then
-        if lightness > 50 then return "light red"
+        if luminance > 40 then return "light red"
+        elseif luminance > 20 then return "red"
         else return "deep red" end
+
+    -- Amber/hazel/brown (warm hues 15-40)
     elseif hue < 40 then
-        if lightness > 60 then return "amber"
-        elseif lightness > 40 then return "hazel"
-        else return "dark hazel" end
+        if saturation > 60 and luminance > 35 then return "amber"
+        elseif luminance > 50 then return "light amber"
+        elseif luminance > 30 then return "hazel"
+        elseif luminance > 18 then return "dark brown"
+        else return "very dark brown" end
+
+    -- Golden/yellow-brown (40-65)
     elseif hue < 65 then
-        if lightness > 60 then return "golden"
-        elseif lightness > 40 then return "hazel"
-        else return "dark brown" end
+        if luminance > 45 then return "golden"
+        elseif luminance > 30 then return "hazel"
+        elseif luminance > 18 then return "dark brown"
+        else return "very dark brown" end
+
+    -- Yellow-green / olive (65-90)
     elseif hue < 90 then
-        if lightness > 50 then return "yellow-green"
-        else return "olive green" end
+        if luminance > 40 then return "yellow-green"
+        elseif luminance > 20 then return "olive"
+        else return "dark olive" end
+
+    -- Green (90-160)
     elseif hue < 160 then
-        if lightness > 60 then return "light green"
-        elseif lightness > 40 then return "green"
-        else return "dark green" end
+        if luminance > 45 then return "light green"
+        elseif luminance > 25 then return "green"
+        elseif luminance > 12 then return "dark green"
+        else return "very dark green" end
+
+    -- Teal/cyan (160-200)
     elseif hue < 200 then
-        if lightness > 60 then return "light teal"
-        elseif lightness > 40 then return "teal"
-        else return "dark teal" end
+        if luminance > 45 then return "light teal"
+        elseif luminance > 25 then return "teal"
+        elseif luminance > 12 then return "dark teal"
+        else return "very dark teal" end
+
+    -- Blue (200-250)
     elseif hue < 250 then
-        if lightness > 60 then return "light blue"
-        elseif lightness > 40 then return "blue"
-        else return "dark blue" end
-    elseif hue < 290 then
-        if lightness > 50 then return "light purple"
-        elseif lightness > 30 then return "purple"
-        else return "dark purple" end
+        if luminance > 50 then return "ice blue"
+        elseif luminance > 30 then return "blue"
+        elseif luminance > 15 then return "dark blue"
+        else return "very dark blue" end
+
+    -- Purple/pink (250+) -- luminance determines which
+    elseif hue < 310 then
+        if luminance > 40 then return "light purple"
+        elseif luminance > 25 then return "purple"
+        elseif luminance > 12 then return "dark purple"
+        else return "very dark purple" end
     else
-        if lightness > 50 then return "pink"
-        else return "dark pink" end
+        if luminance > 40 then return "pink"
+        elseif luminance > 25 then return "dark pink"
+        else return "deep magenta" end
     end
 end
 

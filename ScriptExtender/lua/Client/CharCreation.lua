@@ -2809,6 +2809,7 @@ local AppearanceHandler = CreateCCPageHandler({
                         ColorDescriptions.DescribeAppearanceItem(
                             carouselValue)
                     if override then
+                        -- Manual override replaces entirely.
                         itemValue = override
                     else
                         local colorHex =
