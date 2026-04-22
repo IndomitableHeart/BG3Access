@@ -11,8 +11,9 @@
 -- The Manager detects dialog/cutscene widget DC types and delegates here.
 -- This module reads widget DC properties for speech output.
 
-local Log = BG3Access.Client.Log
-local Helpers = BG3Access.Client.Helpers
+local Log        = BG3Access.Client.Log
+local Helpers    = BG3Access.Client.Helpers
+local SpeechData = BG3Access.Client.SpeechData
 
 -- ============================================================================
 -- Constants
@@ -105,12 +106,12 @@ local function HandleSubtitle(dcProps)
         if cleanSpeaker == "" then cleanSpeaker = nil end
     end
 
-    local speechData = Helpers.CreateSpeechData()
+    local speechData = SpeechData.Create()
     if cleanSpeaker then
-        speechData:Add("subtitle",
+        speechData:Add("description",
             cleanSpeaker .. ": " .. cleanSubtitle, "brief")
     else
-        speechData:Add("subtitle", cleanSubtitle, "brief")
+        speechData:Add("description", cleanSubtitle, "brief")
     end
     local fullText = speechData:Format()
     Log.Info("SUBTITLE: " .. fullText)
@@ -156,8 +157,8 @@ local function HandleDialogWidget(dcProps)
     local cleanBody = Helpers.StripMarkupTags(bodyText)
     if not cleanBody or cleanBody == "" then return end
 
-    local dialogSpeech = Helpers.CreateSpeechData()
-    dialogSpeech:Add("dialogBody", cleanBody, "brief")
+    local dialogSpeech = SpeechData.Create()
+    dialogSpeech:Add("description", cleanBody, "brief")
     Log.Info("DIALOG: " .. cleanBody:sub(1, 80))
     Ext.Tolk.Speak(dialogSpeech:Format(), true)
 end
@@ -260,8 +261,8 @@ local function HandleDialogAnswerSnapshot(snapshot)
     if combined == dialogState.lastAnswerText then return end
     dialogState.lastAnswerText = combined
 
-    local answerSpeech = Helpers.CreateSpeechData()
-    answerSpeech:Add("answerText", combined, "brief")
+    local answerSpeech = SpeechData.Create()
+    answerSpeech:Add("name", combined, "brief")
     Log.Info("DIALOG ANSWER: " .. combined:sub(1, 160))
     Ext.Tolk.Speak(answerSpeech:Format(), true)
 end
@@ -293,15 +294,15 @@ local function HandleDialogAnswerFocus(focusedElement)
 
     -- Prefix with answer number if available.
     local answerIndex = dcProps.AnswerIdx
-    local answerFocusSpeech = Helpers.CreateSpeechData()
+    local numberPrefix = ""
     if answerIndex then
         local numIndex = tonumber(answerIndex)
         if numIndex then
-            answerFocusSpeech:Add("answerNumber",
-                tostring(numIndex + 1), "brief")
+            numberPrefix = tostring(numIndex + 1) .. ". "
         end
     end
-    answerFocusSpeech:Add("answerText", cleanAnswer, "brief")
+    local answerFocusSpeech = SpeechData.Create()
+    answerFocusSpeech:Add("name", numberPrefix .. cleanAnswer, "brief")
     local fullText = answerFocusSpeech:Format()
     Log.Info("DIALOG ANSWER: " .. fullText:sub(1, 80))
     Ext.Tolk.Speak(fullText, true)

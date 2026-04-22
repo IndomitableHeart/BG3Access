@@ -485,3 +485,116 @@ Ext.Osiris.RegisterListener("AttackedBy", 7, "after",
 
 _P("BG3Access: Combat event relay registered on '"
     .. COMBAT_CHANNEL .. "'")
+
+-- ============================================================================
+-- Subregion transition relay
+--
+-- Larian's own Osiris story code fires EnteredTrigger / LeftTrigger
+-- events whenever any character crosses a trigger boundary.  We
+-- register listeners, filter for the host character crossing a
+-- subregion trigger (identified by DB_Subregion membership), and
+-- relay a lightweight notification to the client so the accessibility
+-- layer can announce "Entering X" / "Leaving X".  No per-tick polling
+-- -- the work only happens at actual trigger boundaries.
+-- ============================================================================
+
+local SUBREGION_CHANNEL       = "BG3Access_SubregionEvent"
+local SUBREGION_QUERY_CHANNEL = "BG3Access_SubregionQuery"
+
+--- Broadcast a subregion transition to all clients.  Client-side
+--- listener reads the UI-bound SubRegionName TextBlock to get the
+--- localized display name (Larian's Osiris also populates that
+--- widget text on the same tick via SetSubRegionName).
+---
+--- eventName is one of "enter" (crossed boundary into subregion),
+--- "leave" (crossed boundary out), "initial" (player started in
+--- this subregion -- save load or level warp; phrased differently
+--- on the client so it doesn't sound like a fresh crossing).
+local function RelaySubregionEvent(eventName, slug)
+    local payload = nil
+    local okEncode, encoded = pcall(Ext.Json.Stringify, {
+        event = eventName,
+        slug  = slug,
+    })
+    if okEncode then payload = encoded end
+    if not payload then return end
+    pcall(Ext.ServerNet.BroadcastMessage, SUBREGION_CHANNEL, payload)
+end
+
+--- Handler shared between EnteredTrigger and LeftTrigger.  Filters
+--- to the host character + subregion triggers; silently ignores
+--- everything else.
+local function HandleSubregionCrossing(eventName, characterGuid, triggerGuid)
+    local hostOk, host = pcall(Osi.GetHostCharacter)
+    if not hostOk or not host then return end
+    if tostring(characterGuid) ~= tostring(host) then return end
+
+    local rowsOk, rows = pcall(function()
+        return Osi.DB_Subregion:Get(tostring(triggerGuid), nil, nil, nil)
+    end)
+    if not rowsOk or not rows or #rows == 0 then return end
+
+    local slug = tostring(rows[1][2])
+    RelaySubregionEvent(eventName, slug)
+end
+
+pcall(Ext.Osiris.RegisterListener, "EnteredTrigger", 2, "after",
+    function(character, trigger)
+        HandleSubregionCrossing("enter", character, trigger)
+    end)
+
+pcall(Ext.Osiris.RegisterListener, "LeftTrigger", 2, "after",
+    function(character, trigger)
+        HandleSubregionCrossing("leave", character, trigger)
+    end)
+
+--- Broadcast the host character's CURRENT subregion memberships.
+--- Called when a client asks for a subregion prime -- after save
+--- load, level warp, or client reconnect, since EnteredTrigger
+--- doesn't fire for triggers the player is already standing inside.
+--- Multiple subregions can overlap (city + district + building);
+--- we emit the one with the highest tier (most specific) only.
+local function BroadcastCurrentSubregion()
+    local hostOk, host = pcall(Osi.GetHostCharacter)
+    if not hostOk or not host then return end
+
+    local entityOk, entity = pcall(Ext.Entity.Get, host)
+    if not entityOk or not entity then return end
+    local triggersInside = entity.TriggerIsInsideOf
+    if not triggersInside then return end
+    local insideOf = triggersInside.InsideOf
+    if not insideOf or #insideOf == 0 then return end
+
+    -- Walk every trigger the host is inside, pick the subregion with
+    -- the highest tier (fourth column of DB_Subregion).
+    local bestSlug = nil
+    local bestTier = -1
+    for _, triggerGuid in ipairs(insideOf) do
+        local rowsOk, rows = pcall(function()
+            return Osi.DB_Subregion:Get(tostring(triggerGuid),
+                nil, nil, nil)
+        end)
+        if rowsOk and rows and #rows > 0 then
+            local slug = tostring(rows[1][2])
+            local tier = tonumber(rows[1][4]) or 0
+            if tier > bestTier then
+                bestTier = tier
+                bestSlug = slug
+            end
+        end
+    end
+
+    if bestSlug then
+        RelaySubregionEvent("initial", bestSlug)
+    end
+end
+
+Ext.RegisterNetListener(SUBREGION_QUERY_CHANNEL,
+    function(channel, payload, userId)
+        BroadcastCurrentSubregion()
+    end)
+
+_P("BG3Access: Subregion transition relay registered on '"
+    .. SUBREGION_CHANNEL .. "'")
+_P("BG3Access: Subregion prime query registered on '"
+    .. SUBREGION_QUERY_CHANNEL .. "'")

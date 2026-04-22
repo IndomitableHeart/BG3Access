@@ -15,7 +15,7 @@
 -- ============================================================================
 
 local Log = BG3Access.Client.Log
-local Helpers = BG3Access.Client.Helpers
+local SpeechData = BG3Access.Client.SpeechData
 
 local COMBAT_CHANNEL = "BG3Access_Combat"
 
@@ -29,31 +29,22 @@ local currentTurnCharacterGuid = nil
 local currentRound = 0
 local pendingRoundAnnouncement = nil
 
--- Minimal handler state for SpeechData:Speak() dedup.
-local combatSpeechState = {
-    lastSpokenFullText = nil,
-}
-
 -- ---------------------------------------------------------------------------
 -- Speech helpers
 -- ---------------------------------------------------------------------------
 
 --- Speak combat text with interrupt (cuts off previous speech).
---- Combat events are always "user-initiated" in the sense that they
---- are game events the user needs to hear immediately.
+--- Combat events are background events that bypass the SpeechData
+--- field system via SpeakAlert.
 local function SpeakCombatInterrupt(text)
     if not text or text == "" then return end
-    local speechData = Helpers.CreateSpeechData()
-    speechData:Add("combat", text, "brief")
-    speechData:Speak(combatSpeechState, true, nil, true)
+    SpeechData.Alert(text, "interrupt")
 end
 
 --- Speak combat text queued (appends after current speech).
 local function SpeakCombatQueued(text)
     if not text or text == "" then return end
-    local speechData = Helpers.CreateSpeechData()
-    speechData:Add("combat", text, "normal")
-    speechData:Speak(combatSpeechState, false, nil, false)
+    SpeechData.Alert(text, "queue")
 end
 
 -- ---------------------------------------------------------------------------
@@ -335,7 +326,6 @@ local function ResetState()
     currentTurnCharacterGuid = nil
     currentRound = 0
     pendingRoundAnnouncement = nil
-    combatSpeechState.lastSpokenFullText = nil
 end
 
 --- Query: are we currently in combat?

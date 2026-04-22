@@ -23,10 +23,11 @@
 -- LocaString handles, Lua falls back to Ext.Stats API lookups.
 
 local Log = BG3Access.Client.Log
-local Helpers  = BG3Access.Client.Helpers
-local Cutscene = BG3Access.Client.Cutscene
-local CharSheet = BG3Access.Client.CharSheet
-local SpellBook = BG3Access.Client.SpellBook
+local Helpers    = BG3Access.Client.Helpers
+local SpeechData = BG3Access.Client.SpeechData
+local Cutscene   = BG3Access.Client.Cutscene
+local CharSheet  = BG3Access.Client.CharSheet
+local SpellBook  = BG3Access.Client.SpellBook
 
 -- ============================================================================
 -- Constants
@@ -73,15 +74,32 @@ end
 
 -- ============================================================================
 -- Detail view: shared module (Client/DetailView.lua).
--- WorldUI delegates to it via HandleDetailViewToggle / CloseDetailView.
+-- Trigger + handler lookup live in EventRouter so any menu/panel can
+-- use it.  WorldUI exposes the tooltip cache (source of truth for
+-- item facts) via GetLastTooltipTexts, and the close hook for state
+-- reset.  Nothing here calls DetailView.Toggle directly.
 local DetailView = BG3Access.Client.DetailView
 
-local function HandleDetailViewToggle()
-    return DetailView.Toggle(activePanelHandler, lastRawTooltipTexts)
+--- GetLastTooltipTexts: exposes the tooltip cache populated by
+--- DispatchTooltip.  EventRouter owns the detail-view trigger and
+--- fetches this to pass along when opening DetailView.Toggle, since
+--- the builders use the tooltip as source of truth for item facts.
+local function GetLastTooltipTexts()
+    return lastRawTooltipTexts
 end
 
 local function CloseDetailView(silent)
     DetailView.Close(silent)
+end
+
+--- CloseCompareView: close the compare grid (if open) so its d-pad
+--- input subscription doesn't persist after the panel deactivates.
+--- Called on active-handler change, overlay takeover, and module reset.
+local function CloseCompareView(silent)
+    local CompareView = BG3Access.Client.CompareView
+    if CompareView and CompareView.IsOpen() then
+        CompareView.Close(silent)
+    end
 end
 
 -- ============================================================================
@@ -312,7 +330,7 @@ local function SpeakRadialSlot(slotData)
     local cleanTitle = Helpers.StripMarkupTags(slotData.title)
 
     -- Build SpeechData for tooltip diff.
-    local speechData = Helpers.CreateSpeechData()
+    local speechData = SpeechData.Create()
     speechData:Add("title", cleanTitle, "brief")
 
     -- Track title for inspect panel filtering (separate pipeline).
@@ -332,12 +350,18 @@ local function SpeakRadialSlot(slotData)
     if slotData.tagProps and slotData.slotType == "HotBar" then
         local goldValue = slotData.tagProps["Gold"]
         if goldValue and goldValue ~= "" and goldValue ~= "0" then
-            speechData:Add("gold", goldValue .. " gold", "normal")
+            speechData:AddProperty("Gold", goldValue, "normal")
         end
+        -- Stack count for any stackable item.  Goes through the
+        -- dedicated `count` core field so every context that shows
+        -- quantity (radial, inventory, loot, trade, containers,
+        -- camp, alchemy, etc.) speaks the same form.  Only fires
+        -- when > 1 since single items are implicit.
         local stackCount = slotData.tagProps["Count"]
         if stackCount and stackCount ~= "" and stackCount ~= "0"
             and stackCount ~= "1" then
-            speechData:Add("count", "x" .. stackCount, "normal")
+            speechData:Add("count",
+                stackCount .. " available", "normal")
         end
     end
 
@@ -369,15 +393,16 @@ local function HandleRadialOpen()
     if inRadial then return end
     inRadial = true
 
-    local speechData = Helpers.CreateSpeechData()
+    local speechData = SpeechData.Create()
     speechData:Add("title", "Action Radial")
     if not radialHintSpoken then
         radialHintSpoken = true
-        speechData:Add("hint", RADIAL_HINT)
+        speechData:Add("navigationHint", RADIAL_HINT)
     end
     local speech = speechData:Format()
+    if not speech then return end
     Log.Info("RADIAL OPEN: " .. speech)
-    Ext.Tolk.Speak(speech, true)
+    SpeechData.Alert(speech, "interrupt")
 end
 
 --- ClearRadialFocus: called by the Manager when focus moves to a
@@ -422,6 +447,19 @@ local function DispatchTooltip(structuredTooltipData, snapshot)
         tooltipState.lastTooltipSpeech = nil
     end
 
+    -- Tooltip-close signal: tooltipChanged is true but no texts arrived.
+    -- Invalidate tooltip-derived state on the active handler (compare
+    -- stash) and close any open CompareView whose grid was built from
+    -- the tooltip's contents.  Runs even when the module is suppressed
+    -- so state can't linger past a suppression boundary.
+    if snapshot.tooltipChanged and not structuredTooltipData then
+        if activePanelHandler and activePanelHandler.ClearCompareData then
+            activePanelHandler.ClearCompareData()
+        end
+        CloseCompareView(true)
+        lastRawTooltipTexts = nil
+    end
+
     if tooltipSuppressed or not tooltipEnabled then return end
     if not structuredTooltipData then return end
 
@@ -438,20 +476,7 @@ local function DispatchTooltip(structuredTooltipData, snapshot)
     -- Radial fallback: no panel handler active, build simple SpeechData
     -- from roles and speak directly.  Use "brief" verbosity for radial
     -- context (damage/cost only, matching old minimal behavior).
-    local fallbackSpeech = Helpers.CreateSpeechData()
-    for _, tooltipEntry in ipairs(structuredTooltipData) do
-        local role = tooltipEntry.role or ""
-        local entryText = Helpers.StripMarkupTags(tooltipEntry.text)
-        if entryText and entryText ~= "" then
-            if role == "Title" then
-                fallbackSpeech:Add("title", entryText, "brief")
-            elseif role == "PropertyText" then
-                fallbackSpeech:Add("property", entryText, "normal")
-            elseif role == "ContentText" then
-                fallbackSpeech:Add("description", entryText, "verbose")
-            end
-        end
-    end
+    local fallbackSpeech = SpeechData.FromTooltip(structuredTooltipData)
     if lastRadialSpeechData then
         fallbackSpeech = fallbackSpeech:Diff(lastRadialSpeechData)
     end
@@ -466,93 +491,91 @@ end
 
 --- HandleInspectNav: called by EventRouter when d-pad moves focus between
 --- side panels in the PinnedTooltips_c inspect widget.  Reads the focused
---- panel's TextBlocks via C++ BFS and speaks using SpeechData.
+--- panel's TextBlocks via C++ structured BFS and speaks using SpeechData.
 ---
---- C++ BFS order does NOT match visual order -- description paragraphs
---- may come before headings.  Classify by content, not position:
----   Title: shortest qualifying string (heading words like "Action",
----          "Attack Roll", "Advantage" are always short).
----   Subtitle: second-shortest short string (e.g., "Dexterity").
----   Stats: modifier patterns (+5, 2 metres, Once per turn).
----   Description: long strings with periods (explanation paragraphs).
+--- Delegates to SpeechData.FromTooltip -- the same role-based classifier
+--- used by the live tooltip poll -- via the shared TOOLTIP_ROLE_MAP.
+--- Inspect side cards use the game's tooltip templates (Tooltips.xaml)
+--- which have x:Name on most TextBlocks (Title, ContentText,
+--- PropertyText, etc.), so role-based classification is reliable.
+---
+--- Pre-pass: KeyValue WrapPanel templates emit consecutive pairs of
+--- role="KeyValue" entries (label + value).  PairKeyValueEntries
+--- collapses them into {role=<key>, text=<value>} entries so
+--- FromTooltip renders them as "key: value" properties.
 local function HandleInspectNav()
-    local readOk, panelTexts = pcall(Ext.UI.ReadFocusedTextBlocks)
-    if not readOk or not panelTexts or #panelTexts == 0 then return end
-
-    -- First pass: clean and classify all texts.
-    local shortTexts = {}   -- {text, length} for title/subtitle candidates
-    local statTexts = {}    -- modifier/distance strings
-    local longTexts = {}    -- description paragraphs
-
-    for _, text in ipairs(panelTexts) do
-        if text and text ~= "" and text ~= ":" and text ~= "." then
-            local cleaned = Helpers.StripMarkupTags(text)
-            if cleaned and cleaned ~= ""
-                and cleaned ~= ":" and cleaned ~= "." then
-                cleaned = cleaned:gsub("[%.:%s]+$", "")
-                if cleaned == "" then goto nextInspectItem end
-
-                if cleaned:match("^[%+%-]%d+")
-                    or cleaned:match("^%d+%s*m") then
-                    statTexts[#statTexts + 1] = cleaned
-                elseif #cleaned <= 30 and not cleaned:find("%.")
-                    and not cleaned:match("^%d+$")
-                    and not cleaned:match("^%(.*%)$") then
-                    shortTexts[#shortTexts + 1] = {
-                        text = cleaned, length = #cleaned
-                    }
-                else
-                    longTexts[#longTexts + 1] = cleaned
-                end
-            end
-        end
-        ::nextInspectItem::
+    local focused = Ext.UI.GetFocusedElement()
+    if not focused then return end
+    local readOk, structuredTexts = pcall(
+        Ext.UI.ReadElementStructuredTextBlocks, focused)
+    if not readOk or not structuredTexts or #structuredTexts == 0 then
+        return
     end
 
-    -- Keep BFS encounter order for short texts (first encountered
-    -- = most likely the heading).  Do NOT sort by length -- "Dexterity"
-    -- is shorter than "Attack Roll" but "Attack Roll" is the title.
+    local pairedTexts = SpeechData.PairKeyValueEntries(structuredTexts)
+    local speechData = SpeechData.FromTooltip(pairedTexts)
 
-    -- Build SpeechData: title, subtitle, stats, description.
-    local speechData = Helpers.CreateSpeechData()
-
-    if #shortTexts >= 1 then
-        speechData:Add("title", shortTexts[1].text, "brief")
-    end
-    for shortIndex = 2, #shortTexts do
-        speechData:Add("subtitle", shortTexts[shortIndex].text, "normal")
-    end
-    for _, statText in ipairs(statTexts) do
-        speechData:Add("stat", statText, "brief")
-    end
-    for _, descText in ipairs(longTexts) do
-        speechData:Add("description", descText, "verbose")
-    end
+    -- Some inspect tooltip templates (StatusTooltip et al.) put the
+    -- title/subtitle TextBlocks under unnamed container chains that
+    -- C++ parent-role promotion can't reach, so FromTooltip drops
+    -- them.  Fill any missing title/sectionLabel/description core
+    -- fields from unnamed short/long entries as a fallback.  Named
+    -- roles win because we check HasField before filling.
+    SpeechData.PromoteEmptyRoleTitle(speechData, pairedTexts)
+    SpeechData.PromoteEmptyRoleDescription(speechData, pairedTexts)
 
     local speech = speechData:Format()
-    if speech then
+    if speech and speech ~= "" then
         Log.Info("INSPECT NAV: " .. speech)
         Ext.Tolk.Speak(speech, true)
     end
 end
 
 --- SpeakInspectData: called when PinnedTooltips_c widget appears (right
---- stick inspect).  Reads TextBlocks directly from the inspect widget
---- via C++ BFS (same approach as tooltip scanner but targeting a widget).
---- This captures the side panel detail (dice, damage type, range in feet,
---- attack modifier, cost explanation) that the tooltip popup didn't have.
---- Falls back to stored tooltip texts if the widget read fails.
+--- stick inspect).  Reads the MAIN tooltip subtree (not the linked
+--- side panels) via structured role-based extraction and speaks the
+--- overview through SpeechData.FromTooltip.
+---
+--- XAML structure: PinnedTooltips_c contains a `PinnedContainer`
+--- (Grid) for the primary item tooltip AND a `ChildTooltipsContainer`
+--- (ScrollViewer) for linked side panels (Burning, Bonus Action,
+--- Single Use, Item Weight, Item Price, etc.).  Early versions read
+--- the WHOLE widget with a flat-text BFS, which conflated main-item
+--- data with side-panel data -- e.g. a Potion of Healing's 2d4+2
+--- healing got mixed with the linked Burning condition's 1d4 Fire
+--- damage ("Damage: 1 to 4, 1d4 Fire plus 2d4+2" -- misleading).
+---
+--- Now we target only PinnedContainer via FindNameInWidget, run the
+--- structured reader primitive on it, and let FromTooltip classify
+--- each TextBlock by role.  Side panels remain navigable via d-pad
+--- through HandleInspectNav (each reads with correct per-panel
+--- structure).
+---
 --- @return boolean  True if inspect data was spoken, false if nothing found.
 local function SpeakInspectData()
-    -- Try reading the inspect widget directly via C++ BFS.
-    local readOk, widgetTexts = pcall(
-        Ext.UI.ReadWidgetTextBlocks, "PinnedTooltips_c")
-    if readOk and widgetTexts and #widgetTexts > 0 then
-        local inspectData = Helpers.FormatInspectTexts(
-            widgetTexts, lastSpokenRadialTitle)
-        if inspectData then
-            local inspectSpeech = inspectData:Format()
-            if inspectSpeech then
+    -- Resolve PinnedContainer (the main-tooltip Grid inside the
+    -- PinnedTooltips_c widget).  FindNameInWidget walks across
+    -- visible widgets to find the named element, bypassing the
+    -- widget NameScope boundary.
+    local findOk, mainContainer = pcall(
+        Ext.UI.FindNameInWidget, "PinnedContainer")
+    if findOk and mainContainer then
+        local readOk, structuredTexts = pcall(
+            Ext.UI.ReadElementStructuredTextBlocks, mainContainer)
+        if readOk and structuredTexts and #structuredTexts > 0 then
+            local pairedTexts = SpeechData.PairKeyValueEntries(
+                structuredTexts)
+            local speechData = SpeechData.FromTooltip(pairedTexts)
+            SpeechData.PromoteEmptyRoleTitle(speechData, pairedTexts)
+            SpeechData.PromoteEmptyRoleDescription(
+                speechData, pairedTexts)
+            -- Potions/scrolls/consumables: relabel orphan Damage
+            -- dice to Dice so "2d4+2" doesn't read as "Damage: 2d4+2"
+            -- when it's actually healing/effect dice.  Shared with
+            -- FormatItemTooltip for consistent labeling.
+            SpeechData.RelabelOrphanDamageDice(speechData)
+            local inspectSpeech = speechData:Format()
+            if inspectSpeech and inspectSpeech ~= "" then
                 Log.Info("INSPECT (widget): " .. inspectSpeech)
                 Ext.Tolk.Speak(inspectSpeech, true)
                 return true
@@ -560,25 +583,21 @@ local function SpeakInspectData()
         end
     end
 
-    -- Fallback: use stored tooltip texts if widget read failed.
-    -- lastRawTooltipTexts is now {role, text} tables; extract flat
-    -- text array for FormatInspectTexts which expects plain strings.
+    -- Fallback: use stored tooltip texts if PinnedContainer lookup
+    -- failed.  Same structured path via FromTooltip.
     if lastRawTooltipTexts and #lastRawTooltipTexts > 0 then
-        local flatTexts = {}
-        for _, tooltipEntry in ipairs(lastRawTooltipTexts) do
-            if tooltipEntry.text and tooltipEntry.text ~= "" then
-                flatTexts[#flatTexts + 1] = tooltipEntry.text
-            end
-        end
-        local inspectData = Helpers.FormatInspectTexts(
-            flatTexts, lastSpokenRadialTitle)
-        if inspectData then
-            local inspectSpeech = inspectData:Format()
-            if inspectSpeech then
-                Log.Info("INSPECT (fallback): " .. inspectSpeech)
-                Ext.Tolk.Speak(inspectSpeech, true)
-                return true
-            end
+        local pairedTexts = SpeechData.PairKeyValueEntries(
+            lastRawTooltipTexts)
+        local speechData = SpeechData.FromTooltip(pairedTexts)
+        SpeechData.PromoteEmptyRoleTitle(speechData, pairedTexts)
+        SpeechData.PromoteEmptyRoleDescription(
+            speechData, pairedTexts)
+        SpeechData.RelabelOrphanDamageDice(speechData)
+        local inspectSpeech = speechData:Format()
+        if inspectSpeech and inspectSpeech ~= "" then
+            Log.Info("INSPECT (fallback): " .. inspectSpeech)
+            Ext.Tolk.Speak(inspectSpeech, true)
+            return true
         end
     end
 
@@ -638,7 +657,7 @@ local function CreatePanelHandler(config)
         lastSpeechData       = nil,   -- SpeechData from last handler speech
         lastFocusedData      = nil,   -- last focusedElement data table (for detail view)
         lastTooltipSpeech    = nil,   -- tooltip dedup (inline comparison)
-        spokenFields         = {},    -- set of field names spoken (for tooltip cross-off)
+        spokenRoles          = {},    -- set of field names spoken (for tooltip cross-off)
         spokenValues         = {},    -- set of spoken values (for carousel dedup)
         tabHintSpoken        = false,
         screenEntryJustSpoke = false,
@@ -653,18 +672,25 @@ local function CreatePanelHandler(config)
     }
 
     -- -----------------------------------------------------------------
-    -- RecordSpokenFields: populate spokenFields and spokenValues from
+    -- RecordSpokenRoles: populate spokenRoles and spokenValues from
     -- a SpeechData's fields so tooltip cross-off and carousel dedup
     -- can reference what was already spoken.
     -- -----------------------------------------------------------------
-    local function RecordSpokenFields(speechData)
-        handlerState.spokenFields = {}
+    local function RecordSpokenRoles(speechData)
+        handlerState.spokenRoles = {}
         handlerState.spokenValues = {}
-        for _, field in ipairs(speechData.fields) do
-            handlerState.spokenFields[field.name] = true
-            if field.value and field.value ~= "" then
+        for fieldName, fieldValue in pairs(speechData.coreFields) do
+            handlerState.spokenRoles[fieldName] = true
+            if fieldValue and fieldValue ~= "" then
                 handlerState.spokenValues[
-                    Helpers.NormalizeForCompare(field.value)] = true
+                    Helpers.NormalizeForCompare(fieldValue)] = true
+            end
+        end
+        for _, prop in ipairs(speechData.properties) do
+            handlerState.spokenRoles["property:" .. prop.label] = true
+            if prop.value and prop.value ~= "" then
+                handlerState.spokenValues[
+                    Helpers.NormalizeForCompare(prop.value)] = true
             end
         end
     end
@@ -685,6 +711,18 @@ local function CreatePanelHandler(config)
             or snapshot.selectionChanged
             or snapshot.inlineCarouselChanged
             or snapshot.valueChanged
+
+        -- Clear stale compare data on focus change.  HandleTooltip
+        -- re-populates when the new item's tooltip (with compare card)
+        -- arrives; until then, RS-Right falls through to default
+        -- behavior instead of opening a grid for the previous item.
+        -- Also close an open compare view: its local grid was built
+        -- from the previous item's cards and is now stale.
+        if snapshot.focusChanged then
+            handlerState.focusedCompareData = nil
+            handlerState.compareData = nil
+            CloseCompareView(true)
+        end
 
         -- Dialog answer navigation: when focus changes within an active
         -- dialog, the cutscene module handles answer speech.
@@ -737,8 +775,8 @@ local function CreatePanelHandler(config)
             local updateText = widgetBody or widgetActions
             if updateText and updateText ~= ""
                 and updateText ~= handlerState.lastSpokenFullText then
-                local updateSpeech = Helpers.CreateSpeechData()
-                updateSpeech:Add("widgetUpdate", updateText, "brief")
+                local updateSpeech = SpeechData.Create()
+                updateSpeech:Add("status", updateText, "brief")
                 updateSpeech:Speak(handlerState, false, nil, userInitiated)
                 return
             end
@@ -757,7 +795,7 @@ local function CreatePanelHandler(config)
             if carouselValue ~= handlerState.lastSpokenFullText
                 and not handlerState.spokenValues[
                     Helpers.NormalizeForCompare(carouselValue)] then
-                local carouselSpeech = Helpers.CreateSpeechData()
+                local carouselSpeech = SpeechData.Create()
                 carouselSpeech:Add("value", carouselValue, "brief")
                 carouselSpeech:Speak(handlerState, false, nil, userInitiated)
             end
@@ -772,13 +810,16 @@ local function CreatePanelHandler(config)
                     focusedElement, handlerState, snapshot)
                 -- SpeechData object: compute delta against previous
                 -- SpeechData and speak only what changed.
-                if type(customName) == "table" and customName.fields then
+                if type(customName) == "table" and customName.coreFields then
                     local delta = customName:Delta(
                         handlerState.lastSpeechData)
                     local deltaFormatted = delta:Format()
+                    -- Always update lastSpeechData so subsequent
+                    -- deltas compare against the most recent state,
+                    -- even when the current tick was silent.
+                    handlerState.lastSpeechData = customName
+                    handlerState.lastSpokenFullText = customName:Format()
                     if deltaFormatted and deltaFormatted ~= "" then
-                        handlerState.lastSpeechData = customName
-                        handlerState.lastSpokenFullText = customName:Format()
                         Log.Info("VALUE [" .. config.name .. "]: "
                             .. deltaFormatted)
                         Ext.Tolk.Speak(deltaFormatted, true)
@@ -788,7 +829,7 @@ local function CreatePanelHandler(config)
                 -- Non-empty string: wrap in SpeechData and speak.
                 if customName and customName ~= "" then
                     if customName ~= handlerState.lastSpokenFullText then
-                        local valueSpeech = Helpers.CreateSpeechData()
+                        local valueSpeech = SpeechData.Create()
                         valueSpeech:Add("value", customName, "brief")
                         valueSpeech:Speak(handlerState, false, nil,
                             userInitiated)
@@ -801,7 +842,7 @@ local function CreatePanelHandler(config)
             local valueText = Helpers.FormatDCValue(focusedElement.dcProps)
             if valueText and valueText ~= ""
                 and valueText ~= handlerState.lastSpokenFullText then
-                local valueSpeech = Helpers.CreateSpeechData()
+                local valueSpeech = SpeechData.Create()
                 valueSpeech:Add("value", valueText, "brief")
                 valueSpeech:Speak(handlerState, false, nil, userInitiated)
             end
@@ -811,7 +852,7 @@ local function CreatePanelHandler(config)
         -- =============================================================
         -- Screen entry or item navigation: build SpeechData, speak.
         -- =============================================================
-        local speechData = Helpers.CreateSpeechData()
+        local speechData = SpeechData.Create()
         local tabName = nil
         local normalTab = ""
         local screenTitle = nil
@@ -895,7 +936,7 @@ local function CreatePanelHandler(config)
                     end
                 end
                 if panelHint then
-                    speechData:Add("hint", panelHint, "normal")
+                    speechData:Add("navigationHint", panelHint, "normal")
                 end
             end
 
@@ -911,7 +952,7 @@ local function CreatePanelHandler(config)
                     showTabName = false
                 end
                 if showTabName then
-                    speechData:Add("tabName", tabName, "brief")
+                    speechData:Add("sectionLabel", tabName, "brief")
                 end
             end
 
@@ -937,7 +978,7 @@ local function CreatePanelHandler(config)
                 speechData:Add("description", bodyAssembled, "normal")
             end
             if widgetActions then
-                speechData:Add("actions", widgetActions, "normal")
+                speechData:Add("instructionHint", widgetActions, "normal")
             end
         else
             -- Item navigation: dedup check.
@@ -972,7 +1013,7 @@ local function CreatePanelHandler(config)
             splitName, splitValue, splitDesc = config.customItemFn(
                 focusedElement, handlerState, snapshot)
             -- Check if customItemFn returned a SpeechData object.
-            if type(splitName) == "table" and splitName.fields then
+            if type(splitName) == "table" and splitName.coreFields then
                 customSpeechData = splitName
                 customHandled = true
             elseif splitName ~= nil then
@@ -984,7 +1025,8 @@ local function CreatePanelHandler(config)
         -- Empty SpeechData (zero fields) = handler handled everything
         -- itself (e.g., Book reader), suppress all generic speech.
         if customSpeechData then
-            if #customSpeechData.fields == 0 then
+            if next(customSpeechData.coreFields) == nil
+                and #customSpeechData.properties == 0 then
                 handlerState.lastFocusedData = focusedElement
                 return
             end
@@ -993,22 +1035,31 @@ local function CreatePanelHandler(config)
             -- Merge screen entry fields (title/hint/tab) into the custom
             -- SpeechData if this is a screen entry.
             if isScreenEntry then
-                local merged = Helpers.CreateSpeechData()
-                -- Copy screen entry fields first.
-                for _, field in ipairs(speechData.fields) do
-                    merged:Add(field.name, field.value, field.tier)
+                local merged = SpeechData.Create()
+                -- Copy screen entry core fields first.
+                for fieldName, fieldValue in pairs(speechData.coreFields) do
+                    merged:Add(fieldName, fieldValue,
+                        speechData.tiers[fieldName])
+                end
+                for _, prop in ipairs(speechData.properties) do
+                    merged:AddProperty(prop.label, prop.value, prop.tier)
                 end
                 -- Then custom handler fields.
-                for _, field in ipairs(customSpeechData.fields) do
-                    merged:Add(field.name, field.value, field.tier)
+                for fieldName, fieldValue in pairs(
+                        customSpeechData.coreFields) do
+                    merged:Add(fieldName, fieldValue,
+                        customSpeechData.tiers[fieldName])
+                end
+                for _, prop in ipairs(customSpeechData.properties) do
+                    merged:AddProperty(prop.label, prop.value, prop.tier)
                 end
                 handlerState.lastSpeechData = merged
-                RecordSpokenFields(merged)
+                RecordSpokenRoles(merged)
                 merged:Speak(handlerState, isScreenEntry, nil,
                     userInitiated)
             else
                 handlerState.lastSpeechData = customSpeechData
-                RecordSpokenFields(customSpeechData)
+                RecordSpokenRoles(customSpeechData)
                 customSpeechData:Speak(handlerState, isScreenEntry, nil,
                     userInitiated)
             end
@@ -1069,7 +1120,7 @@ local function CreatePanelHandler(config)
         end
 
         speechData:Add("name", itemName, "brief")
-        speechData:Add("info", itemInfo, "normal")
+        speechData:AddProperty("Info", itemInfo, "normal")
         speechData:Add("value", itemValue, "brief")
         speechData:Add("description", itemDesc, "verbose")
 
@@ -1077,7 +1128,7 @@ local function CreatePanelHandler(config)
         handlerState.lastFocusedData = focusedElement
         handlerState.lastSpeechData = speechData
         -- Record which fields we spoke (for tooltip cross-off).
-        RecordSpokenFields(speechData)
+        RecordSpokenRoles(speechData)
         speechData:Speak(handlerState, isScreenEntry, nil, userInitiated)
     end
 
@@ -1110,6 +1161,11 @@ local function CreatePanelHandler(config)
         handlerState.titleOverride = nil
         handlerState.bodyOverride = nil
         handlerState.pendingWidgetEvent = nil
+        -- Compare stash lives across tooltip events; clear on handler
+        -- teardown so re-entering the panel doesn't pick up state from
+        -- a previous session's tooltip.
+        handlerState.focusedCompareData = nil
+        handlerState.compareData = nil
         if config.onReset then
             config.onReset(handlerState)
         end
@@ -1149,41 +1205,98 @@ local function CreatePanelHandler(config)
             return handlerState.lastFocusedData
         end,
         BuildDetailList   = config.buildDetailList,
-        --- HandleTooltip: receive structured tooltip data ({role, text}
-        --- array), optionally re-format via customTooltipFn, skip
-        --- fields the handler already spoke, then speak with dedup.
-        --- @param structuredData table  Array of {role, text} from C++.
+        --- HandleTooltip: process an open tooltip.
+        ---
+        --- Single-card tooltips (most cases) flow through the normal
+        --- role-mapping pipeline on the whole popup's TextBlocks.
+        ---
+        --- Compare-mode tooltips (inventory items focused on a
+        --- non-selected character) render CompareTooltipTemplate with
+        --- two named ContentControls:
+        ---   HoveredItemPanel  = focused item's card
+        ---   EquippedItemPanel = currently-equipped counterpart
+        --- Lua detects this via primitives (GetTooltipPopupRoot +
+        --- FindNameInWidgetScoped) and:
+        ---   1. Speaks the MAIN tooltip from HoveredItemPanel only
+        ---      (no doubled Equipped-by/Weight/Gold across cards)
+        ---   2. Stashes both cards as separate SpeechData objects on
+        ---      handlerState for the CompareView RS-Right grid
+        ---   3. Adds a "Comparison available, right stick right" hint
+        ---      to the main tooltip speech
+        ---
+        --- @param structuredData table  Array of {role, text} from C++ (whole popup).
         --- @param rawTexts table  Same structured array (for customTooltipFn).
         --- @param focusedDCType string|nil  DC type of focused element.
         HandleTooltip = function(structuredData, rawTexts, focusedDCType)
-            -- Each handler decides what to speak via customTooltipFn.
-            -- No customTooltipFn = no tooltip speech.
-            if not config.customTooltipFn then return end
-            local tooltipData = config.customTooltipFn(
-                rawTexts, focusedDCType)
-            if not tooltipData or tooltipData == ""
-                or #tooltipData.fields == 0 then return end
-
-            -- Step 2: Skip fields the handler already spoke.
-            local filtered = Helpers.CreateSpeechData()
-            for _, field in ipairs(tooltipData.fields) do
-                if not handlerState.spokenFields[field.name] then
-                    filtered:Add(field.name, field.value, field.tier)
+            -- Compare-mode detection: if both named panels exist, read
+            -- each card's entries separately via primitives.  The
+            -- focused-card entries go to the main speech path; both
+            -- go (without cross-off) to CompareView state.
+            handlerState.focusedCompareData = nil
+            handlerState.compareData = nil
+            local focusedEntries = structuredData
+            local compareEntries = nil
+            local popupRoot = Ext.UI.GetTooltipPopupRoot()
+            if popupRoot then
+                local hoveredPanel = Ext.UI.FindNameInWidgetScoped(
+                    "HoveredItemPanel", popupRoot)
+                local equippedPanel = Ext.UI.FindNameInWidgetScoped(
+                    "EquippedItemPanel", popupRoot)
+                if hoveredPanel and equippedPanel then
+                    local hEntries = Ext.UI
+                        .ReadElementStructuredTextBlocks(hoveredPanel)
+                    local eEntries = Ext.UI
+                        .ReadElementStructuredTextBlocks(equippedPanel)
+                    if hEntries and eEntries
+                        and #hEntries > 0 and #eEntries > 0 then
+                        focusedEntries = hEntries
+                        compareEntries = eEntries
+                    end
                 end
             end
-            if tooltipData.skipDiff then
-                filtered.skipDiff = true
-            end
-            tooltipData = filtered
 
-            -- Step 3: Format and speak with inline dedup.
-            local tooltipSpeech = tooltipData:Format(
-                config.tooltipVerbosity or "verbose")
+            -- Main speech pipeline (focused card only in compare mode,
+            -- whole popup in single-card mode).
+            local tooltipData
+            if config.customTooltipFn then
+                tooltipData = config.customTooltipFn(
+                    focusedEntries, focusedDCType, handlerState)
+            else
+                tooltipData = SpeechData.FromTooltip(
+                    focusedEntries, handlerState.spokenRoles)
+            end
+            if not tooltipData or tooltipData == ""
+                or (next(tooltipData.coreFields) == nil
+                    and #tooltipData.properties == 0) then return end
+
+            -- Compare data: build separate SpeechData objects WITHOUT
+            -- cross-off so CompareView has both items' full facts
+            -- (including names) regardless of what focus already spoke.
+            if compareEntries then
+                local focusedNoCrossOff = SpeechData.FromTooltip(
+                    focusedEntries)
+                local compareSpeech = SpeechData.FromTooltip(
+                    compareEntries)
+                if focusedNoCrossOff and compareSpeech
+                    and compareSpeech.coreFields.name then
+                    handlerState.focusedCompareData = focusedNoCrossOff
+                    handlerState.compareData = compareSpeech
+                    if not tooltipData:HasField("instructionHint") then
+                        tooltipData:Add("instructionHint",
+                            "Comparison available, right stick right",
+                            "brief")
+                    end
+                end
+            end
+
+            -- Format and speak with inline dedup.  No explicit
+            -- verbosity: Format() falls back to the module-global
+            -- currentVerbosity so RS-Down cycling affects tooltips
+            -- the same as every other speech path.
+            local tooltipSpeech = tooltipData:Format()
             if not tooltipSpeech or tooltipSpeech == "" then return end
             if tooltipSpeech == handlerState.lastTooltipSpeech then return end
             handlerState.lastTooltipSpeech = tooltipSpeech
-            local disableInterrupt = config.shouldDisableInterrupt
-                and config.shouldDisableInterrupt()
             Log.Info("TOOLTIP: " .. tooltipSpeech)
             -- Queue after item speech (interrupt=false).  The handler
             -- already spoke the item name; tooltip is supplemental.
@@ -1191,6 +1304,25 @@ local function CreatePanelHandler(config)
         end,
         ResetTooltipDedup = function()
             handlerState.lastTooltipSpeech = nil
+        end,
+        --- ClearCompareData: invalidate tooltip-derived compare stash.
+        --- Called by DispatchTooltip on the tooltip-close signal so a
+        --- subsequent RS-Right can't open a grid for a tooltip that is
+        --- no longer on screen.
+        ClearCompareData = function()
+            handlerState.focusedCompareData = nil
+            handlerState.compareData = nil
+        end,
+        --- GetCompareData: returns (focusedSpeech, compareSpeech) when
+        --- the last tooltip contained a compare card, or nil otherwise.
+        --- Used by the EventRouter RS-Right dispatcher to open CompareView.
+        GetCompareData = function()
+            if handlerState.focusedCompareData
+                and handlerState.compareData then
+                return handlerState.focusedCompareData,
+                    handlerState.compareData
+            end
+            return nil, nil
         end,
     }
 end
@@ -1282,10 +1414,10 @@ local ExamineHandler = CreatePanelHandler({
                     or ResolveLevel(dcProps.NonMagical)
                     or ResolveLevel(dcProps.Magical)
 
-                local speechData = Helpers.CreateSpeechData()
-                speechData:Add("resistanceName", damageType, "brief")
+                local speechData = SpeechData.Create()
+                speechData:Add("name", damageType, "brief")
                 if resistanceLevel then
-                    speechData:Add("resistanceLevel",
+                    speechData:AddProperty("Level",
                         resistanceLevel, "brief")
                 end
                 return speechData
@@ -1294,7 +1426,8 @@ local ExamineHandler = CreatePanelHandler({
 
         return nil
     end,
-    customTooltipFn = function(tooltipTexts, focusedDCType)
+    customTooltipFn = function(tooltipTexts, focusedDCType,
+                               handlerState)
         if not tooltipTexts or #tooltipTexts == 0 then return nil end
 
         -- VMRangeStat / VMStat: extract breakdown and description
@@ -1304,59 +1437,33 @@ local ExamineHandler = CreatePanelHandler({
         if focusedDCType
             and (focusedDCType:find("VMRangeStat")
                 or focusedDCType:find("VMStat")) then
-            local speechData = Helpers.CreateSpeechData()
-            for _, tooltipEntry in ipairs(tooltipTexts) do
-                local role = tooltipEntry.role or ""
-                local entryText = Helpers.StripMarkupTags(
-                    tooltipEntry.text)
-                if not entryText or entryText == "" then
-                    goto nextStatEntry
-                end
-                entryText = entryText:gsub("[%.:%s]+$", "")
-                if entryText == "" then goto nextStatEntry end
-
-                if role == "PropertyText" then
-                    speechData:Add("breakdown",
-                        entryText, "normal")
-                elseif role == "ContentText"
-                    or role == "BaseDescription"
-                    or role == "AdditionalDescription" then
-                    speechData:Add("description",
-                        entryText, "verbose")
-                elseif role == "" and #entryText > 30
-                    and entryText ~= "Inspect" then
-                    -- Unnamed long text is likely a description
-                    -- (some tooltip TextBlocks lack x:Names).
-                    speechData:Add("description",
-                        entryText, "verbose")
-                end
-                ::nextStatEntry::
-            end
-            if #speechData.fields == 0 then return nil end
+            local speechData = SpeechData.FromTooltip(tooltipTexts)
+            -- Stat tooltips use PropertyText for component breakdowns
+            -- rather than generic properties.
+            speechData:RelabelProperty("Property", "Breakdown")
+            -- Stat tooltips often put their explanatory body text
+            -- in an unnamed TextBlock (no x:Name).
+            SpeechData.PromoteEmptyRoleDescription(
+                speechData, tooltipTexts, 30)
+            if next(speechData.coreFields) == nil
+                and #speechData.properties == 0 then return nil end
             return speechData
         end
 
-        -- VMResistance: tooltip has the description sentences.
-        -- Handler already spoke name + level, so only add
-        -- description fields.  Skip the title text (e.g.,
-        -- "Bludgeoning Resistance") since the handler covered it.
+        -- VMResistance: tooltip has description sentences in
+        -- BaseDescription and (optionally) AdditionalDescription
+        -- TextBlocks.  Use the shared FromTooltip mapping so both
+        -- land in their own core fields instead of collapsing.
+        -- Title is cross-off filtered (handler spoke name).
         -- skipDiff because the description is new information,
         -- not a duplicate of what the handler said.
         if focusedDCType
             and focusedDCType:find("VMResistance") then
-            local speechData = Helpers.CreateSpeechData()
+            local speechData = SpeechData.FromTooltip(tooltipTexts,
+                handlerState.spokenRoles)
             speechData.skipDiff = true
-            for _, tooltipEntry in ipairs(tooltipTexts) do
-                local entryText = Helpers.StripMarkupTags(
-                    tooltipEntry.text)
-                if entryText and entryText ~= ""
-                    and entryText ~= "Inspect"
-                    and entryText:find("damage") then
-                    speechData:Add("description",
-                        entryText, "normal")
-                end
-            end
-            if #speechData.fields == 0 then return nil end
+            if next(speechData.coreFields) == nil
+                and #speechData.properties == 0 then return nil end
             return speechData
         end
 
@@ -1442,14 +1549,14 @@ local ActiveRollHandler = CreatePanelHandler({
                 or skillName:match("^h%x+g") then
                 return
             end
-            local speechData = Helpers.CreateSpeechData()
+            local speechData = SpeechData.Create()
 
             -- Dialogue line (for dialogue skill checks).
             local dialogueLine = dcProps.SelectedDialogueLine
             if dialogueLine and dialogueLine ~= ""
                 and not dialogueLine:match("^h%x+g")
                 and not dialogueLine:find("%[ForceUpdate%]") then
-                speechData:Add("dialogue", dialogueLine, "normal")
+                speechData:Add("description", dialogueLine, "normal")
             end
 
             -- Build title from roll info: skill, ability check, DC,
@@ -1485,7 +1592,7 @@ local ActiveRollHandler = CreatePanelHandler({
             end
 
             -- Navigation hint (globally toggleable via hintsEnabled).
-            speechData:Add("hint",
+            speechData:Add("navigationHint",
                 "Y to roll. Left and right to browse bonuses.")
 
             local formatted = speechData:Format()
@@ -1500,8 +1607,8 @@ local ActiveRollHandler = CreatePanelHandler({
         -- Re-roll available (Inspiration point or Lucky feat).
         elseif rollState == "WaitForReRoll" then
             handlerState.lastRollState = rollState
-            local speechData = Helpers.CreateSpeechData()
-            speechData:Add("reroll",
+            local speechData = SpeechData.Create()
+            speechData:Add("instructionHint",
                 "Re-roll available. Y to re-roll.", "brief")
             local formatted = speechData:Format()
             if formatted then
@@ -1533,29 +1640,29 @@ local ActiveRollHandler = CreatePanelHandler({
             end
 
             handlerState.lastRollState = rollState
-            local speechData = Helpers.CreateSpeechData()
+            local speechData = SpeechData.Create()
 
             if skipped == "On" then
-                speechData:Add("skipped", "Skipped", "brief")
+                speechData:Add("status", "Skipped", "brief")
             end
 
-            speechData:Add("rolled",
+            speechData:AddProperty("Dice",
                 "Rolled " .. finalResult, "brief")
 
             local resultNumber = tonumber(finalResult) or 0
             if success == "On" then
                 if resultNumber == 20 then
-                    speechData:Add("outcome",
+                    speechData:AddProperty("Outcome",
                         "Critical Success!", "brief")
                 else
-                    speechData:Add("outcome", "Success!", "brief")
+                    speechData:AddProperty("Outcome", "Success!", "brief")
                 end
             else
                 if resultNumber == 1 then
-                    speechData:Add("outcome",
+                    speechData:AddProperty("Outcome",
                         "Critical Failure!", "brief")
                 else
-                    speechData:Add("outcome", "Failure.", "brief")
+                    speechData:AddProperty("Outcome", "Failure.", "brief")
                 end
             end
 
@@ -1584,7 +1691,7 @@ local ActiveRollHandler = CreatePanelHandler({
         -- complete roll data, causing item speech to get interrupted.
         -- Return empty SpeechData to suppress all generic speech too.
         if not handlerState.entrySpoken then
-            return Helpers.CreateSpeechData()
+            return SpeechData.Create()
         end
 
         local elemId = focusedElement.elemId
@@ -1600,7 +1707,7 @@ local ActiveRollHandler = CreatePanelHandler({
         -- consecutively.  Different elements always speak even when
         -- their text is identical (e.g., two "+2" bonuses).
         if elemId and elemId == handlerState.lastBonusElemId then
-            return Helpers.CreateSpeechData()
+            return SpeechData.Create()
         end
         handlerState.lastBonusElemId = elemId
 
@@ -1645,7 +1752,7 @@ local ActiveRollHandler = CreatePanelHandler({
             end
 
             if #parts > 0 then
-                local itemSpeech = Helpers.CreateSpeechData()
+                local itemSpeech = SpeechData.Create()
                 itemSpeech:Add("name",
                     table.concat(parts, " "), "brief")
                 return itemSpeech
@@ -1665,7 +1772,7 @@ local ActiveRollHandler = CreatePanelHandler({
             local advantageType = dcProps.AdvantageType or ""
             local description = dcProps.Description or ""
             if advantageType ~= "" then
-                local itemSpeech = Helpers.CreateSpeechData()
+                local itemSpeech = SpeechData.Create()
                 local advantageText = advantageType
                 if description ~= ""
                     and not description:match("^h%x+g") then
@@ -1681,7 +1788,7 @@ local ActiveRollHandler = CreatePanelHandler({
             local name = dcProps.Name
             if name and name ~= ""
                 and not name:match("^h%x+g") then
-                local itemSpeech = Helpers.CreateSpeechData()
+                local itemSpeech = SpeechData.Create()
                 itemSpeech:Add("name", name, "brief")
                 return itemSpeech
             end
@@ -1692,7 +1799,7 @@ local ActiveRollHandler = CreatePanelHandler({
             local name = dcProps.Name
             if name and name ~= ""
                 and not name:match("^h%x+g") then
-                local itemSpeech = Helpers.CreateSpeechData()
+                local itemSpeech = SpeechData.Create()
                 itemSpeech:Add("name", name, "brief")
                 return itemSpeech
             end
@@ -1959,28 +2066,15 @@ local JournalQuestsHandler = CreatePanelHandler({
         -- Fall through to generic pipeline.
         return nil
     end,
-    customTooltipFn = function(tooltipTexts, focusedDCType)
+    customTooltipFn = function(tooltipTexts, focusedDCType,
+                               handlerState)
         if not tooltipTexts or #tooltipTexts == 0 then return nil end
         -- Quest entries: build SpeechData from roles for full detail.
         if focusedDCType == "ls.QuestView" then
-            local speechData = Helpers.CreateSpeechData()
-            for _, tooltipEntry in ipairs(tooltipTexts) do
-                local role = tooltipEntry.role or ""
-                local entryText = Helpers.StripMarkupTags(
-                    tooltipEntry.text)
-                if entryText and entryText ~= "" then
-                    if role == "Title" then
-                        speechData:Add("title", entryText, "brief")
-                    elseif role == "PropertyText" then
-                        speechData:Add("property",
-                            entryText, "normal")
-                    elseif role == "ContentText" then
-                        speechData:Add("description",
-                            entryText, "verbose")
-                    end
-                end
-            end
-            if #speechData.fields == 0 then return nil end
+            local speechData = SpeechData.FromTooltip(tooltipTexts)
+            speechData:RelabelProperty("Property", "Info")
+            if next(speechData.coreFields) == nil
+                and #speechData.properties == 0 then return nil end
             return speechData
         end
         -- Categories and objectives: suppress (already spoken).
@@ -2032,7 +2126,7 @@ local SelectionFlyOutHandler = CreatePanelHandler({
     customItemFn = function(focusedElement, handlerState, snapshot)
         -- Build SpeechData with custom ordering: title, item, value,
         -- desc, then hint (hint AFTER item name, not before).
-        local speechData = Helpers.CreateSpeechData()
+        local speechData = SpeechData.Create()
 
         -- Title (screen entry only -- collection title from C++).
         -- Note: HandleSnapshot already consumed pendingWidgetEvent, so
@@ -2074,7 +2168,7 @@ local SelectionFlyOutHandler = CreatePanelHandler({
             else
                 hintText = "A to attack. X for actions. B to close"
             end
-            speechData:Add("hint", hintText, "normal")
+            speechData:Add("instructionHint", hintText, "normal")
         end
 
         return speechData
@@ -2172,7 +2266,7 @@ local PartyLineHandler = CreatePanelHandler({
 
         -- Party member character entry.
         if dcType == "ls.Character" and dcProps then
-            local speechData = Helpers.CreateSpeechData()
+            local speechData = SpeechData.Create()
 
             -- Character name from dcProps.
             local charName = dcProps.Name or dcProps.CharacterName
@@ -2182,35 +2276,33 @@ local PartyLineHandler = CreatePanelHandler({
             end
 
             -- Read text blocks for level/class and other info.
+            -- CleanTooltipText handles markup strip, trailing punct,
+            -- Inspect/Close/OK junk filter, and numeric-only reject.
+            -- HP "10/10" would be rejected as numeric-only, so we
+            -- check that pattern BEFORE CleanTooltipText.
             local readOk, textBlocks = pcall(
                 Ext.UI.ReadFocusedTextBlocks)
             if readOk and textBlocks then
                 for _, text in ipairs(textBlocks) do
-                    if text and text ~= "" then
-                        local cleaned = Helpers.StripMarkupTags(text)
-                        if cleaned and cleaned ~= ""
-                            and cleaned ~= charName then
-                            -- Level/class: "Lv 1 Rogue"
+                    local raw = text and
+                        Helpers.StripMarkupTags(text) or nil
+                    if raw and raw:match("^%d+/%d+$") then
+                        speechData:AddProperty("HP", raw, "normal")
+                    else
+                        local cleaned = SpeechData.CleanTooltipText(text)
+                        if cleaned and cleaned ~= charName then
                             if cleaned:match("^Lv %d+") then
-                                speechData:Add("levelClass",
-                                    cleaned, "brief")
-                            -- HP: "10/10"
-                            elseif cleaned:match("^%d+/%d+$") then
-                                speechData:Add("hp",
-                                    "HP " .. cleaned, "normal")
-                            -- Level Up indicator.
+                                -- Strip "Lv " prefix; label supplies
+                                -- the context ("Level: 1 Rogue").
+                                local levelValue = cleaned:gsub(
+                                    "^Lv%s+", "")
+                                speechData:AddProperty("Level",
+                                    levelValue, "brief")
                             elseif cleaned == "Level Up" then
-                                speechData:Add("levelUp",
+                                speechData:Add("status",
                                     "Level Up available", "brief")
-                            -- Reactions header: skip.
-                            elseif cleaned == "Reactions" then
-                                -- skip
-                            -- Inspect label: skip.
-                            elseif cleaned == "Inspect" then
-                                -- skip
-                            -- Reaction names at verbose tier.
-                            else
-                                speechData:Add("reaction",
+                            elseif cleaned ~= "Reactions" then
+                                speechData:AddProperty("Reaction",
                                     cleaned, "verbose")
                             end
                         end
@@ -2218,7 +2310,8 @@ local PartyLineHandler = CreatePanelHandler({
                 end
             end
 
-            if #speechData.fields > 0 then
+            if next(speechData.coreFields) ~= nil
+                or #speechData.properties > 0 then
                 return speechData
             end
         end
@@ -2226,41 +2319,60 @@ local PartyLineHandler = CreatePanelHandler({
         -- Fall through to generic pipeline.
         return nil
     end,
-    customTooltipFn = function(tooltipTexts, focusedDCType)
-        -- Party member tooltip: extract level/class and Level Up
-        -- status.  Reactions are verbose-tier detail.
+    customTooltipFn = function(tooltipTexts, focusedDCType,
+                               handlerState)
+        -- Party member tooltip.  XAML roles available:
+        --   TitleArea -> name (handler already spoke; cross-off)
+        --   ClassAndLevel -> AddProperty("Level", "Lv 1 Rogue")
+        --     (customItemFn already added this; cross-off skips)
+        --   Root -> individual reactions (Opportunity Attack, etc.)
+        --   "" (empty) -> header labels and "Level Up" marker
+        -- FromTooltip handles named roles + cross-off.  Post-
+        -- processing collapses the "Root" reactions into a count
+        -- and scans empty-role text for the Level Up marker.
         if focusedDCType == "ls.Character" and tooltipTexts then
-            local speechData = Helpers.CreateSpeechData()
+            local spokenRoles = handlerState
+                and handlerState.spokenRoles or nil
+            local speechData = SpeechData.FromTooltip(
+                tooltipTexts, spokenRoles)
+
+            -- Count Root reactions and detect Level Up BEFORE
+            -- removing those properties (the removal happens via
+            -- RemoveProperties below).  Level Up text arrives under
+            -- the generic "txt" x:Name which FromTooltip passes
+            -- through as AddProperty("txt", ...).
             local reactionCount = 0
-            local inReactions = false
-            for _, tooltipEntry in ipairs(tooltipTexts) do
-                local entryText = tooltipEntry.text
-                if entryText and entryText ~= "" then
-                    local cleaned = Helpers.StripMarkupTags(entryText)
-                    if not cleaned or cleaned == "" then
-                        -- skip
-                    elseif cleaned == "Inspect" then
-                        -- skip
-                    elseif cleaned == "Reactions" then
-                        inReactions = true
-                    elseif cleaned == "Level Up" then
-                        inReactions = false
-                        speechData:Add("levelUp",
-                            "Level Up available", "brief")
-                    elseif cleaned:match("^Lv %d+") then
-                        speechData:Add("levelClass",
-                            cleaned, "brief")
-                    elseif inReactions then
-                        reactionCount = reactionCount + 1
-                    end
+            local levelUpFound = false
+            for _, prop in ipairs(speechData.properties) do
+                if prop.label == "Root" then
+                    reactionCount = reactionCount + 1
+                elseif prop.label == "txt"
+                    and prop.value:find("Level Up", 1, true) then
+                    levelUpFound = true
                 end
             end
+            -- Drop the raw Root and Level-Up-txt entries; replace
+            -- with semantic equivalents (status, Reactions count).
+            speechData:RemoveProperties(function(prop)
+                if prop.label == "Root" then return true end
+                if prop.label == "txt"
+                    and prop.value:find("Level Up", 1, true) then
+                    return true
+                end
+                return false
+            end)
+            if levelUpFound then
+                speechData:Add("status",
+                    "Level Up available", "brief")
+            end
             if reactionCount > 0 then
-                speechData:Add("reactions",
+                speechData:AddProperty("Reactions",
                     tostring(reactionCount) .. " reactions active",
                     "normal")
             end
-            if #speechData.fields > 0 then
+
+            if next(speechData.coreFields) ~= nil
+                or #speechData.properties > 0 then
                 return speechData
             end
         end
@@ -2283,31 +2395,24 @@ local PartyLineHandler = CreatePanelHandler({
             end
         end
 
-        -- Build remaining fields from tooltip texts ({role, text}).
+        -- Build remaining fields via shared FromTooltip mapping.
+        -- Level from ClassAndLevel role; reactions from Root roles.
         if tooltipTexts then
-            local inReactions = false
-            for _, tooltipEntry in ipairs(tooltipTexts) do
-                local entryText = tooltipEntry.text
-                if entryText and entryText ~= "" then
-                    local cleaned = Helpers.StripMarkupTags(entryText)
-                    if not cleaned or cleaned == "" then
-                        -- skip
-                    elseif cleaned == "Inspect" then
-                        -- skip
-                    elseif cleaned:match("^Lv %d+") then
-                        detailList[#detailList + 1] = {
-                            label = "Level", value = cleaned}
-                    elseif cleaned == "Reactions" then
-                        inReactions = true
-                    elseif cleaned == "Level Up" then
-                        inReactions = false
-                        detailList[#detailList + 1] = {
-                            label = "Level Up",
-                            value = "Available"}
-                    elseif inReactions then
-                        detailList[#detailList + 1] = {
-                            label = "Reaction", value = cleaned}
-                    end
+            local speechData = SpeechData.FromTooltip(tooltipTexts)
+            -- Extract Reaction, Level, and Level Up from properties.
+            -- "Level Up" text arrives under the "txt" x:Name which
+            -- FromTooltip passes through as AddProperty("txt", ...).
+            for _, prop in ipairs(speechData.properties) do
+                if prop.label == "Root" then
+                    detailList[#detailList + 1] = {
+                        label = "Reaction", value = prop.value}
+                elseif prop.label == "Level" then
+                    detailList[#detailList + 1] = {
+                        label = "Level", value = prop.value}
+                elseif prop.label == "txt"
+                    and prop.value:find("Level Up", 1, true) then
+                    detailList[#detailList + 1] = {
+                        label = "Level Up", value = "Available"}
                 end
             end
         end
@@ -2453,13 +2558,20 @@ local MapHandler = CreatePanelHandler({
         local waypointName = dcProps.Name
             or dcProps.DisplayName or dcProps.Title
         if not waypointName or waypointName == "" then
-            -- Fallback: element text from the TextBlock.
             waypointName = focusedElement.elemText
         end
         if not waypointName or waypointName == "" then
             return nil, nil, nil
         end
         waypointName = Helpers.StripMarkupTags(waypointName)
+
+        -- Announce "Waypoints" once when the waypoint panel
+        -- opens (first VMWaypoint focus).
+        if focusedElement.dcType == "ls.VMWaypoint"
+            and not handlerState.waypointsAnnounced then
+            handlerState.waypointsAnnounced = true
+            return "Waypoints. " .. waypointName, nil, nil
+        end
 
         return waypointName, nil, nil
     end,
@@ -2500,11 +2612,11 @@ local function OpenBookReader(handlerState)
     handlerState.bookLineIndex = 0
     local lineCount = #handlerState.bookLines
     Log.Info("BOOK: " .. lineCount .. " lines")
-    local speechData = Helpers.CreateSpeechData()
-    speechData:Add("intro", "Book viewer. Use d-pad up and down"
+    local speechData = SpeechData.Create()
+    speechData:Add("description", "Book viewer. Use d-pad up and down"
         .. " to move line by line through the text.", "brief")
-    speechData:Add("lineCount", lineCount .. " lines.", "normal")
-    speechData:Add("controls",
+    speechData:AddProperty("Lines", lineCount .. " lines.", "normal")
+    speechData:Add("instructionHint",
         "A to pick up. B to close.", "normal")
     speechData:Speak(handlerState, true)
 
@@ -2521,8 +2633,8 @@ local function OpenBookReader(handlerState)
                     if not bookLines then return end
                     local currentIndex = handlerState.bookLineIndex
                     if currentIndex >= #bookLines then
-                        local endSpeech = Helpers.CreateSpeechData()
-                        endSpeech:Add("boundary",
+                        local endSpeech = SpeechData.Create()
+                        endSpeech:Add("status",
                             "End of text", "brief")
                         endSpeech:Speak(handlerState, false, nil, true)
                         return
@@ -2532,8 +2644,8 @@ local function OpenBookReader(handlerState)
                     Log.Info("BOOK [" .. currentIndex .. "/"
                         .. #bookLines .. "]: "
                         .. bookLines[currentIndex]:sub(1, 60))
-                    local lineSpeech = Helpers.CreateSpeechData()
-                    lineSpeech:Add("line",
+                    local lineSpeech = SpeechData.Create()
+                    lineSpeech:Add("description",
                         bookLines[currentIndex], "brief")
                     lineSpeech:Speak(handlerState, false, nil, true)
 
@@ -2543,8 +2655,8 @@ local function OpenBookReader(handlerState)
                     if not bookLines then return end
                     local currentIndex = handlerState.bookLineIndex
                     if currentIndex <= 1 then
-                        local beginSpeech = Helpers.CreateSpeechData()
-                        beginSpeech:Add("boundary",
+                        local beginSpeech = SpeechData.Create()
+                        beginSpeech:Add("status",
                             "Beginning of text", "brief")
                         beginSpeech:Speak(handlerState, false, nil, true)
                         return
@@ -2554,8 +2666,8 @@ local function OpenBookReader(handlerState)
                     Log.Info("BOOK [" .. currentIndex .. "/"
                         .. #bookLines .. "]: "
                         .. bookLines[currentIndex]:sub(1, 60))
-                    local lineSpeech = Helpers.CreateSpeechData()
-                    lineSpeech:Add("line",
+                    local lineSpeech = SpeechData.Create()
+                    lineSpeech:Add("description",
                         bookLines[currentIndex], "brief")
                     lineSpeech:Speak(handlerState, false, nil, true)
 
@@ -2630,7 +2742,7 @@ local BookHandler = CreatePanelHandler({
         -- pipeline entirely (including namedTexts visual text noise
         -- like "Close", "Pick up", "Turn Page").  The book reader
         -- handles all speech directly.
-        return Helpers.CreateSpeechData()
+        return SpeechData.Create()
     end,
 })
 
@@ -2784,6 +2896,15 @@ local ALL_PANEL_HANDLERS = {
 -- Restored when the overlay disappears (widget set shrinks).
 local previousPanelHandler = nil
 
+-- Widget address (hex pointer string) of the widget the active handler
+-- was activated against.  C++ emits snapshot.widgetAddrs (parallel to
+-- snapshot.widgetDCTypes) so we can verify by identity, not DC type.
+-- DC types lie for handlers whose top-level widget is generic
+-- (ls.Widget) but whose nested content carries the distinctive DC
+-- (ActiveRoll, SpellBook, etc.).  Widget addresses don't lie.
+local activePanelHandlerWidgetAddr   = nil
+local previousPanelHandlerWidgetAddr = nil
+
 
 -- DC types that should only activate when the user explicitly focuses
 -- or selects an element inside them (focusedElement/selectedElement),
@@ -2821,8 +2942,11 @@ local function HandlePanelWidgetAdded(widgetData)
     if not newHandler then return end
 
     if newHandler ~= activePanelHandler then
-        -- Close detail view when active handler changes (overlay took over).
+        -- Close detail/compare views when active handler changes
+        -- (overlay took over, tab switch, etc.) so their d-pad
+        -- subscriptions don't persist into the new context.
         CloseDetailView(true)
+        CloseCompareView(true)
         if activePanelHandler then
             -- Save for restoration when overlay closes.
             -- Do NOT reset the previous handler -- its state (tabHintSpoken,
@@ -2830,10 +2954,16 @@ local function HandlePanelWidgetAdded(widgetData)
             -- doesn't re-speak when the overlay closes and the handler is
             -- restored.
             previousPanelHandler = activePanelHandler
+            previousPanelHandlerWidgetAddr = activePanelHandlerWidgetAddr
         end
         activePanelHandler = newHandler
+        -- Anchor the handler to this specific widget's address.  Used
+        -- by close detection to verify presence by identity, not by
+        -- DC type.
+        activePanelHandlerWidgetAddr = widgetData.widgetRootId
         Log.Info("Active panel: " .. activePanelHandler.name
-            .. " (dc=" .. widgetData.dcType .. ")")
+            .. " (dc=" .. widgetData.dcType
+            .. " widget=" .. tostring(activePanelHandlerWidgetAddr) .. ")")
     end
 
     activePanelHandler.HandleWidgetAdded(widgetData)
@@ -2935,8 +3065,35 @@ local function RoutePanelSnapshot(snapshot)
         end
         if discoveredHandler then
             activePanelHandler = discoveredHandler
+            -- Anchor to the widget that carried the identifying DC.
+            -- Prefer focused, then selected, then the first matching
+            -- widget in widgetDCTypes (fallback for widget-level
+            -- discovery).  widgetRootId is set on every FocusEventData.
+            activePanelHandlerWidgetAddr = nil
+            if snapshot.focusedElement
+                and snapshot.focusedElement.widgetRootId
+                and snapshot.focusedElement.widgetRootId ~= "" then
+                activePanelHandlerWidgetAddr =
+                    snapshot.focusedElement.widgetRootId
+            elseif snapshot.selectedElement
+                and snapshot.selectedElement.widgetRootId
+                and snapshot.selectedElement.widgetRootId ~= "" then
+                activePanelHandlerWidgetAddr =
+                    snapshot.selectedElement.widgetRootId
+            elseif snapshot.widgetDCTypes and snapshot.widgetAddrs then
+                for widgetIndex, widgetDCType in ipairs(
+                        snapshot.widgetDCTypes) do
+                    if DC_TYPE_HANDLERS[widgetDCType]
+                            == discoveredHandler then
+                        activePanelHandlerWidgetAddr =
+                            snapshot.widgetAddrs[widgetIndex]
+                        break
+                    end
+                end
+            end
             Log.Info("Active panel (discovered): "
-                .. activePanelHandler.name)
+                .. activePanelHandler.name
+                .. " widget=" .. tostring(activePanelHandlerWidgetAddr))
             -- Handler just activated -- deliver snapshot and return.
             -- Skip close detection on this snapshot: widgetDCTypes
             -- cache is stale (built early in tick before the widget
@@ -2994,81 +3151,48 @@ local function RoutePanelSnapshot(snapshot)
         end
     end
 
-    -- Overlay close detection: when a previous handler is saved
-    -- (overlay like Container took over from CharacterPanel) and the
-    -- widget set changes (selectionChanged on post-settle after overlay
-    -- widget removed), restore the previous handler.
-    if previousPanelHandler
-        and (snapshot.selectionChanged or snapshot.widgetAdded) then
-        -- Check if any widget event this tick has a DC type mapping
-        -- back to the overlay handler.  If yes, overlay is still
-        -- present; otherwise it closed.
-        local overlayStillPresent = false
-        if snapshot.widgetEvents then
-            for _, widgetEvent in ipairs(snapshot.widgetEvents) do
-                if widgetEvent.dcType then
-                    local widgetHandler = DC_TYPE_HANDLERS[
-                        widgetEvent.dcType]
-                    if widgetHandler == activePanelHandler then
-                        overlayStillPresent = true
-                        break
-                    end
+    -- Event-driven handler lifetime: the only close trigger is C++
+    -- firing widgetRemoved with a widget address matching our anchor.
+    -- No polling of widgetAddrs, no inference from "anchor not present"
+    -- -- the tracked-widget array is noisy for specific widgets (BG3
+    -- rebuilds pointers / transient visibility flips), so using it as
+    -- a presence oracle produces false-positive closes.  widgetRemoved
+    -- is an explicit event and fires exactly when a widget genuinely
+    -- goes invisible.
+    if snapshot.widgetRemoved and snapshot.removedWidgetData then
+        local removedAddr = snapshot.removedWidgetData.widgetRootId
+        if removedAddr and removedAddr ~= "" then
+            if removedAddr == activePanelHandlerWidgetAddr then
+                if previousPanelHandler then
+                    Log.Info("Overlay closed, restoring: "
+                        .. previousPanelHandler.name)
+                    activePanelHandler.ResetState()
+                    activePanelHandler = previousPanelHandler
+                    activePanelHandlerWidgetAddr =
+                        previousPanelHandlerWidgetAddr
+                    previousPanelHandler = nil
+                    previousPanelHandlerWidgetAddr = nil
+                else
+                    Log.Info("Panel closed, deactivating: "
+                        .. activePanelHandler.name
+                        .. " widget=" .. tostring(activePanelHandlerWidgetAddr))
+                    CloseDetailView(true)
+                    activePanelHandler.ResetState()
+                    activePanelHandler = nil
+                    activePanelHandlerWidgetAddr = nil
+                    return
                 end
+            elseif removedAddr == previousPanelHandlerWidgetAddr then
+                -- The underlying panel's widget is gone (e.g. user
+                -- navigated away while an overlay was active).  Drop
+                -- the saved previous handler so we don't try to
+                -- restore to a panel that no longer exists.
+                Log.Info("Previous panel widget removed, clearing: "
+                    .. previousPanelHandler.name)
+                previousPanelHandler.ResetState()
+                previousPanelHandler = nil
+                previousPanelHandlerWidgetAddr = nil
             end
-        end
-        if not overlayStillPresent then
-            Log.Info("Overlay closed, restoring: "
-                .. previousPanelHandler.name)
-            activePanelHandler.ResetState()
-            activePanelHandler = previousPanelHandler
-            previousPanelHandler = nil
-        end
-    end
-
-    -- Panel close detection: only run when the widget set actually
-    -- changed (wChg).  If no signal in the snapshot maps to the active
-    -- handler AND focus is gone (no focused element), the panel has
-    -- closed.  This prevents false deactivation from focus alternating
-    -- between mapped and unmapped DC types within the same panel
-    -- (e.g., Examine's VMItem header vs VMRangeStat rows).
-    if snapshot.postSettle or snapshot.widgetAdded then
-        local handlerStillPresent = false
-        -- Widget DC types from the scan.
-        if snapshot.widgetDCTypes then
-            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-                if DC_TYPE_HANDLERS[widgetDCType]
-                    == activePanelHandler then
-                    handlerStillPresent = true
-                    break
-                end
-            end
-        end
-        -- Focused element DC type (discovery-activated handlers).
-        if not handlerStillPresent
-            and snapshot.focusedElement
-            and snapshot.focusedElement.dcType then
-            if DC_TYPE_HANDLERS[snapshot.focusedElement.dcType]
-                == activePanelHandler then
-                handlerStillPresent = true
-            end
-        end
-        -- Selected element DC type.
-        if not handlerStillPresent
-            and snapshot.selectedElement
-            and snapshot.selectedElement.dcType then
-            if DC_TYPE_HANDLERS[snapshot.selectedElement.dcType]
-                == activePanelHandler then
-                handlerStillPresent = true
-            end
-        end
-        if not handlerStillPresent then
-            Log.Info("Panel closed, deactivating: "
-                .. activePanelHandler.name)
-            CloseDetailView(true)
-            activePanelHandler.ResetState()
-            activePanelHandler = nil
-            previousPanelHandler = nil
-            return
         end
     end
 
@@ -3088,7 +3212,9 @@ local function ResetAllPanelHandlers()
         ALL_PANEL_HANDLERS[handlerIndex].ResetState()
     end
     activePanelHandler = nil
+    activePanelHandlerWidgetAddr = nil
     previousPanelHandler = nil
+    previousPanelHandlerWidgetAddr = nil
 end
 
 --- TryActivateFromSnapshot: attempt to discover and activate a panel
@@ -3164,6 +3290,15 @@ end
 --- ResetState: clear all WorldUI state (radial + panels).
 --- Called on GameStateChanged to prevent stale dedup across sessions.
 local function ResetState()
+    -- Detail + compare views: close silently so their d-pad input
+    -- subscriptions don't outlive the session.
+    CloseDetailView(true)
+    CloseCompareView(true)
+    -- Re-arm compare navigation hint for the new session.
+    local CompareView = BG3Access.Client.CompareView
+    if CompareView and CompareView.ResetHint then
+        CompareView.ResetHint()
+    end
     -- Radial state.
     radialHintSpoken = false
     inRadial = false
@@ -3197,8 +3332,10 @@ BG3Access.Client.WorldUI = {
     HandleInspectNav           = HandleInspectNav,
     SetTooltipSuppressed       = SetTooltipSuppressed,
     SetTooltipEnabled          = SetTooltipEnabled,
-    -- Detail view (RS Left virtual property list)
-    HandleDetailViewToggle     = HandleDetailViewToggle,
+    -- Detail view: EventRouter owns the RS Left trigger and handler
+    -- lookup; WorldUI only exposes the tooltip cache that builders
+    -- need as item-facts source, and a close hook for state reset.
+    GetLastTooltipTexts        = GetLastTooltipTexts,
     CloseDetailView            = CloseDetailView,
     -- State management
     ResetState                 = ResetState,

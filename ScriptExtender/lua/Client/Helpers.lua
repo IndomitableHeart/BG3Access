@@ -960,223 +960,7 @@ end
 -- button hints in Lua based on the dialog DC type.
 local DIALOG_BUTTON_HINT = "Press A to confirm, or B to cancel"
 
--- Verbosity tier ranks.  Lower = more essential.
--- "brief" fields are always spoken.  "normal" adds context.
--- "verbose" adds descriptions and secondary details.
-local TIER_RANK = {brief = 1, normal = 2, verbose = 3}
-
--- Global hint toggle.  When false, Format() omits all fields named "hint".
--- Default on.  Will be wired to mod settings later.
-local hintsEnabled = true
-
---- CreateSpeechData: creates an ordered speech data builder.
---- Each field has a name (for debugging/identification), a value (the
---- text to speak), and a verbosity tier (brief/normal/verbose).
---- Fields are spoken in the order they are added.
----
---- Usage:
----   local speech = Helpers.CreateSpeechData()
----   speech:Add("name", "Shortsword", "brief")
----   speech:Add("damage", "4 to 9 Piercing damage", "brief")
----   speech:Add("description", "A common sword...", "verbose")
----   speech:Speak(handlerState, isScreenEntry)
----
---- @return table  Speech data object with :Add(), :Format(), :Speak().
-local function CreateSpeechData()
-    return {
-        fields = {},
-
-        --- Add a labeled field with verbosity tier.
-        --- @param self table  The SpeechData object.
-        --- @param fieldName string  Field name (for identification).
-        --- @param fieldValue string|nil  Text to speak.  Nil/empty skipped.
-        --- @param tier string|nil  "brief", "normal", or "verbose" (default "normal").
-        Add = function(self, fieldName, fieldValue, tier)
-            if fieldValue and fieldValue ~= "" then
-                self.fields[#self.fields + 1] = {
-                    name = fieldName,
-                    value = fieldValue,
-                    tier = tier or "normal",
-                }
-            end
-        end,
-
-        --- HasField: check if a named field has been added.
-        --- @param self table  The SpeechData object.
-        --- @param fieldName string  The field name to check.
-        --- @return boolean
-        HasField = function(self, fieldName)
-            for _, field in ipairs(self.fields) do
-                if field.name == fieldName then return true end
-            end
-            return false
-        end,
-
-        --- Delta: return a new SpeechData with only the fields that are
-        --- new, changed, or removed compared to `previous`.  Used by the
-        --- isValueOnly path to speak only what changed (e.g., "Equipped"
-        --- -> "Unequipped") instead of repeating the full item speech.
-        --- A field present in previous but absent in self is added as
-        --- the negation (e.g., equipped was "Equipped", now absent ->
-        --- "Unequipped").
-        --- @param self table  The new SpeechData.
-        --- @param previous table|nil  The previous SpeechData to compare.
-        --- @return table  New SpeechData with only changed/new fields.
-        Delta = function(self, previous)
-            if not previous or not previous.fields or #previous.fields == 0 then
-                return self
-            end
-            local result = CreateSpeechData()
-
-            -- Build lookup of previous field values by name.
-            local prevByName = {}
-            for _, field in ipairs(previous.fields) do
-                prevByName[field.name] = field.value
-            end
-
-            -- Build lookup of current field values by name.
-            local currByName = {}
-            for _, field in ipairs(self.fields) do
-                currByName[field.name] = field.value
-            end
-
-            -- Fields in self that are new or changed.
-            for _, field in ipairs(self.fields) do
-                local prevValue = prevByName[field.name]
-                if not prevValue then
-                    -- New field.
-                    result:Add(field.name, field.value, field.tier)
-                elseif NormalizeForCompare(field.value)
-                    ~= NormalizeForCompare(prevValue) then
-                    -- Changed value.
-                    result:Add(field.name, field.value, field.tier)
-                end
-            end
-
-            -- Fields removed from previous: "equipped" was present, now
-            -- absent means "Unequipped".
-            if prevByName["equipped"] and not currByName["equipped"] then
-                result:Add("equipped", "Unequipped", "brief")
-            end
-
-            return result
-        end,
-
-        --- Diff: return a new SpeechData with only the fields whose values
-        --- are NOT already present in `other`.  Matching is by normalized
-        --- value (case-insensitive, whitespace/punctuation stripped).
-        --- Substring matching requires >5 chars to prevent false positives
-        --- from short strings like "AC" or "14".
-        --- @param self table  The tooltip SpeechData.
-        --- @param other table|nil  The handler's SpeechData to diff against.
-        --- @return table  New SpeechData with unmatched fields only.
-        --- Diff: return a new SpeechData with only the fields whose
-        --- normalized values do NOT exactly match any field in `other`.
-        --- Exact match only -- no substring heuristics.
-        --- @param self table  The tooltip SpeechData.
-        --- @param other table|nil  The handler's SpeechData.
-        --- @return table  New SpeechData with unmatched fields only.
-        Diff = function(self, other)
-            if not other or not other.fields or #other.fields == 0 then
-                return self
-            end
-            -- Build a set of normalized values from the other
-            -- SpeechData for O(1) lookup.
-            local otherValues = {}
-            for _, otherField in ipairs(other.fields) do
-                otherValues[NormalizeForCompare(otherField.value)] = true
-            end
-            local result = CreateSpeechData()
-            for _, field in ipairs(self.fields) do
-                if not otherValues[NormalizeForCompare(field.value)] then
-                    result:Add(field.name, field.value, field.tier)
-                end
-            end
-            return result
-        end,
-
-        --- Format: assemble fields into a speech string, filtered by
-        --- verbosity.  Fields with tier rank <= verbosity rank are included.
-        ---
-        --- Special field semantics:
-        ---   "title"  -- always included regardless of verbosity tier.
-        ---   "hint"   -- included only when the global hintsEnabled flag
-        ---               is true; tier parameter is ignored.
-        ---   all else -- standard tier filtering applies.
-        ---
-        --- @param self table  The SpeechData object.
-        --- @param verbosity string|nil  "brief", "normal", or "verbose".
-        ---     Default "verbose" (all fields spoken).
-        --- @return string|nil  Assembled speech, or nil if empty.
-        Format = function(self, verbosity)
-            verbosity = verbosity or "verbose"
-            local maxRank = TIER_RANK[verbosity] or 3
-            local parts = {}
-            for _, field in ipairs(self.fields) do
-                local include = false
-                if field.name == "title" then
-                    -- Title fields always speak regardless of verbosity.
-                    include = true
-                elseif field.name == "hint" then
-                    -- Hint fields are globally toggleable.
-                    include = hintsEnabled
-                else
-                    local fieldRank = TIER_RANK[field.tier] or 2
-                    include = fieldRank <= maxRank
-                end
-                if include then
-                    -- Strip trailing punctuation/whitespace before joining.
-                    local cleaned = field.value:gsub("[%.%s]+$", "")
-                    if cleaned ~= "" then
-                        parts[#parts + 1] = cleaned
-                    end
-                end
-            end
-            if #parts == 0 then return nil end
-            return StripMarkupTags(table.concat(parts, ". "))
-        end,
-
-        --- Speak: format and speak the assembled text with interrupt logic.
-        --- Interrupt only when user-initiated (d-pad, button) or screen
-        --- entry.  System events (widget scans, post-settle) append so
-        --- they don't cut off hint or entry speech mid-sentence.
-        --- @param self table  The SpeechData object.
-        --- @param handlerState table  Handler's isolated state.
-        --- @param isScreenEntry boolean  Whether this is a screen entry.
-        --- @param verbosity string|nil  Verbosity level (default "verbose").
-        --- @param userInitiated boolean|nil  True when snapshot had user
-        ---     input (focusChanged, selectionChanged, carousel, value).
-        Speak = function(self, handlerState, isScreenEntry, verbosity,
-                         userInitiated)
-            local assembled = self:Format(verbosity)
-            if not assembled or assembled == "" then return end
-
-            -- Interrupt only on user-initiated events or screen entries.
-            -- System events append so they don't cut off active speech.
-            local interrupt = isScreenEntry or (userInitiated == true)
-
-            -- Visual text (loading tips): body-only, no title/tab/hint/item.
-            -- Always append so tips queue naturally.  But NOT when the
-            -- user initiated the event (d-pad press) -- user input
-            -- should always interrupt.
-            if not userInitiated
-                and self:HasField("description")
-                and not self:HasField("title")
-                and not self:HasField("tabName")
-                and not self:HasField("hint")
-                and not self:HasField("name") then
-                interrupt = false
-            end
-
-            local Log = BG3Access.Client.Log
-            Log.Info("SPEAK"
-                .. (interrupt and "" or " (append)")
-                .. ": " .. assembled)
-            Ext.Tolk.Speak(assembled, interrupt)
-            handlerState.lastSpokenFullText = assembled
-        end,
-    }
-end
+-- SpeechData moved to Client/SpeechData.lua (loaded before Helpers).
 
 --- ExtractFromNamedTexts: extract title and body parts from named text entries.
 --- @param namedTexts table|nil  Map of elementName -> elementText.
@@ -1425,7 +1209,7 @@ local function FormatInspectTexts(widgetTexts, filterTitle)
                     or cleaned == "Class Action"
                     or cleaned == "Cantrip"
                     or cleaned:match("^Level %d+") then
-                    table.insert(categoryParts, "Category: " .. cleaned)
+                    table.insert(categoryParts, cleaned)
                     seen[cleaned] = true
 
                 -- Weapon Damage (label-only, skip)
@@ -1457,8 +1241,11 @@ local function FormatInspectTexts(widgetTexts, filterTitle)
     if #combinedDice > 0 then
         table.insert(damagePhrases, table.concat(combinedDice, " plus "))
     end
+    -- Label "Damage" is applied by AddProperty below; don't suffix
+    -- the value with " Damage" or the formatter produces
+    -- "Damage: ... Damage".
     local damagePhrase = #damagePhrases > 0
-        and table.concat(damagePhrases, ", ") .. " Damage" or nil
+        and table.concat(damagePhrases, ", ") or nil
 
     -- Assemble range phrase: "Melee, 5 feet"
     local rangePhrase = nil
@@ -1487,28 +1274,30 @@ local function FormatInspectTexts(widgetTexts, filterTitle)
     end
 
     -- Final assembly via SpeechData.
-    local speechData = CreateSpeechData()
-    speechData:Add("inspectLabel", "Inspect", "brief")
+    local SpeechDataMod = BG3Access.Client.SpeechData
+    local speechData = SpeechDataMod.Create()
+    speechData:Add("name", "Inspect", "brief")
     if damagePhrase then
-        speechData:Add("damage", damagePhrase, "brief")
+        speechData:AddProperty("Damage", damagePhrase, "brief")
     end
     if rangePhrase then
-        speechData:Add("range", rangePhrase, "brief")
+        speechData:AddProperty("Range", rangePhrase, "brief")
     end
     if attackPhrase then
-        speechData:Add("attack", attackPhrase, "brief")
+        speechData:AddProperty("Attack", attackPhrase, "brief")
     end
     for _, entry in ipairs(costParts) do
-        speechData:Add("cost", entry, "normal")
+        speechData:AddProperty("Cost", entry, "normal")
     end
     for _, entry in ipairs(cooldownParts) do
-        speechData:Add("cooldown", entry, "normal")
+        speechData:AddProperty("Cooldown", entry, "normal")
     end
     for _, entry in ipairs(categoryParts) do
-        speechData:Add("category", entry, "verbose")
+        speechData:AddProperty("Category", entry, "verbose")
     end
 
-    if #speechData.fields <= 1 then return nil end  -- only "Inspect" label
+    -- Only the "Inspect" name with no properties: nothing useful.
+    if #speechData.properties == 0 then return nil end
     return speechData
 end
 
@@ -1522,19 +1311,6 @@ end
 -- ---------------------------------------------------------------------------
 -- Exports
 -- ---------------------------------------------------------------------------
---- SetHintsEnabled: toggle the global hint flag.
---- When false, Format() omits all fields named "hint".
---- @param enabled boolean
-local function SetHintsEnabled(enabled)
-    hintsEnabled = enabled
-end
-
---- GetHintsEnabled: return current hint toggle state.
---- @return boolean
-local function GetHintsEnabled()
-    return hintsEnabled
-end
-
 --- ExpandAbilityAbbreviation: returns the full ability name for a 3-letter
 --- abbreviation (STR -> Strength, INT -> Intelligence, etc.), or nil if
 --- the text is not a recognized abbreviation.
@@ -1563,12 +1339,9 @@ BG3Access.Client.Helpers = {
     LookupSpellDescription       = LookupSpellDescription,
     LookupFeatureDescription     = LookupFeatureDescription,
     LookupStaticDataDescription  = LookupStaticDataDescription,
-    CreateSpeechData             = CreateSpeechData,
     DIALOG_BUTTON_HINT           = DIALOG_BUTTON_HINT,
     ExtractFromNamedTexts        = ExtractFromNamedTexts,
     ExtractFromWidgetData        = ExtractFromWidgetData,
     FormatInspectTexts           = FormatInspectTexts,
-    SetHintsEnabled              = SetHintsEnabled,
-    GetHintsEnabled              = GetHintsEnabled,
     ExpandAbilityAbbreviation    = ExpandAbilityAbbreviation,
 }

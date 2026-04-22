@@ -8,8 +8,9 @@
 BG3Access = BG3Access or {}
 BG3Access.Client = BG3Access.Client or {}
 
-local Log     = BG3Access.Client.Log
-local Helpers = BG3Access.Client.Helpers
+local Log        = BG3Access.Client.Log
+local Helpers    = BG3Access.Client.Helpers
+local SpeechData = BG3Access.Client.SpeechData
 
 -- ============================================================================
 -- State
@@ -29,7 +30,7 @@ local function SpeakDetailItem()
         return
     end
     local entry = detailViewList[detailViewIndex]
-    local speechData = Helpers.CreateSpeechData()
+    local speechData = SpeechData.Create()
     speechData:Add("name", entry.label, "brief")
     if entry.value and entry.value ~= "" then
         speechData:Add("value", entry.value, "brief")
@@ -71,7 +72,7 @@ local function CloseDetailView(silent)
     detailViewIndex = 1
     if not silent then
         Log.Info("DETAIL VIEW: closed")
-        local speechData = Helpers.CreateSpeechData()
+        local speechData = SpeechData.Create()
         speechData:Add("name", "Detail view closed", "brief")
         Ext.Tolk.Speak(speechData:Format(), true)
     else
@@ -118,7 +119,7 @@ local function Toggle(handler, tooltipTexts)
         return false
     end
     if not builtList or #builtList == 0 then
-        local noDetailsSpeech = Helpers.CreateSpeechData()
+        local noDetailsSpeech = SpeechData.Create()
         noDetailsSpeech:Add("name", "No details available", "brief")
         Ext.Tolk.Speak(noDetailsSpeech:Format(), true)
         return true
@@ -153,7 +154,7 @@ local function Toggle(handler, tooltipTexts)
 
     -- Announce entry and speak first item.
     local firstEntry = detailViewList[1]
-    local openSpeechData = Helpers.CreateSpeechData()
+    local openSpeechData = SpeechData.Create()
     openSpeechData:Add("title", "Detail view", "brief")
     openSpeechData:Add("name", firstEntry.label, "brief")
     openSpeechData:Add("value", firstEntry.value, "brief")

@@ -22,6 +22,7 @@
 
 local Log = BG3Access.Client.Log
 local Helpers = BG3Access.Client.Helpers
+local SpeechData = BG3Access.Client.SpeechData
 
 
 -- ============================================================================
@@ -889,10 +890,10 @@ local function SpeakNamingScreen()
     ccState.lastMainTab = "Naming"
     namingScreenWasSpoken = true
 
-    local speechData = Helpers.CreateSpeechData()
+    local speechData = SpeechData.Create()
     speechData:Add("title", "Enter Character Name")
-    speechData:Add("characterName", characterName, "brief")
-    speechData:Add("hint",
+    speechData:Add("name", characterName, "brief")
+    speechData:Add("instructionHint",
         "Press A to rename. Press Y to choose guardian")
     local speech = speechData:Format()
     Log.Info("NAMING SCREEN: " .. speech)
@@ -1001,9 +1002,9 @@ local function SpeakIntroBackstory()
             .. " Everything changes when you awaken imprisoned on an alien ship."
             .. " Perhaps your time has finally come."
     end
-    local speechData = Helpers.CreateSpeechData()
-    speechData:Add("originLabel", "Create a custom character.", "brief")
-    speechData:Add("originBackstory", "Backstory: " .. backstory, "verbose")
+    local speechData = SpeechData.Create()
+    speechData:Add("sectionLabel", "Create a custom character.", "brief")
+    speechData:Add("description", "Backstory: " .. backstory, "verbose")
     local speech = speechData:Format()
     Log.Info("CC INTRO BACKSTORY: " .. speech)
     Ext.Tolk.Speak(speech, true)
@@ -1090,9 +1091,9 @@ end
 
 -- SpeakGuardianEntry: first CC snapshot after naming -> guardian page.
 local function SpeakGuardianEntry()
-    local speechData = Helpers.CreateSpeechData()
+    local speechData = SpeechData.Create()
     speechData:Add("title", "Guardian Appearance", "brief")
-    speechData:Add("hint",
+    speechData:Add("navigationHint",
         "Choose your guardian's appearance."
         .. " D-pad up and down to browse options."
         .. " D-pad left and right to change values."
@@ -1113,9 +1114,9 @@ local function SpeakLevelUpEntry(focusedElement)
     if levelUpClass and levelUpClass ~= "" then
         levelUpTitle = "Level Up: " .. levelUpClass
     end
-    local speechData = Helpers.CreateSpeechData()
+    local speechData = SpeechData.Create()
     speechData:Add("title", levelUpTitle, "brief")
-    speechData:Add("hint",
+    speechData:Add("navigationHint",
         "Up and down to review gains."
         .. " Press Y to accept."
         .. " Press X to add a class."
@@ -1142,11 +1143,11 @@ local function SpeakMainCCEntry(focusedElement)
     ccState.introAwaitingContinue = true
     SubscribeIntroContinue()
 
-    local speechData = Helpers.CreateSpeechData()
+    local speechData = SpeechData.Create()
     -- Title omitted: the welcome text opens with "Welcome to
     -- character creation" which establishes context without
     -- a redundant "Character Creation" prefix.
-    speechData:Add("hint", CC_INTRO_WELCOME, "verbose")
+    speechData:Add("navigationHint", CC_INTRO_WELCOME, "verbose")
     Log.Info("CC FIRST ENTRY: main, intro-await LT")
     return speechData
 end
@@ -1547,8 +1548,11 @@ local function CreateCCPageHandler(config)
     -- The tooltip handler skips any role that's already set here.
     local function RecordSpokenRoles(speechData)
         handlerState.spokenRoles = {}
-        for _, field in ipairs(speechData.fields) do
-            handlerState.spokenRoles[field.name] = true
+        for fieldName, _ in pairs(speechData.coreFields) do
+            handlerState.spokenRoles[fieldName] = true
+        end
+        for _, prop in ipairs(speechData.properties) do
+            handlerState.spokenRoles["property:" .. prop.label] = true
         end
     end
 
@@ -1618,7 +1622,7 @@ local function CreateCCPageHandler(config)
                         tabName, handlerState)
             end
 
-            local valueSpeech = Helpers.CreateSpeechData()
+            local valueSpeech = SpeechData.Create()
             if focusedElement.dcType == "gui::VMSliderSetting"
                 and itemValue and itemValue ~= "" then
                 -- Sliders: speak only the number.
@@ -1656,7 +1660,7 @@ local function CreateCCPageHandler(config)
         -- =============================================================
         -- Screen entry or item navigation.
         -- =============================================================
-        local speechData = Helpers.CreateSpeechData()
+        local speechData = SpeechData.Create()
         local screenTitle = nil
 
         if isScreenEntry then
@@ -1691,7 +1695,7 @@ local function CreateCCPageHandler(config)
                 local tabHint = ResolveHint(tabName, snapshot)
                 if tabHint then
                     handlerState.tabHintsSpoken[tabName] = true
-                    speechData:Add("hint", tabHint, "normal")
+                    speechData:Add("navigationHint", tabHint, "normal")
                 elseif tabHint == false then
                     -- Explicitly suppressed; still mark spoken so we
                     -- don't try again on this visit.
@@ -1707,7 +1711,7 @@ local function CreateCCPageHandler(config)
                     showTabName = false
                 end
                 if showTabName then
-                    speechData:Add("tabName", tabName, "brief")
+                    speechData:Add("sectionLabel", tabName, "brief")
                 end
             end
 
@@ -1889,7 +1893,7 @@ local function CreateCCPageHandler(config)
             and elemAddr == handlerState.lastSpokenElemAddr
             and not isScreenEntry then
             -- Same element, new data.  Speak only what changed.
-            local cycleSpeech = Helpers.CreateSpeechData()
+            local cycleSpeech = SpeechData.Create()
             if itemValue and itemValue ~= "" then
                 cycleSpeech:Add("value", itemValue, "brief")
             elseif itemName and itemName ~= ""
@@ -2005,174 +2009,118 @@ local function CreateCCPageHandler(config)
         HandleTooltip = function(structuredData, rawTexts)
             if not structuredData then return end
             local spoken = handlerState.spokenRoles or {}
-            -- Map tooltip x:Name roles to SpeechData role names.
-            -- If the item handler already spoke that role, skip.
-            local tooltipJunk = {
-                ["Inspect"] = true, ["Close"] = true,
-                ["OK"] = true,
-            }
-            local tooltipData = Helpers.CreateSpeechData()
-            for _, tooltipEntry in ipairs(structuredData) do
-                local xName = tooltipEntry.role
-                local entryText = Helpers.StripMarkupTags(
-                    tooltipEntry.text)
-                if not entryText or entryText == "" then
-                    goto nextCCTooltipEntry
-                end
-                entryText = entryText:gsub("[%.:%s]+$", "")
-                if entryText == "" then goto nextCCTooltipEntry end
 
-                if xName and xName ~= "" then
-                    -- Map x:Name to speech role and check cross-off.
-                    if xName == "Title" or xName == "TitleName"
-                        or xName == "TitleText" then
-                        if not spoken.name then
-                            tooltipData:Add("name",
-                                entryText, "brief")
-                        end
-                    elseif xName == "SubTitleContainer"
-                        or xName == "subtitleText" then
-                        tooltipData:Add("subtitle",
-                            entryText, "normal")
-                    elseif xName == "ContentText"
-                        or xName == "TechnicalDescription"
-                        or xName == "BaseDescription"
-                        or xName == "AdditionalDescription"
-                        or xName == "ExtraDescription"
-                        or xName == "Description"
-                        or xName == "DescriptionText"
-                        or xName == "PassiveExtraDescription" then
-                        if not spoken.description then
-                            tooltipData:Add("description",
-                                entryText, "verbose")
-                        end
-                    elseif xName == "txt" then
-                        -- Spell school/level ("Evocation Cantrip",
-                        -- "Level 1 Conjuration Spell").
-                        tooltipData:Add("school",
-                            entryText, "normal")
-                    elseif xName == "VariationWarnings" then
-                        tooltipData:Add("warning",
-                            entryText, "normal")
-                    elseif xName == "EmpoweredMetamagicText" then
-                        tooltipData:Add("metamagic",
-                            entryText, "verbose")
-                    elseif xName == "PropertyText" then
-                        -- TypeId-based labeling (from C++ parent DC).
-                        local typeId = tooltipEntry.typeId
-                        local normalizedText = NormalizeDetailText(
-                            entryText, "PropertyText")
-                        if typeId == "Concentration" then
-                            tooltipData:Add("property",
-                                "Requires concentration", "normal")
-                        elseif typeId == "Range" then
-                            tooltipData:Add("property",
-                                "Range: " .. normalizedText, "normal")
-                        elseif typeId == "ZoneRadius" then
-                            tooltipData:Add("property",
-                                "AoE radius: " .. normalizedText,
-                                "normal")
-                        elseif typeId == "CastAbility" then
-                            local abilityFull =
-                                Helpers.ExpandAbilityAbbreviation(
-                                    entryText)
-                            tooltipData:Add("property",
-                                "Casting: "
-                                    .. (abilityFull or entryText),
-                                "normal")
-                        elseif typeId == "SaveAbility" then
-                            tooltipData:Add("property",
-                                "Save: " .. normalizedText, "normal")
-                        elseif typeId then
-                            tooltipData:Add("property",
-                                normalizedText, "normal")
-                        else
-                            -- Fallback: no typeId (old C++ build).
-                            local abilityFull =
-                                Helpers.ExpandAbilityAbbreviation(
-                                    entryText)
-                            if abilityFull then
-                                tooltipData:Add("property",
-                                    "Casting: " .. abilityFull,
-                                    "normal")
-                            else
-                                tooltipData:Add("property",
-                                    normalizedText, "normal")
+            -- Base mapping via shared FromTooltip (handles common
+            -- named roles, junk filtering, cross-off).
+            local tooltipData = SpeechData.FromTooltip(
+                structuredData, spoken)
+
+            -- Post-process: PropertyText typeId overrides.
+            -- FromTooltip maps PropertyText to generic "Property".
+            -- CC tooltip templates use typeId for specific labels.
+            -- Clean entryText via the same pipeline FromTooltip used
+            -- on prop.value so the match comparison works.
+            for _, tooltipEntry in ipairs(structuredData) do
+                local role = tooltipEntry.role or ""
+                if role == "PropertyText" and tooltipEntry.typeId then
+                    local typeId = tooltipEntry.typeId
+                    local entryText = SpeechData.CleanTooltipText(
+                        tooltipEntry.text)
+                    if entryText then
+                        for _, prop in ipairs(tooltipData.properties) do
+                            if prop.label == "Property"
+                                and prop.value == entryText then
+                                if typeId == "Concentration" then
+                                    prop.label = "Concentration"
+                                    prop.value =
+                                        "Requires concentration"
+                                elseif typeId == "Range" then
+                                    prop.label = "Range"
+                                    prop.value = NormalizeDetailText(
+                                        entryText, "PropertyText")
+                                elseif typeId == "ZoneRadius"
+                                    or typeId == "Radius" then
+                                    prop.label = "AoE radius"
+                                    prop.value = NormalizeDetailText(
+                                        entryText, "PropertyText")
+                                elseif typeId == "CastAbility" then
+                                    prop.label = "Casting"
+                                    local abilityFull =
+                                        Helpers.ExpandAbilityAbbreviation(
+                                            entryText)
+                                    if abilityFull then
+                                        prop.value = abilityFull
+                                    end
+                                elseif typeId == "SaveAbility" then
+                                    prop.label = "Save"
+                                    prop.value = NormalizeDetailText(
+                                        entryText, "PropertyText")
+                                else
+                                    prop.label = typeId
+                                end
+                                break
                             end
                         end
-                    elseif xName == "SpellDamageText" then
-                        tooltipData:Add("damage",
-                            entryText, "normal")
-                    elseif xName == "DiceValue" then
-                        tooltipData:Add("roll",
-                            "Dice: " .. entryText, "verbose")
-                    elseif xName == "DamageType" then
-                        tooltipData:Add("damageType",
-                            "Damage type: " .. entryText, "normal")
-                    elseif xName == "Name" then
-                        if entryText:find("Spell Slot") then
-                            local slotLevel = entryText:gsub(
-                                "%s*Spell Slot%s*", "")
-                            tooltipData:Add("cost",
-                                "Spell slot: " .. slotLevel, "normal")
-                        elseif entryText:find("Sorcery Point")
-                            or entryText:find("Channel") then
-                            tooltipData:Add("cost",
-                                "Resource: " .. entryText, "normal")
-                        else
-                            tooltipData:Add("cost",
-                                "Cost: " .. entryText, "normal")
-                        end
-                    elseif xName == "SectionDuration" then
-                        tooltipData:Add("duration",
-                            "Duration: " .. entryText, "normal")
-                    elseif xName == "AbilityName" then
-                        tooltipData:Add("ability",
-                            "Ability: " .. entryText, "normal")
-                    elseif xName == "SkillValue" then
-                        -- Always include: "+3 to Perception Checks"
-                        -- provides context beyond the bare "+3" value
-                        -- the handler already spoke.
-                        tooltipData:Add("skillValue",
-                            entryText, "normal")
-                    elseif xName == "AbilityModifierDesc" then
-                        tooltipData:Add("abilityModifier",
-                            entryText, "normal")
-                    elseif xName == "SavingThrows" then
-                        tooltipData:Add("savingThrow",
-                            entryText, "normal")
-                    elseif xName == "TitleValue" then
-                        -- Score in parentheses, e.g. "(12)".
-                        tooltipData:Add("score",
-                            "Total: " .. entryText, "normal")
-                    elseif xName == "AbilityModifiersLabel" then
-                        -- "Your Ability Points come from:" -- context
-                        -- for the breakdown that follows.
-                        tooltipData:Add("breakdownLabel",
-                            entryText, "verbose")
-                    elseif xName == "TitleArea" then
-                        -- Section header word ("Ability") -- skip,
-                        -- redundant with the ability name.
-                    elseif xName == "Value" then
-                        -- Breakdown values ("10") -- verbose detail.
-                        tooltipData:Add("breakdownValue",
-                            entryText, "verbose")
-                    else
-                        tooltipData:Add(xName, entryText, "normal")
                     end
-                else
-                    -- Unnamed entries (tooltip template has no
-                    -- x:Name, e.g. NameAndDescTooltipContent for
-                    -- VMFeatureBoost / VMSpellReference).
-                    -- fontSize from C++ (via sFontSizeProp DP)
-                    -- distinguishes title (56) from body (48).
-                    if not tooltipJunk[entryText]
-                        and not entryText:match("^[%d%.]+$") then
+                end
+            end
+
+            -- Post-process: "Name" role conditional relabeling.
+            -- FromTooltip falls through to AddProperty("Name", text)
+            -- for unrecognized roles.  CC uses content to pick labels.
+            for _, prop in ipairs(tooltipData.properties) do
+                if prop.label == "Name" then
+                    if prop.value:find("Spell Slot") then
+                        prop.label = "Spell slot"
+                        prop.value = prop.value:gsub(
+                            "%s*Spell Slot%s*", "")
+                    elseif prop.value:find("Sorcery Point")
+                        or prop.value:find("Channel") then
+                        prop.label = "Resource"
+                    else
+                        prop.label = "Cost"
+                    end
+                elseif prop.label == "VariationWarnings" then
+                    prop.label = "Warning"
+                elseif prop.label == "EmpoweredMetamagicText" then
+                    prop.label = "Metamagic"
+                    prop.tier = "verbose"
+                elseif prop.label == "TitleValue" then
+                    prop.label = "Total"
+                elseif prop.label == "AbilityModifiersLabel" then
+                    prop.label = "Breakdown"
+                    prop.tier = "verbose"
+                elseif prop.label == "Value" then
+                    prop.label = "Breakdown"
+                    prop.tier = "verbose"
+                elseif prop.label == "txt" then
+                    -- CC spell tooltips use "txt" for school+level,
+                    -- e.g. "Evocation Cantrip" or "Level 1 Spell".
+                    prop.label = "School"
+                end
+            end
+
+            -- Post-process: SkillValue override.
+            -- FromTooltip maps SkillValue to core "value" field.
+            -- CC wants it as a property for richer context.
+            if tooltipData.coreFields["value"] then
+                tooltipData:AddProperty("Skill check",
+                    tooltipData.coreFields["value"], "normal")
+                tooltipData.coreFields["value"] = nil
+            end
+
+            -- Post-process: unnamed entries (empty role with fontSize).
+            -- FromTooltip skips these.  CC uses fontSize to distinguish
+            -- title (>52) from body text.
+            for _, tooltipEntry in ipairs(structuredData) do
+                local role = tooltipEntry.role or ""
+                if role == "" then
+                    local entryText = SpeechData.CleanTooltipText(
+                        tooltipEntry.text)
+                    if entryText then
                         local entryFontSize =
                             tooltipEntry.fontSize or 0
                         if entryFontSize > 52 then
-                            -- Large font = title.  Cross-off
-                            -- against spoken name role.
                             if not spoken.name then
                                 tooltipData:Add("name",
                                     entryText, "brief")
@@ -2181,17 +2129,24 @@ local function CreateCCPageHandler(config)
                             tooltipData:Add("description",
                                 entryText, "verbose")
                         else
-                            tooltipData:Add("effect",
+                            tooltipData:AddProperty("Effect",
                                 entryText, "normal")
                         end
                     end
                 end
-                ::nextCCTooltipEntry::
             end
-            if #tooltipData.fields == 0 then return end
-            local tooltipSpeech = tooltipData:Format(
-                config.tooltipVerbosity or "verbose")
+
+            if not next(tooltipData.coreFields)
+                and #tooltipData.properties == 0 then return end
+            -- No explicit verbosity: Format() falls back to the
+            -- module-global currentVerbosity so RS-Down cycling
+            -- affects CC tooltips the same as other speech.
+            local tooltipSpeech = tooltipData:Format()
             if not tooltipSpeech or tooltipSpeech == "" then return end
+            if tooltipSpeech == handlerState.lastTooltipSpeech then
+                return
+            end
+            handlerState.lastTooltipSpeech = tooltipSpeech
             Log.Info("CC TOOLTIP: " .. tooltipSpeech)
             Ext.Tolk.Speak(tooltipSpeech, false)
         end,
@@ -3102,8 +3057,8 @@ local function HandleCCSnapshot(snapshot)
         else
             if not ccState.postCutsceneHintSpoken then
                 ccState.postCutsceneHintSpoken = true
-                local hintSpeech = Helpers.CreateSpeechData()
-                hintSpeech:Add("hint",
+                local hintSpeech = SpeechData.Create()
+                hintSpeech:Add("navigationHint",
                     "Press down twice to return to the character list",
                     "brief")
                 local hintText = hintSpeech:Format()
@@ -3145,8 +3100,8 @@ local function HandleCCSnapshot(snapshot)
         if instruction then
             if ccState.activeInstruction ~= focusedElement.elemName then
                 ccState.activeInstruction = focusedElement.elemName
-                local instructionSpeech = Helpers.CreateSpeechData()
-                instructionSpeech:Add("instruction", instruction, "brief")
+                local instructionSpeech = SpeechData.Create()
+                instructionSpeech:Add("instructionHint", instruction, "brief")
                 Log.Info("CC INSTRUCTION: " .. focusedElement.elemName)
                 Ext.Tolk.Speak(instructionSpeech:Format(), true)
             end

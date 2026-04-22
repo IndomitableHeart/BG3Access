@@ -11,6 +11,7 @@
 
 local Log = BG3Access.Client.Log
 local Helpers = BG3Access.Client.Helpers
+local SpeechData = BG3Access.Client.SpeechData
 
 -- ============================================================================
 -- Constants
@@ -90,36 +91,6 @@ if Ext.Enums and Ext.Enums.DiceSizeId then
             end
         end
     end
-end
-
--- WeaponFlags bitmask -> speech-worthy flag names, built at load time.
-local WEAPON_FLAG_SPEECH = {}
-local WEAPON_FLAGS_SKIP = {
-    Melee = true, Dippable = true, Torch = true, NoDualWield = true,
-    NotSheathable = true, Unstowable = true, NeedDualWieldingBoost = true,
-    Magical = true, Ammunition = true, Loading = true, Lance = true,
-    Net = true,
-}
-if Ext.Enums and Ext.Enums.WeaponFlags then
-    for flagName, flagValue in pairs(Ext.Enums.WeaponFlags) do
-        if type(flagName) == "string" and not WEAPON_FLAGS_SKIP[flagName] then
-            local numericValue = nil
-            if type(flagValue) == "number" then
-                numericValue = flagValue
-            else
-                pcall(function() numericValue = flagValue.Value end)
-            end
-            if numericValue and numericValue > 0 then
-                local displayName = flagName:gsub("(%l)(%u)", "%1-%2")
-                WEAPON_FLAG_SPEECH[#WEAPON_FLAG_SPEECH + 1] = {
-                    mask = numericValue, name = displayName
-                }
-            end
-        end
-    end
-    table.sort(WEAPON_FLAG_SPEECH, function(flagA, flagB)
-        return flagA.mask < flagB.mask
-    end)
 end
 
 -- WeaponFlags masks for ability modifier calculation.
@@ -300,30 +271,6 @@ local function ReadItemName(itemEntity)
     return nil
 end
 
---- ReadItemDescription: gets the item's flavor description from its root template.
---- @param itemEntity userdata  The item entity.
---- @return string|nil  Description text, or nil.
-local function ReadItemDescription(itemEntity)
-    local templateComponent = itemEntity.OriginalTemplate
-    if not templateComponent then return nil end
-    local templateId = templateComponent.OriginalTemplate
-    if not templateId or templateId == "" then return nil end
-
-    local template = Ext.Template.GetRootTemplate(tostring(templateId))
-    if not template then return nil end
-
-    local description = template.Description
-    if not description then return nil end
-
-    local resolved = ResolveTranslatedStringValue(description)
-    if resolved and (resolved:find("s_HandleUnknown")
-        or resolved:find("%[ForceUpdate%]")
-        or resolved:match("^h%x+g")) then
-        return nil
-    end
-    return resolved
-end
-
 --- HasWeaponFlag: checks if a weapon properties bitfield has a specific flag.
 --- @param weaponProps number  The WeaponProperties bitfield.
 --- @param flagMask number  The flag mask to check.
@@ -402,70 +349,6 @@ local function ReadItemCategory(itemEntity)
     end
 
     return nil
-end
-
---- ReadItemStats: reads weapon properties, armor AC, and item description
---- from an item entity.  Returns a structured table so callers can build
---- SpeechData with separate fields for each piece of information.
---- Does NOT compute damage -- damage comes from tooltip (game-computed).
---- @param itemEntity userdata  The item entity.
---- @return table|nil  {weaponProps, armorClass, description} or nil.
-local function ReadItemStats(itemEntity)
-    local result = {}
-
-    local weapon = itemEntity.Weapon
-    if weapon then
-        local weaponProps = weapon.WeaponProperties
-        if weaponProps and weaponProps ~= 0 then
-            local flagNames = {}
-            for _, flag in ipairs(WEAPON_FLAG_SPEECH) do
-                if weaponProps % (flag.mask * 2) >= flag.mask then
-                    flagNames[#flagNames + 1] = flag.name
-                end
-            end
-            if #flagNames > 0 then
-                result.weaponProps = table.concat(flagNames, ", ")
-            end
-        end
-    end
-
-    local armor = itemEntity.Armor
-    if armor then
-        local armorClass = armor.ArmorClass
-        if armorClass and armorClass > 0 then
-            local acStr = "AC " .. tostring(armorClass)
-            if armor.Shield then
-                acStr = acStr .. " (Shield)"
-            end
-            result.armorClass = acStr
-        end
-    end
-
-    local descOk, description = pcall(ReadItemDescription, itemEntity)
-    if descOk and description and description ~= "" then
-        result.description = description
-    end
-
-    if not result.weaponProps and not result.armorClass
-        and not result.description then
-        return nil
-    end
-    return result
-end
-
---- FormatItemStatsString: flattens ReadItemStats result into a single string.
---- Used by GatherEquipmentSpeechData (equipment slot tooltip path).
---- @param itemEntity userdata  The item entity.
---- @return string|nil  Formatted stats string, or nil.
-local function FormatItemStatsString(itemEntity)
-    local stats = ReadItemStats(itemEntity)
-    if not stats then return nil end
-    local parts = {}
-    if stats.weaponProps then parts[#parts + 1] = stats.weaponProps end
-    if stats.armorClass then parts[#parts + 1] = stats.armorClass end
-    if stats.description then parts[#parts + 1] = stats.description end
-    if #parts == 0 then return nil end
-    return table.concat(parts, ". ")
 end
 
 -- ============================================================================
@@ -754,169 +637,6 @@ local function ReadOptionButtonText()
 end
 
 -- ============================================================================
--- Equipment speech data (game-computed damage from tooltips)
--- ============================================================================
-
---- GatherEquipmentSpeechData: builds a SpeechData object for an equipped
---- item's DETAILS from tooltip texts and entity components.
----
---- Does NOT include slot + item name (the handler speaks those immediately).
----
---- @param tooltipTexts table  Raw tooltip text array from C++.
---- @param slotName string  The equipment slot display name.
---- @param itemName string|nil  The item name from dcProps.
---- @return table  SpeechData object ready for :Format() or :Speak().
-local function GatherEquipmentSpeechData(tooltipTexts, slotName, itemName)
-    local speechData = Helpers.CreateSpeechData()
-
-    local damageRange = nil
-    local damageRoll = nil
-    local damageType = nil
-    local tooltipDescription = nil
-    local tooltipDescriptionLength = 0
-    local itemNameLower = itemName and itemName:lower() or nil
-    local seen = {}
-
-    for _, tooltipEntry in ipairs(tooltipTexts) do
-        local text = tooltipEntry.text
-        if not text or text == "" then goto nextTooltipText end
-        local cleaned = Helpers.StripMarkupTags(text)
-        if not cleaned or cleaned == "" then goto nextTooltipText end
-        local lowerCleaned = cleaned:lower()
-
-        -- Skip noise.
-        if cleaned == "Inspect" then goto nextTooltipText end
-        if cleaned:find("^Equipped by") then goto nextTooltipText end
-        -- Bare numbers: skip.  Weight, gold, and AC come from the entity
-        -- API, not tooltip number parsing.
-        if cleaned:match("^[%d%.]+$") then goto nextTooltipText end
-        -- "Armour Class" label: skip.  AC comes from entity API.
-        if lowerCleaned == "armour class"
-            or lowerCleaned == "armor class" then
-            goto nextTooltipText
-        end
-        if cleaned:find("^Proficiency with") then goto nextTooltipText end
-        if cleaned:find("s_HandleUnknown") then goto nextTooltipText end
-        if cleaned:find("%[ForceUpdate%]") then goto nextTooltipText end
-        if itemNameLower and lowerCleaned == itemNameLower then
-            goto nextTooltipText
-        end
-        if seen[lowerCleaned] then goto nextTooltipText end
-        seen[lowerCleaned] = true
-
-        -- Damage range: "4~9 Damage" or "4~9".
-        local rangeMatch = cleaned:match("^(%d+~%d+)%s*[Dd]amage")
-            or cleaned:match("^(%d+~%d+)$")
-        if rangeMatch then
-            damageRange = rangeMatch:gsub("(%d+)~(%d+)", "%1 to %2")
-            goto nextTooltipText
-        end
-
-        -- Damage roll: "1d6+3" or "2d8" pattern.
-        if cleaned:match("^%d+d%d+") then
-            damageRoll = cleaned
-            goto nextTooltipText
-        end
-
-        -- Damage type: single word matching Ext.Enums.DamageType.
-        if Ext.Enums and Ext.Enums.DamageType then
-            local isDamageType = false
-            pcall(function()
-                isDamageType = Ext.Enums.DamageType[cleaned] ~= nil
-            end)
-            if isDamageType then
-                damageType = cleaned
-                goto nextTooltipText
-            end
-        end
-
-        -- Description: longest remaining text after filtering.
-        if #cleaned > tooltipDescriptionLength and #cleaned > 20 then
-            tooltipDescription = cleaned:gsub("[%.:%s]+$", "")
-            tooltipDescriptionLength = #cleaned
-        end
-
-        ::nextTooltipText::
-    end
-
-    -- Assemble damage line.
-    if damageRange then
-        local damagePart = damageRange
-        if damageType then
-            damagePart = damagePart .. " " .. damageType
-        end
-        damagePart = damagePart .. " damage"
-        if damageRoll then
-            damagePart = damagePart .. ", roll " .. damageRoll
-        end
-        speechData:Add("damage", damagePart, "brief")
-    end
-
-    -- Weapon properties and armor AC from entity.
-    local entity = GetSelectedCharacterEntity()
-    if entity then
-        local slotType = nil
-        if slotName then
-            for enumLabel, friendlyName in pairs(EQUIPMENT_SLOT_NAMES) do
-                if friendlyName == slotName then
-                    slotType = enumLabel
-                    break
-                end
-            end
-        end
-        if slotType then
-            local slotIndex = nil
-            if Ext.Enums and Ext.Enums.StatsItemSlot then
-                local enumVal = Ext.Enums.StatsItemSlot[slotType]
-                if type(enumVal) == "number" then
-                    slotIndex = enumVal
-                elseif enumVal ~= nil then
-                    pcall(function() slotIndex = enumVal.Value end)
-                end
-            end
-            if slotIndex then
-                local getOk, itemEntity = pcall(
-                    GetEquippedItemEntity, entity, slotIndex)
-                if getOk and itemEntity then
-                    local statsOk, statsText = pcall(
-                        FormatItemStatsString, itemEntity)
-                    if statsOk and statsText and statsText ~= "" then
-                        speechData:Add("stats", statsText, "normal")
-                    end
-                    -- Weight and gold from entity (verbose tier).
-                    -- Entity weight is in internal units (x1000).
-                    pcall(function()
-                        local itemData = itemEntity.Data
-                        if itemData and itemData.Weight
-                            and itemData.Weight > 0 then
-                            local displayWeight =
-                                itemData.Weight / 1000
-                            speechData:Add("weight",
-                                "Weight: " .. tostring(displayWeight),
-                                "verbose")
-                        end
-                        local itemValue = itemEntity.Value
-                        if itemValue and itemValue.Value
-                            and itemValue.Value > 0 then
-                            speechData:Add("gold",
-                                tostring(itemValue.Value) .. " gold",
-                                "verbose")
-                        end
-                    end)
-                end
-            end
-        end
-    end
-
-    -- Fallback description from tooltip if entity didn't provide one.
-    if not speechData:HasField("stats") and tooltipDescription then
-        speechData:Add("description", tooltipDescription, "verbose")
-    end
-
-    return speechData
-end
-
--- ============================================================================
 -- Detail view builders (RS Left virtual property list)
 -- ============================================================================
 
@@ -949,294 +669,253 @@ local function ResolveDCPropString(propValue)
     return nil
 end
 
---- ParseTooltipForDetails: extract game-computed properties from cached
---- tooltip texts.  Returns a table of extracted fields:
----   effectDesc: short functional description (e.g., "Heals and removes Burning")
----   range: healing/damage range (e.g., "4 to 10 Healing")
----   roll: dice roll (e.g., "2d4+2")
----   actionCost: action cost (e.g., "Bonus Action")
----   singleUse: true if "Single Use" found
----   damageRange: damage range (e.g., "4 to 9 damage")
----   damageType: damage type (e.g., "Slashing")
---- @param tooltipTexts table|nil  Array of raw tooltip strings.
---- @param itemName string|nil  Item name to filter out of results.
---- @return table  Extracted fields (may be empty).
-local function ParseTooltipForDetails(tooltipTexts, itemName)
-    local result = {}
-    if not tooltipTexts or #tooltipTexts == 0 then return result end
+--- ExtractItemFacts: extract all item-body facts from tooltip data
+--- into a flat structured table that detail-view builders can convert
+--- into {label, value} list entries.
+---
+--- The tooltip is the authoritative source for item-body facts --
+--- all values here (damage, dice, AC, weight, gold, properties,
+--- description, etc.) come from the game's own rendered tooltip, so
+--- they already respect the user's unit/language/theme settings and
+--- never disagree with what a sighted player sees.  Callers that
+--- need non-item facts (character's ability modifier for dice,
+--- identity fields like slot name) add those on top of the facts
+--- returned here.
+---
+--- Returns a table of optional facts (all fields may be nil):
+---   damageRange      -- "4 to 9"       (Range prop / damageDisplayText)
+---   dice             -- "1d6+3"        (Damage prop, dice notation)
+---   damageType       -- "Piercing"     (Damage type prop)
+---   healing          -- "4 to 10"      (Amount prop / unroled "N~M Healing")
+---   weaponProperties -- "Light, Finesse" (Property entries, itemName-deduped)
+---   armorClass       -- "11"           (Armour Class prop / ArmorText)
+---   category         -- "Light Armour" (Category prop / SubTitleContainer)
+---   gold             -- "16"           (Gold prop / GoldContainer)
+---   weight           -- "1.8"          (Weight prop / weightText, unit-aware)
+---   description      -- "A common..."  (description core field, markup stripped)
+---   effectDesc       -- short (10-80 char) unroled functional text
+---   actionCost       -- "Bonus Action" (Cost prop or unroled marker)
+---   singleUse        -- true if marker present
+---
+--- @param tooltipTexts table|nil  Structured {role,text} entries.
+--- @param itemName string|nil  Item name, used to dedup Property
+---   entries whose value just repeats the title.
+--- @return table  Facts table (may be empty if tooltip missing).
+local function ExtractItemFacts(tooltipTexts, itemName)
+    local facts = {}
+    if not tooltipTexts or #tooltipTexts == 0 then return facts end
 
-    local itemNameLower = itemName and itemName:lower() or nil
-    local longestDesc = nil
-    local longestDescLength = 0
+    local speechData = SpeechData.FromTooltip(tooltipTexts)
 
-    for _, tooltipEntry in ipairs(tooltipTexts) do
-        local rawText = tooltipEntry.text
-        if not rawText or rawText == "" then goto nextTooltip end
-        local cleaned = Helpers.StripMarkupTags(rawText)
-        if not cleaned or cleaned == "" then goto nextTooltip end
-        local lowerCleaned = cleaned:lower()
-
-        -- Skip noise.
-        if cleaned == "Inspect" then goto nextTooltip end
-        if cleaned:find("^Equipped by") then goto nextTooltip end
-        -- Bare numbers (weight, gold, AC values).
-        if cleaned:match("^[%d%.]+$") then goto nextTooltip end
-        -- Item name itself.
-        if itemNameLower and lowerCleaned == itemNameLower then
-            goto nextTooltip
-        end
-
-        -- Healing range: "4~10 Healing" or "4~10".
-        local healRange = cleaned:match("^(%d+~%d+)%s*[Hh]ealing")
-        if healRange then
-            result.range = healRange:gsub("(%d+)~(%d+)", "%1 to %2")
-                .. " Healing"
-            goto nextTooltip
-        end
-
-        -- Damage range: "4~9 Damage" or "4~9".
-        local damageRange = cleaned:match("^(%d+~%d+)%s*[Dd]amage")
-            or cleaned:match("^(%d+~%d+)$")
-        if damageRange then
-            result.damageRange = damageRange:gsub(
-                "(%d+)~(%d+)", "%1 to %2") .. " damage"
-            goto nextTooltip
-        end
-
-        -- Dice roll: "2d4+2", "1d6", etc.
-        if cleaned:match("^%d+d%d+") then
-            result.roll = cleaned
-            goto nextTooltip
-        end
-
-        -- Action cost: "Bonus Action", "Action", "Reaction".
-        if lowerCleaned == "bonus action"
-            or lowerCleaned == "action"
-            or lowerCleaned == "reaction" then
-            result.actionCost = cleaned
-            goto nextTooltip
-        end
-
-        -- Single Use.
-        if lowerCleaned == "single use" then
-            result.singleUse = true
-            goto nextTooltip
-        end
-
-        -- Damage type (single word matching DamageType enum).
-        if Ext.Enums and Ext.Enums.DamageType then
-            local isDamageType = false
-            pcall(function()
-                isDamageType = Ext.Enums.DamageType[cleaned] ~= nil
-            end)
-            if isDamageType then
-                result.damageType = cleaned
-                goto nextTooltip
-            end
-        end
-
-        -- Armor class label: skip.
-        if lowerCleaned == "armour class"
-            or lowerCleaned == "armor class" then
-            goto nextTooltip
-        end
-
-        -- Effect description: short functional text (not flavor).
-        -- Prefer texts under ~80 chars that describe what the item does.
-        if #cleaned > 10 and #cleaned < 80
-            and not cleaned:find("^Proficiency with")
-            and cleaned ~= result.range
-            and not HasDetailLabel({}, cleaned) then
-            if not result.effectDesc then
-                result.effectDesc = cleaned
-            end
-        end
-
-        -- Longest remaining text as flavor description fallback.
-        if #cleaned > longestDescLength and #cleaned > 20 then
-            longestDesc = cleaned
-            longestDescLength = #cleaned
-        end
-
-        ::nextTooltip::
+    -- Description from the core field (ContentText / BaseDescription),
+    -- markup stripped.
+    if speechData.coreFields["description"] then
+        facts.description = Helpers.StripMarkupTags(
+            speechData.coreFields["description"])
     end
 
-    result.flavorDesc = longestDesc
-    return result
+    -- Walk properties and map each known label to a fact field.
+    -- Property entries collect separately and get itemName-deduped
+    -- + joined at the end.
+    local propertyValues = {}
+    local itemNameLower = itemName and itemName:lower() or nil
+
+    for _, prop in ipairs(speechData.properties) do
+        local label = prop.label
+        local value = prop.value
+        if label == "Range" then
+            facts.damageRange = value
+        elseif label == "Damage" then
+            -- Dice notation for weapons/potions -> dice; rare "N to M"
+            -- form -> damageRange fallback.
+            if value:match("^%d+d%d+[%+%-]?%d*$") then
+                facts.dice = value
+            elseif value:match("^%d+ to %d+") then
+                facts.damageRange = facts.damageRange
+                    or value:match("^(%d+ to %d+)")
+            end
+        elseif label == "Damage type" then
+            facts.damageType = value
+        elseif label == "Amount" then
+            -- DamageRange role: value carries context word baked in
+            -- ("4 to 10 Healing" or "4 to 9 Damage"); route to the
+            -- appropriate fact based on the suffix.
+            local healMatch = value:match("^(%d+ to %d+)%s*[Hh]ealing")
+            if healMatch then
+                facts.healing = facts.healing or healMatch
+            else
+                local rangeMatch = value:match("^(%d+ to %d+)")
+                if rangeMatch then
+                    facts.damageRange = facts.damageRange or rangeMatch
+                end
+            end
+        elseif label == "Armour Class" then
+            facts.armorClass = value
+        elseif label == "Category" then
+            facts.category = value
+        elseif label == "Gold" then
+            facts.gold = value
+        elseif label == "Weight" then
+            facts.weight = value
+        elseif label == "Cost" then
+            facts.actionCost = value
+        elseif label == "Property" then
+            if not (itemNameLower
+                and value:lower() == itemNameLower) then
+                propertyValues[#propertyValues + 1] = value
+            end
+        end
+    end
+
+    if #propertyValues > 0 then
+        facts.weaponProperties = table.concat(propertyValues, ", ")
+    end
+
+    -- Unroled (empty-role) text extraction: singleUse marker, healing
+    -- variant ("4~10 Healing" as raw text), action cost fallback,
+    -- short effect description.
+    for _, tooltipEntry in ipairs(tooltipTexts) do
+        local role = tooltipEntry.role or ""
+        if role ~= "" then goto nextUnroled end
+        local cleaned = SpeechData.CleanTooltipText(tooltipEntry.text)
+        if not cleaned then goto nextUnroled end
+        local lowerCleaned = cleaned:lower()
+
+        if itemNameLower and lowerCleaned == itemNameLower then
+            goto nextUnroled
+        end
+
+        if lowerCleaned == "single use" then
+            facts.singleUse = true
+            goto nextUnroled
+        end
+
+        local healRange = cleaned:match("^(%d+~%d+)%s*[Hh]ealing")
+        if healRange and not facts.healing then
+            facts.healing = healRange:gsub("(%d+)~(%d+)", "%1 to %2")
+            goto nextUnroled
+        end
+
+        if not facts.actionCost then
+            if lowerCleaned == "bonus action"
+                or lowerCleaned == "action"
+                or lowerCleaned == "reaction" then
+                facts.actionCost = cleaned
+                goto nextUnroled
+            end
+        end
+
+        if not facts.effectDesc
+            and #cleaned > 10 and #cleaned < 80
+            and not cleaned:find("^Proficiency with") then
+            facts.effectDesc = cleaned
+        end
+
+        ::nextUnroled::
+    end
+
+    return facts
 end
 
 --- BuildVMItemDetailList: build detail list for inventory items.
+--- Identity fields come from dcProps; all item-body facts (damage,
+--- dice, AC, properties, weight, gold, description, etc.) come from
+--- ExtractItemFacts which reads the tooltip (the same source the
+--- sighted player sees, already unit-aware).  A small entity-side
+--- fallback provides Category (proficiency group like "Shortswords")
+--- for items whose tooltip has no Category role -- weapons don't
+--- render SubTitleContainer.
+---
 --- @param dcProps table  DataContext properties from the focused VMItem.
---- @param tooltipTexts table|nil  Cached tooltip texts for extra fields.
+--- @param tooltipTexts table|nil  Cached tooltip texts for the item.
 --- @return table|nil  Array of {label, value}, or nil if empty.
 local function BuildVMItemDetailList(dcProps, tooltipTexts)
     local detailList = {}
-
-    -- Name.
-    local itemName = ResolveDCPropString(
-        dcProps.Name or dcProps.Text or dcProps.Title)
-    if itemName then
-        detailList[#detailList + 1] = {label = "Name", value = itemName}
+    local function addField(label, val)
+        if val and val ~= "" then
+            detailList[#detailList + 1] = {label = label, value = val}
+        end
     end
 
-    -- Rarity (skip Common -- it's the default and not interesting).
+    local itemName = ResolveDCPropString(
+        dcProps.Name or dcProps.Text or dcProps.Title)
+    local facts = ExtractItemFacts(tooltipTexts, itemName)
+
+    -- Category: tooltip has it only for items with SubTitleContainer
+    -- (armor).  Weapons carry the proficiency group on the entity
+    -- stat entry, so fall back there, and fall back again to the
+    -- generic dcProps.ItemType ("Equipment"/"Container").
+    local category = facts.category
+    if not category then
+        local entityUUID = dcProps.EntityUUID
+        if entityUUID and entityUUID ~= "" then
+            pcall(function()
+                local itemEntity = Ext.Entity.Get(entityUUID)
+                if itemEntity then
+                    category = ReadItemCategory(itemEntity)
+                end
+            end)
+        end
+    end
+    if not category then
+        local dcPropsCategory = dcProps.ItemType
+        if dcPropsCategory and dcPropsCategory ~= "" then
+            category = dcPropsCategory
+        end
+    end
+
+    -- Identity block.
+    addField("Name", itemName)
     local rarity = dcProps.Rarity
     if rarity and rarity ~= "" and rarity ~= "Common" then
-        detailList[#detailList + 1] = {label = "Rarity", value = rarity}
+        addField("Rarity", rarity)
     end
+    addField("Category", category)
 
-    -- Category: prefer stat entry proficiency group (e.g., "Light Armour")
-    -- over dcProps.ItemType (e.g., "Equipment" or "Container").
-    -- Entity lookup happens later, so insert a placeholder index and
-    -- fill it in during the entity pass.  If entity doesn't provide one,
-    -- fall back to dcProps.ItemType.
-    local categoryInsertIndex = #detailList + 1
-    local categoryFromDCProps = dcProps.ItemType
-    local categoryFilled = false
-
-    -- Equipped status.
     local equippedProp = dcProps.Equipped
     if equippedProp and equippedProp ~= "" then
-        local status = (equippedProp == "NotEquipped")
-            and "Not Equipped" or "Equipped"
-        detailList[#detailList + 1] = {label = "Status", value = status}
+        addField("Status", (equippedProp == "NotEquipped")
+            and "Not Equipped" or "Equipped")
     end
 
-    -- Stack count (only interesting when > 1).
+    -- "N available" format matches the radial slot speech for
+    -- consistent count-announcement across contexts.
     local stackCount = dcProps.Count
     if stackCount and stackCount ~= "" and stackCount ~= "1" then
-        detailList[#detailList + 1] = {
-            label = "Count", value = tostring(stackCount)}
+        addField("Count", tostring(stackCount) .. " available")
     end
 
-    -- Entity API: stats, weight, gold, description.
-    local entityUUID = dcProps.EntityUUID
-    if entityUUID and entityUUID ~= "" then
-        pcall(function()
-            local itemEntity = Ext.Entity.Get(entityUUID)
-            if not itemEntity then return end
+    -- Combat/usage block (all tooltip-sourced).
+    addField("Damage", facts.damageRange)
+    addField("Dice", facts.dice)
+    addField("Damage type", facts.damageType)
+    addField("Healing", facts.healing)
+    addField("Armor Class", facts.armorClass)
+    addField("Properties", facts.weaponProperties)
+    addField("Cost", facts.actionCost)
+    if facts.singleUse then addField("Usage", "Single Use") end
+    addField("Effect", facts.effectDesc)
 
-            -- Category from stat entry (e.g., "Light Armour").
-            local category = ReadItemCategory(itemEntity)
-            if category then
-                table.insert(detailList, categoryInsertIndex,
-                    {label = "Category", value = category})
-                categoryFilled = true
-            end
-
-            local itemStats = ReadItemStats(itemEntity)
-            if itemStats then
-                if itemStats.armorClass then
-                    detailList[#detailList + 1] = {
-                        label = "Armor Class",
-                        value = itemStats.armorClass,
-                    }
-                end
-                if itemStats.weaponProps then
-                    detailList[#detailList + 1] = {
-                        label = "Properties",
-                        value = itemStats.weaponProps,
-                    }
-                end
-                if itemStats.description then
-                    detailList[#detailList + 1] = {
-                        label = "Description",
-                        value = Helpers.StripMarkupTags(
-                            itemStats.description),
-                    }
-                end
-            end
-
-            -- Weight (internal units x1000).
-            local itemData = itemEntity.Data
-            if itemData and itemData.Weight and itemData.Weight > 0 then
-                detailList[#detailList + 1] = {
-                    label = "Weight",
-                    value = tostring(itemData.Weight / 1000),
-                }
-            end
-
-            -- Gold value.
-            local itemValue = itemEntity.Value
-            if itemValue and itemValue.Value
-                and itemValue.Value > 0 then
-                detailList[#detailList + 1] = {
-                    label = "Value",
-                    value = tostring(itemValue.Value) .. " gold",
-                }
-            end
-        end)
-    end
-
-    -- Fallback category from dcProps if entity didn't provide one.
-    if not categoryFilled and categoryFromDCProps
-        and categoryFromDCProps ~= "" then
-        table.insert(detailList, categoryInsertIndex,
-            {label = "Category", value = categoryFromDCProps})
-    end
-
-    -- Tooltip-derived fields: effect, healing/damage, roll, cost.
-    local itemName = ResolveDCPropString(
-        dcProps.Name or dcProps.Text or dcProps.Title)
-    local tooltipData = ParseTooltipForDetails(tooltipTexts, itemName)
-    if tooltipData.effectDesc then
-        detailList[#detailList + 1] = {
-            label = "Effect", value = tooltipData.effectDesc}
-    end
-    if tooltipData.range then
-        detailList[#detailList + 1] = {
-            label = "Healing", value = tooltipData.range}
-    end
-    if tooltipData.damageRange then
-        local damageValue = tooltipData.damageRange
-        if tooltipData.damageType then
-            damageValue = damageValue .. ", " .. tooltipData.damageType
-        end
-        detailList[#detailList + 1] = {
-            label = "Damage", value = damageValue}
-    end
-    if tooltipData.roll then
-        -- Format: "1d6+3" -> "1d6, +3"
-        local formattedRoll = tooltipData.roll:gsub(
-            "(%d+d%d+)([%+%-])", "%1, %2")
-        detailList[#detailList + 1] = {
-            label = "Roll", value = formattedRoll}
-    end
-    if tooltipData.actionCost then
-        detailList[#detailList + 1] = {
-            label = "Cost", value = tooltipData.actionCost}
-    end
-    if tooltipData.singleUse then
-        detailList[#detailList + 1] = {
-            label = "Usage", value = "Single Use"}
-    end
-
-    -- Fallback description: prefer entity API description, then dcProps,
-    -- then tooltip flavor text.
-    if not HasDetailLabel(detailList, "Description") then
-        local itemDescription = ResolveDCPropString(
-            dcProps.Description)
-        if itemDescription and itemDescription ~= "" then
-            detailList[#detailList + 1] = {
-                label = "Description",
-                value = Helpers.StripMarkupTags(itemDescription),
-            }
-        elseif tooltipData.flavorDesc then
-            detailList[#detailList + 1] = {
-                label = "Description",
-                value = Helpers.StripMarkupTags(tooltipData.flavorDesc),
-            }
-        end
-    end
-
-    -- Fallback gold from dcProps.
-    if not HasDetailLabel(detailList, "Value") then
+    -- Economy block.
+    if facts.gold then
+        addField("Value", facts.gold .. " gold")
+    else
         local dcGold = dcProps.Gold
         if dcGold and dcGold ~= "" and dcGold ~= "0" then
-            detailList[#detailList + 1] = {
-                label = "Value", value = dcGold .. " gold"}
+            addField("Value", dcGold .. " gold")
         end
     end
+    addField("Weight", facts.weight)
+
+    -- Description: tooltip flavor first, then dcProps fallback.
+    local description = facts.description
+    if not description then
+        local dcPropsDescription = ResolveDCPropString(dcProps.Description)
+        if dcPropsDescription and dcPropsDescription ~= "" then
+            description = Helpers.StripMarkupTags(dcPropsDescription)
+        end
+    end
+    addField("Description", description)
 
     return #detailList > 0 and detailList or nil
 end
@@ -1269,18 +948,23 @@ local function ResolveSlotIndex(slotName)
     return nil
 end
 
---- BuildEquipmentSlotDetailList: build detail list for equipment slots.
---- Uses entity API to read the equipped item's full stats (AC, weight,
---- gold, description), same data sources as GatherEquipmentSpeechData.
+--- BuildEquipmentSlotDetailList: build detail list for an equipped
+--- item.  Identity fields (slot, status, item name) come from dcProps;
+--- all item-body facts (damage, dice, AC, properties, weight, gold,
+--- description) come from ExtractItemFacts via the tooltip.  The only
+--- genuinely entity-sourced fact is the ability-inference on the dice
+--- roll ("from Dexterity") -- that's character data, not item data,
+--- and lives here because it embellishes an item fact.  Category
+--- falls back to entity (proficiency group) when tooltip has no role.
+---
 --- @param dcProps table  DataContext properties from the focused slot.
 --- @param focusedData table  Full focused element data (not a snapshot).
+--- @param tooltipTexts table|nil  Cached tooltip texts for the slot.
 --- @return table|nil  Array of {label, value}, or nil if empty.
 local function BuildEquipmentSlotDetailList(dcProps, focusedData, tooltipTexts)
-    -- Fields are gathered into temp vars, then appended in the
-    -- final display order at the end of the function.
     local slotName = ExtractEquipmentSlotName(dcProps, nil)
 
-    -- Empty slot: speak just Slot + Status.
+    -- Empty slot: just Slot + Status.
     local isEquipped = dcProps and dcProps.EquippedType
         and dcProps.EquippedType ~= "None"
         and dcProps.EquippedType ~= ""
@@ -1293,75 +977,38 @@ local function BuildEquipmentSlotDetailList(dcProps, focusedData, tooltipTexts)
         return emptyList
     end
 
-    -- Gather fields into temp vars.
     local itemName = nil
     if type(dcProps.Item) == "table" then
         itemName = ResolveDCPropString(
             dcProps.Item.Name or dcProps.Item.DisplayName
             or dcProps.Item.Text)
     end
-    local category = nil
-    local armorClass = nil
-    local weaponPropsField = nil
-    local weight = nil
-    local value = nil
-    local description = nil
 
-    -- Entity lookup: character -> equipment inventory -> slot -> item entity.
+    local facts = ExtractItemFacts(tooltipTexts, itemName)
+
+    -- Category fallback: tooltip has it only for SubTitleContainer
+    -- items (armor).  Weapons carry proficiency group on the entity
+    -- stat entry; look up if tooltip didn't cover it.
     local slotIndex = ResolveSlotIndex(slotName)
     local characterEntity = GetSelectedCharacterEntity()
-    if slotIndex and characterEntity then
+    local category = facts.category
+    if not category and slotIndex and characterEntity then
         pcall(function()
             local itemEntity = GetEquippedItemEntity(
                 characterEntity, slotIndex)
-            if not itemEntity then return end
-
-            category = ReadItemCategory(itemEntity)
-
-            local itemStats = ReadItemStats(itemEntity)
-            if itemStats then
-                armorClass = itemStats.armorClass
-                weaponPropsField = itemStats.weaponProps
-                if itemStats.description then
-                    description = Helpers.StripMarkupTags(
-                        itemStats.description)
-                end
-            end
-
-            local itemData = itemEntity.Data
-            if itemData and itemData.Weight and itemData.Weight > 0 then
-                weight = tostring(itemData.Weight / 1000)
-            end
-
-            local itemValue = itemEntity.Value
-            if itemValue and itemValue.Value
-                and itemValue.Value > 0 then
-                value = tostring(itemValue.Value) .. " gold"
+            if itemEntity then
+                category = ReadItemCategory(itemEntity)
             end
         end)
     end
 
-    -- Tooltip-derived fields: damage, roll, type, cost.
-    local tooltipData = ParseTooltipForDetails(tooltipTexts, itemName)
-    local damageField = nil
-    local healingField = nil
+    -- Dice roll: tooltip gives the raw notation ("1d6+3"); format as
+    -- "1d6, +3 from Dexterity" with ability-inference from the
+    -- character.  Ability-inference is character data, not item, so
+    -- it stays in this builder instead of ExtractItemFacts.
     local rollField = nil
-    local effectField = tooltipData.effectDesc
-    local costField = tooltipData.actionCost
-
-    if tooltipData.damageRange then
-        local damageValue = tooltipData.damageRange
-        if tooltipData.damageType then
-            damageValue = damageValue .. ", " .. tooltipData.damageType
-        end
-        damageField = damageValue
-    end
-    if tooltipData.range then
-        healingField = tooltipData.range
-    end
-    if tooltipData.roll then
-        -- Format: "1d6+3" -> "1d6, +3"
-        local rollValue = tooltipData.roll:gsub(
+    if facts.dice then
+        local rollValue = facts.dice:gsub(
             "(%d+d%d+)([%+%-])", "%1, %2")
         if characterEntity then
             pcall(function()
@@ -1460,9 +1107,8 @@ local function BuildEquipmentSlotDetailList(dcProps, focusedData, tooltipTexts)
         rollField = rollValue
     end
 
-    -- Assemble the detail list in final display order:
-    -- Slot, Name, Category, Damage/Healing, Roll, Properties,
-    -- Armor Class, Weight, Value, Description, Effect, Cost.
+    -- Assemble in final display order.  Each Damage / Dice / Damage
+    -- type / Property etc. is its own d-pad entry.
     local detailList = {}
     local function addField(label, val)
         if val and val ~= "" then
@@ -1472,16 +1118,18 @@ local function BuildEquipmentSlotDetailList(dcProps, focusedData, tooltipTexts)
     addField("Slot", slotName)
     addField("Name", itemName)
     addField("Category", category)
-    addField("Damage", damageField)
-    addField("Healing", healingField)
-    addField("Roll", rollField)
-    addField("Properties", weaponPropsField)
-    addField("Armor Class", armorClass)
-    addField("Weight", weight)
-    addField("Value", value)
-    addField("Description", description)
-    addField("Effect", effectField)
-    addField("Cost", costField)
+    addField("Damage", facts.damageRange)
+    addField("Dice", rollField)
+    addField("Damage type", facts.damageType)
+    addField("Healing", facts.healing)
+    addField("Properties", facts.weaponProperties)
+    addField("Armor Class", facts.armorClass)
+    addField("Cost", facts.actionCost)
+    if facts.singleUse then addField("Usage", "Single Use") end
+    addField("Effect", facts.effectDesc)
+    addField("Value", facts.gold and (facts.gold .. " gold") or nil)
+    addField("Weight", facts.weight)
+    addField("Description", facts.description)
 
     return #detailList > 0 and detailList or nil
 end
@@ -1528,6 +1176,221 @@ local function BuildAbilityDetailList(elemId, dcProps)
 
     return #detailList > 0 and detailList or nil
 end
+
+-- ============================================================================
+-- Per-DC-type tooltip formatters
+-- ============================================================================
+-- Each formatter takes the raw tooltip data and spokenRoles cross-off
+-- set, returns a SpeechData or nil.  The TOOLTIP_FORMATTERS dispatch
+-- table below maps focused DC type -> formatter.  Adding new item
+-- types means adding a named formatter and one line to the table,
+-- not growing a monolithic customTooltipFn.
+
+--- Item-shaped tooltips: inventory VMItem entries AND equipment-
+--- slot VMEquipmentSlot entries (when the slot is populated, its
+--- tooltip content is identical in shape to an inventory item's).
+--- Drops armorDisplay (redundant static label), dedupes armor
+--- Category against PropertyText, relabels dice-notation Damage ->
+--- Dice (potions), promotes "Single Use" marker from empty role to
+--- a Usage property, collapses the weapon-property trio into a
+--- single "Weapon properties" line, and combines Range + dice +
+--- type into a prose Damage phrase.
+local function FormatItemTooltip(tooltipTexts, spokenRoles)
+    local speechData = SpeechData.FromTooltip(tooltipTexts, spokenRoles)
+    speechData:RemoveProperty("armorDisplay")
+
+    -- Extract the raw title text directly from tooltipTexts (NOT
+    -- from speechData.coreFields.name, which is nil when the caller
+    -- passed spokenRoles = {name=true} to suppress title speech --
+    -- e.g. equipment-slot tooltips where the handler already spoke
+    -- the item name).  Used to dedup Property entries whose value
+    -- just repeats the item name.
+    local itemTitle = nil
+    for _, entry in ipairs(tooltipTexts) do
+        if entry.role == "Title" and entry.text then
+            itemTitle = SpeechData.CleanTooltipText(entry.text)
+            break
+        end
+    end
+
+    -- Dedup: armor tooltips duplicate "Light Armour" across
+    -- SubTitleContainer (-> Category) and PropertyText.
+    local categoryValue = nil
+    for _, prop in ipairs(speechData.properties) do
+        if prop.label == "Category" then
+            categoryValue = prop.value
+            break
+        end
+    end
+    if categoryValue then
+        speechData:RemoveProperties(function(prop)
+            return prop.label == "Property"
+                and prop.value == categoryValue
+        end)
+    end
+
+    -- "Single Use" is an empty-role text marker; promote to Usage.
+    for _, entry in ipairs(tooltipTexts) do
+        local role = entry.role or ""
+        if role == "" and entry.text
+            and SpeechData.CleanTooltipText(entry.text)
+                == "Single Use" then
+            speechData:AddProperty("Usage", "Single Use", "brief")
+            break
+        end
+    end
+
+    -- Collapse weapon-property entries into a single "Weapon
+    -- properties: Light, Finesse" line, dropping any Property
+    -- whose value duplicates the item name (e.g. a Shortsword has
+    -- "Property: Shortsword" that just repeats the title).
+    SpeechData.CollapseProperties(
+        speechData, "Property", "Weapon properties",
+        itemTitle, "normal")
+
+    -- Combine Range + dice-notation Damage + Damage type into a
+    -- single prose Damage phrase that mirrors the sighted tooltip
+    -- hierarchy ("4~9 Damage" as headline, 1d6+3 Piercing as detail):
+    --   "Damage: 4 to 9, 1d6+3, type piercing"
+    -- Must run BEFORE the potion dice-relabel below, otherwise the
+    -- relabel consumes the Damage property this combining needs.
+    local rangeValue = nil
+    local damageValue = nil
+    local damageTypeValue = nil
+    for _, prop in ipairs(speechData.properties) do
+        if prop.label == "Range" then
+            rangeValue = prop.value
+        elseif prop.label == "Damage" then
+            damageValue = prop.value
+        elseif prop.label == "Damage type" then
+            damageTypeValue = prop.value
+        end
+    end
+    -- Only combine when we have at least two parts -- a bare Damage
+    -- entry with no Range and no type is a potion (handled below).
+    local weaponPartCount = (rangeValue and 1 or 0)
+        + (damageValue and 1 or 0)
+        + (damageTypeValue and 1 or 0)
+    if weaponPartCount >= 2 then
+        local parts = {}
+        if rangeValue     then parts[#parts + 1] = rangeValue end
+        if damageValue    then parts[#parts + 1] = damageValue end
+        if damageTypeValue then
+            parts[#parts + 1] = "type " .. damageTypeValue:lower()
+        end
+        speechData:RemoveProperty("Range")
+        speechData:RemoveProperty("Damage type")
+        speechData:RemoveProperties(function(prop)
+            return prop.label == "Damage"
+        end)
+        speechData:AddProperty(
+            "Damage", table.concat(parts, ", "), "normal")
+    end
+
+    -- Potions/scrolls/consumables: relabel orphan Damage dice to
+    -- Dice via the shared helper (same logic used by
+    -- SpeakInspectData for the inspect-widget overview).
+    SpeechData.RelabelOrphanDamageDice(speechData)
+
+    return speechData
+end
+
+--- VMStat / VMRangeStat: derived stats with breakdowns (HP, AC,
+--- Initiative, Movement, Melee Attack Bonus, etc.).  Stat tooltips
+--- use paired Value+Description entries for the breakdown; the
+--- shared ParseValueDescriptionBreakdown helper turns them into a
+--- single "Breakdown" property and captures any real description.
+--- Stat tooltips that don't name their body TextBlock also have
+--- their description promoted from empty-role text as a fallback.
+local function FormatVMStatTooltip(tooltipTexts, spokenRoles)
+    local speechData = SpeechData.FromTooltip(tooltipTexts, spokenRoles)
+    speechData:RelabelProperty("Property", "Breakdown")
+    speechData:RemoveProperty("TitleValue")
+    speechData:RemoveProperty("ShortText")
+    speechData:RemoveProperty("AC")
+    SpeechData.ParseValueDescriptionBreakdown(
+        speechData, tooltipTexts)
+    SpeechData.PromoteEmptyRoleDescription(
+        speechData, tooltipTexts, 30)
+    return speechData
+end
+
+--- VMCharacterStats: combat stats (Melee Damage row).  Shape
+--- differs from VMStat: a sequence of Description entries forms
+--- the breakdown ("Melee Attack. Total Damage 1d6+3. Shortsword
+--- 1d6 Piercing. Dexterity"), followed by an additionSign /
+--- statValue pair that appends to the last Description (e.g.
+--- "Dexterity +3").  Assemble the full sequence as description.
+local function FormatVMCharacterStatsTooltip(tooltipTexts, spokenRoles)
+    local speechData = SpeechData.FromTooltip(tooltipTexts, spokenRoles)
+    local descriptions = {}
+    local additionSign = nil
+    local statValue = nil
+    for _, entry in ipairs(tooltipTexts) do
+        local role = entry.role or ""
+        local text = SpeechData.CleanTooltipText(entry.text)
+        if text then
+            if role == "Description" then
+                descriptions[#descriptions + 1] = text
+            elseif role == "additionSign" then
+                additionSign = text
+            elseif role == "statValue" then
+                statValue = text
+            end
+        end
+    end
+    if additionSign and statValue and #descriptions > 0 then
+        descriptions[#descriptions] =
+            descriptions[#descriptions]
+            .. " " .. additionSign .. statValue
+    end
+    if #descriptions > 0 then
+        speechData:Add("description",
+            table.concat(descriptions, ". "), "verbose")
+    end
+    speechData:RemoveProperty("additionSign")
+    speechData:RemoveProperty("statValue")
+    return speechData
+end
+
+--- VMAbility / VMSkill / VMEquipmentProficiency: ability and skill
+--- rows.  Relabels "Property" to "Effect" (these are effect text,
+--- not generic properties), drops the redundant TitleValue.
+--- Ability tooltips use the same paired Value+Description breakdown
+--- as stat tooltips (e.g. Base 15, +2 from Class), with a real
+--- description as the FIRST Description entry before any Value.
+local function FormatVMAbilityTooltip(tooltipTexts, spokenRoles)
+    local speechData = SpeechData.FromTooltip(tooltipTexts, spokenRoles)
+    speechData:RelabelProperty("Property", "Effect")
+    speechData:RemoveProperty("TitleValue")
+    SpeechData.ParseValueDescriptionBreakdown(
+        speechData, tooltipTexts)
+    return speechData
+end
+
+--- VMClass / ls.Character / deferred DC types: generic tooltips
+--- with no special handling beyond the universal role mapping.
+local function FormatGenericTooltip(tooltipTexts, spokenRoles)
+    return SpeechData.FromTooltip(tooltipTexts, spokenRoles)
+end
+
+--- Dispatch table: focused DC type -> formatter function.  Adding
+--- a new tooltip-bearing DC type means adding an entry here; the
+--- customTooltipFn below stays unchanged.
+local TOOLTIP_FORMATTERS = {
+    ["ls.VMItem"]                  = FormatItemTooltip,
+    -- Equipment slot tooltip when slot is populated IS an item
+    -- tooltip (same roles, same layout); reuse the item formatter.
+    ["ls.VMEquipmentSlot"]         = FormatItemTooltip,
+    ["ls.VMStat"]                  = FormatVMStatTooltip,
+    ["ls.VMRangeStat"]             = FormatVMStatTooltip,
+    ["gui::VMCharacterStats"]      = FormatVMCharacterStatsTooltip,
+    ["ls.VMAbility"]               = FormatVMAbilityTooltip,
+    ["ls.VMSkill"]                 = FormatVMAbilityTooltip,
+    ["gui::VMEquipmentProficiency"] = FormatVMAbilityTooltip,
+    ["ls.VMClass"]                 = FormatGenericTooltip,
+    ["ls.Character"]               = FormatGenericTooltip,
+}
 
 -- ============================================================================
 -- CharacterPanelHandler: created via WorldUI.CreatePanelHandler
@@ -1588,9 +1451,13 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                 return label, nil, nil
             end
 
-            -- Inventory items: build SpeechData from dcProps + entity API.
-            -- VMItem dcProps include EntityUUID (for direct entity lookup)
-            -- and Equipped ("NotEquipped" or slot enum value).
+            -- Inventory items: identity-only focus speech (name, equipped
+            -- state, stack count).  Everything else -- description,
+            -- weapon properties, weight, gold, armor class, damage --
+            -- comes from the tooltip pipeline via FormatItemTooltip.
+            -- Tooltip is the single source of truth; when the user
+            -- toggles tooltips off (R3 short-press), focus speech stays
+            -- but extra data goes silent, matching the visual behavior.
             if dcType == "ls.VMItem" and dcProps then
                 local itemName = dcProps.Name or dcProps.Text
                     or dcProps.Title
@@ -1598,80 +1465,24 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                     itemName = itemName.Str or itemName.Text
                         or itemName.Name or nil
                 end
-                local itemDescription = dcProps.Description
-                if type(itemDescription) == "table" then
-                    itemDescription = itemDescription.Str
-                        or itemDescription.Text or nil
-                end
                 if itemName and itemName ~= "" then
-                    local speechData = Helpers.CreateSpeechData()
+                    local speechData = SpeechData.Create()
                     speechData:Add("name", itemName, "brief")
-                    -- Equipped status: direct from dcProps (no scan needed).
                     local equippedProp = dcProps.Equipped
                     if equippedProp and equippedProp ~= ""
                         and equippedProp ~= "NotEquipped" then
-                        speechData:Add("equipped", "Equipped", "brief")
+                        speechData:Add("state", "Equipped", "brief")
                     end
-                    -- Entity API: single lookup for stats, weight, gold.
-                    -- Entity weight is in internal units (x1000).
-                    local entityUUID = dcProps.EntityUUID
-                    if entityUUID and entityUUID ~= "" then
-                        pcall(function()
-                            local itemEntity = Ext.Entity.Get(entityUUID)
-                            if not itemEntity then return end
-                            -- Stats: AC, weapon properties, description.
-                            local itemStats = ReadItemStats(itemEntity)
-                            if itemStats then
-                                if itemStats.armorClass then
-                                    speechData:Add("stats",
-                                        itemStats.armorClass, "normal")
-                                end
-                                if itemStats.weaponProps then
-                                    speechData:Add("weaponProps",
-                                        itemStats.weaponProps, "normal")
-                                end
-                                if itemStats.description then
-                                    speechData:Add("description",
-                                        itemStats.description, "verbose")
-                                end
-                            end
-                            -- Weight (x1000 internal units).
-                            local itemData = itemEntity.Data
-                            if itemData and itemData.Weight
-                                and itemData.Weight > 0 then
-                                local displayWeight =
-                                    itemData.Weight / 1000
-                                speechData:Add("weight",
-                                    "Weight: " .. tostring(displayWeight),
-                                    "verbose")
-                            end
-                            -- Gold value.
-                            local itemValue = itemEntity.Value
-                            if itemValue and itemValue.Value
-                                and itemValue.Value > 0 then
-                                speechData:Add("gold",
-                                    tostring(itemValue.Value) .. " gold",
-                                    "verbose")
-                            end
-                        end)
-                    end
-                    -- Fallback description from dcProps if entity API
-                    -- didn't provide anything.
-                    if not speechData:HasField("stats")
-                        and not speechData:HasField("description")
-                        and itemDescription and itemDescription ~= "" then
-                        speechData:Add("description",
-                            Helpers.StripMarkupTags(itemDescription),
-                            "verbose")
-                    end
-                    -- Fallback gold from dcProps if entity didn't provide.
-                    if not speechData:HasField("gold") then
-                        local dcGold = dcProps.Gold
-                        if dcGold and dcGold ~= ""
-                            and dcGold ~= "0" then
-                            speechData:Add("gold",
-                                dcGold .. " gold", "verbose")
-                        end
+                    -- Stack count via the dedicated `count` core
+                    -- field.  Same slot, same phrasing everywhere
+                    -- quantity appears (radial, inventory, loot,
+                    -- trade, containers).
+                    local stackCount = dcProps.Count
+                    if stackCount and stackCount ~= ""
+                        and stackCount ~= "0" and stackCount ~= "1" then
+                        speechData:Add("count",
+                            tostring(stackCount) .. " available",
+                            "normal")
                     end
                     return speechData
                 end
@@ -1778,7 +1589,7 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                     -- Inventory header: name + gold + weight.
                     if dcType == "ls.Character"
                         and #headerTexts >= 2 then
-                        local speechData = Helpers.CreateSpeechData()
+                        local speechData = SpeechData.Create()
                         speechData:Add("name", headerName, "brief")
                         local extras = {}
                         for textIndex = 2, #headerTexts do
@@ -1790,8 +1601,8 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                             end
                         end
                         if #extras >= 1 then
-                            speechData:Add("gold",
-                                "Gold: " .. extras[1], "normal")
+                            speechData:AddProperty("Gold",
+                                extras[1], "normal")
                         end
                         if #extras >= 2 then
                             local weightText = extras[2]
@@ -1802,8 +1613,8 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                                 weightText = weightText:gsub(
                                     "%s*/%s*", " of ")
                             end
-                            speechData:Add("weight",
-                                "Weight: " .. weightText, "normal")
+                            speechData:AddProperty("Weight",
+                                weightText, "normal")
                         end
                         return speechData:Format(), nil, nil
                     end
@@ -1895,141 +1706,48 @@ local function CreateCharacterPanelHandler(createPanelHandler)
             -- Fall through to generic pipeline.
             return nil
         end,
-        customTooltipFn = function(tooltipTexts, focusedDCType)
+        customTooltipFn = function(tooltipTexts, focusedDCType,
+                                   handlerState)
             if not tooltipTexts or #tooltipTexts == 0 then return nil end
-            if focusedDCType then
-                if focusedDCType == "ls.VMEquipmentSlot" then
-                    if equipmentSlotEmpty then return "" end
-                    return GatherEquipmentSpeechData(
-                        tooltipTexts, equipmentSlotName, equipmentItemName)
-                end
-                -- Action resources: suppress (handler already speaks all data).
-                if focusedDCType == "ls.VMActionResource" then
-                    return ""
-                end
-                -- Inventory items (VMItem): Title, damage, properties,
-                -- equipped-by, and description from roles.
-                if focusedDCType == "ls.VMItem" then
-                    local speechData = Helpers.CreateSpeechData()
-                    for _, tooltipEntry in ipairs(tooltipTexts) do
-                        local role = tooltipEntry.role or ""
-                        local entryText = Helpers.StripMarkupTags(
-                            tooltipEntry.text)
-                        if entryText and entryText ~= "" then
-                            if role == "Title" then
-                                speechData:Add("title", entryText, "brief")
-                            elseif role == "DamageLabel"
-                                or role == "DamageType" then
-                                speechData:Add(role, entryText, "normal")
-                            elseif role == "PropertyText" then
-                                speechData:Add("property",
-                                    entryText, "normal")
-                            elseif role == "EquippedByText" then
-                                speechData:Add("equippedBy",
-                                    entryText, "brief")
-                            elseif role == "ContentText" then
-                                speechData:Add("description",
-                                    entryText, "verbose")
-                            end
-                        end
-                    end
-                    if #speechData.fields == 0 then return nil end
-                    return speechData
-                end
-                -- Stats with breakdowns (VMStat, VMRangeStat).
-                if focusedDCType == "ls.VMStat"
-                    or focusedDCType == "ls.VMRangeStat" then
-                    local speechData = Helpers.CreateSpeechData()
-                    for _, tooltipEntry in ipairs(tooltipTexts) do
-                        local role = tooltipEntry.role or ""
-                        local entryText = Helpers.StripMarkupTags(
-                            tooltipEntry.text)
-                        if entryText and entryText ~= "" then
-                            if role == "PropertyText" then
-                                speechData:Add("breakdown",
-                                    entryText, "normal")
-                            elseif role == "ContentText" then
-                                speechData:Add("description",
-                                    entryText, "verbose")
-                            end
-                        end
-                    end
-                    if #speechData.fields == 0 then return nil end
-                    return speechData
-                end
-                -- Combat stats (VMCharacterStats).
-                if focusedDCType == "gui::VMCharacterStats" then
-                    local speechData = Helpers.CreateSpeechData()
-                    for _, tooltipEntry in ipairs(tooltipTexts) do
-                        local role = tooltipEntry.role or ""
-                        local entryText = Helpers.StripMarkupTags(
-                            tooltipEntry.text)
-                        if entryText and entryText ~= "" then
-                            if role == "DamageLabel"
-                                or role == "DiceValue"
-                                or role == "DamageType" then
-                                speechData:Add(role, entryText, "normal")
-                            elseif role == "PropertyText" then
-                                speechData:Add("property",
-                                    entryText, "normal")
-                            elseif role == "ContentText" then
-                                speechData:Add("description",
-                                    entryText, "verbose")
-                            end
-                        end
-                    end
-                    if #speechData.fields == 0 then return nil end
-                    return speechData
-                end
-                -- Abilities, skills, proficiencies.
-                if focusedDCType == "ls.VMAbility"
-                    or focusedDCType == "ls.VMSkill"
-                    or focusedDCType == "gui::VMEquipmentProficiency" then
-                    local speechData = Helpers.CreateSpeechData()
-                    for _, tooltipEntry in ipairs(tooltipTexts) do
-                        local role = tooltipEntry.role or ""
-                        local entryText = Helpers.StripMarkupTags(
-                            tooltipEntry.text)
-                        if entryText and entryText ~= "" then
-                            if role == "PropertyText" then
-                                speechData:Add("effect",
-                                    entryText, "normal")
-                            elseif role == "ContentText" then
-                                speechData:Add("description",
-                                    entryText, "verbose")
-                            end
-                        end
-                    end
-                    if #speechData.fields == 0 then return nil end
-                    return speechData
-                end
-                -- Class, Character info, and tooltip-deferred types:
-                -- speak Title, PropertyText, ContentText.
-                if focusedDCType == "ls.VMClass"
-                    or focusedDCType == "ls.Character"
-                    or TOOLTIP_DEFERRED_DC_TYPES[focusedDCType] then
-                    local speechData = Helpers.CreateSpeechData()
-                    for _, tooltipEntry in ipairs(tooltipTexts) do
-                        local role = tooltipEntry.role or ""
-                        local entryText = Helpers.StripMarkupTags(
-                            tooltipEntry.text)
-                        if entryText and entryText ~= "" then
-                            if role == "Title" then
-                                speechData:Add("title", entryText, "brief")
-                            elseif role == "PropertyText" then
-                                speechData:Add("property",
-                                    entryText, "normal")
-                            elseif role == "ContentText" then
-                                speechData:Add("description",
-                                    entryText, "verbose")
-                            end
-                        end
-                    end
-                    if #speechData.fields == 0 then return nil end
-                    return speechData
-                end
+            if not focusedDCType then return nil end
+
+            -- Empty equipment slot: handler already spoke "slot:
+            -- Empty", no tooltip content to append.
+            if focusedDCType == "ls.VMEquipmentSlot"
+                and equipmentSlotEmpty then
+                return ""
             end
-            return nil
+
+            -- Action resources: handler already spoke everything.
+            if focusedDCType == "ls.VMActionResource" then
+                return ""
+            end
+
+            -- Dispatch by DC type; TOOLTIP_DEFERRED_DC_TYPES share
+            -- the generic formatter.  For equipment slots, the
+            -- handler spoke "slot: item" as plain text (not via
+            -- SpeechData) so spokenRoles wasn't populated -- pre-
+            -- mark "name" so the tooltip doesn't repeat the item
+            -- name we just said.
+            local spokenRoles
+            if focusedDCType == "ls.VMEquipmentSlot" then
+                spokenRoles = {name = true}
+            else
+                spokenRoles = handlerState
+                    and handlerState.spokenRoles or nil
+            end
+            local formatter = TOOLTIP_FORMATTERS[focusedDCType]
+            if not formatter and TOOLTIP_DEFERRED_DC_TYPES[focusedDCType]
+                then formatter = FormatGenericTooltip end
+            if not formatter then return nil end
+
+            local speechData = formatter(tooltipTexts, spokenRoles)
+            if not speechData
+                or (next(speechData.coreFields) == nil
+                    and #speechData.properties == 0) then
+                return nil
+            end
+            return speechData
         end,
         shouldDisableInterrupt = ShouldAppendEquipmentTooltip,
         buildDetailList = function(focusedData, tooltipTexts)

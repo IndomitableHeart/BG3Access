@@ -6,9 +6,11 @@ pcall(Ext.Require, "Client/DevConfig.lua")  -- DEV-ONLY: strip on release
 
 BG3Access.Shared.RequireFiles("Client/", {
 "Logger",
+"SpeechData",
 "Helpers",
 "ColorDescriptions",
 "DetailView",
+"CompareView",
 "CharCreation",
 "Cutscene",
 "CharSheet",
@@ -16,6 +18,7 @@ BG3Access.Shared.RequireFiles("Client/", {
 "WorldUI",
 "Menus",
 "Combat",
+"Subregion",
 "WorldNav",
 "EventRouter",
 })

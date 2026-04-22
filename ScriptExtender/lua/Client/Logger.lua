@@ -169,11 +169,16 @@ function BG3Access.Client.CycleLogLevel()
     currentLevel = (currentLevel + 1) % 3
     local levelName = LOG_LEVEL_NAMES[currentLevel]
     Ext.Utils.Print("[BG3Access] Log level: " .. levelName)
-    local Helpers = BG3Access.Client.Helpers
-    if Helpers and Helpers.CreateSpeechData then
-        local speechData = Helpers.CreateSpeechData()
-        speechData:Add("logLevel", "Log level " .. levelName, "brief")
-        Ext.Tolk.Speak(speechData:Format(), true)
+    -- Mirror Lua DEBUG on the C++ trace-logging flag so one toggle
+    -- flips the whole firehose.  Guarded: the Ext.UI.SetTraceLogging
+    -- binding only exists in VERBOSE-compiled dev builds of the
+    -- extender dll.
+    if Ext.UI and Ext.UI.SetTraceLogging then
+        Ext.UI.SetTraceLogging(currentLevel == LOG_LEVEL_DEBUG)
+    end
+    local SpeechDataMod = BG3Access.Client.SpeechData
+    if SpeechDataMod then
+        SpeechDataMod.Alert("Log level " .. levelName, "interrupt")
     else
         Ext.Tolk.Speak("Log level " .. levelName, true)
     end

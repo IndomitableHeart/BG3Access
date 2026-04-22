@@ -12,6 +12,7 @@
 
 local Log = BG3Access.Client.Log
 local Helpers = BG3Access.Client.Helpers
+local SpeechData = BG3Access.Client.SpeechData
 
 -- ============================================================================
 -- Constants
@@ -114,8 +115,8 @@ local function ParseActionTooltipForDetails(tooltipTexts, actionName)
         local damageMin, damageMax = cleaned:match(
             "^(%d+)~(%d+)%s*[Dd]amage$")
         if damageMin then
+            -- No " damage" suffix; detail view uses label = "Damage".
             result.damageRange = damageMin .. " to " .. damageMax
-                .. " damage"
             goto nextTooltip
         end
 
@@ -123,8 +124,7 @@ local function ParseActionTooltipForDetails(tooltipTexts, actionName)
         local healMin, healMax = cleaned:match(
             "^(%d+)~(%d+)%s*[Hh]ealing")
         if healMin then
-            result.damageRange = healMin .. " to " .. healMax
-                .. " Healing"
+            result.healingRange = healMin .. " to " .. healMax
             goto nextTooltip
         end
 
@@ -496,7 +496,7 @@ end
 --- @param tooltipTexts table|nil  Cached tooltip texts.
 --- @return table  SpeechData object.
 local function FormatActionSpeech(dcProps)
-    local speechData = Helpers.CreateSpeechData()
+    local speechData = SpeechData.Create()
     if not dcProps then return speechData end
 
     -- Action name from dcProps.
@@ -670,7 +670,7 @@ local function CreateSpellBookHandler(createPanelHandler)
                 if not tooltipTexts or #tooltipTexts == 0 then
                     return nil
                 end
-                local speechData = Helpers.CreateSpeechData()
+                local speechData = SpeechData.Create()
                 local seen = {}
 
                 -- Pre-process: extract text from {role, text} entries
@@ -717,9 +717,9 @@ local function CreateSpellBookHandler(createPanelHandler)
                     local damageMin, damageMax = cleaned:match(
                         "^(%d+)~(%d+)%s*[Dd]amage$")
                     if damageMin then
-                        speechData:Add("damage",
-                            damageMin .. " to " .. damageMax
-                            .. " Damage", "brief")
+                        speechData:AddProperty("Damage",
+                            damageMin .. " to " .. damageMax,
+                            "brief")
                         goto nextTT
                     end
 
@@ -727,16 +727,22 @@ local function CreateSpellBookHandler(createPanelHandler)
                     local healMin, healMax = cleaned:match(
                         "^(%d+)~(%d+)%s*[Hh]ealing")
                     if healMin then
-                        speechData:Add("damage",
-                            healMin .. " to " .. healMax
-                            .. " Healing", "brief")
+                        speechData:AddProperty("Healing",
+                            healMin .. " to " .. healMax, "brief")
                         goto nextTT
                     end
 
-                    -- Dice notation: "1d6+3", "+1d6".
+                    -- Dice notation: "1d6+3" (main roll) or
+                    -- "+1d6" / "-1d4" (bonus dice, leading sign).
                     if cleaned:match(
                         "^[%+%-]?%d*d%d+[%+%-]?%d*$") then
-                        speechData:Add("dice", cleaned, "normal")
+                        if cleaned:match("^[%+%-]") then
+                            speechData:AddProperty("Bonus dice",
+                                cleaned, "normal")
+                        else
+                            speechData:AddProperty("Dice",
+                                cleaned, "normal")
+                        end
                         goto nextTT
                     end
 
@@ -748,7 +754,7 @@ local function CreateSpellBookHandler(createPanelHandler)
                                 Ext.Enums.DamageType[cleaned] ~= nil
                         end)
                         if isDamageType then
-                            speechData:Add("damageType",
+                            speechData:AddProperty("Damage type",
                                 cleaned, "normal")
                             goto nextTT
                         end
@@ -756,49 +762,49 @@ local function CreateSpellBookHandler(createPanelHandler)
 
                     -- Cost.
                     if cleaned == "Action" then
-                        speechData:Add("cost",
+                        speechData:AddProperty("Cost",
                             "Costs Action", "normal")
                         goto nextTT
                     end
                     if cleaned == "Bonus Action" then
-                        speechData:Add("cost",
+                        speechData:AddProperty("Cost",
                             "Costs Bonus Action", "normal")
                         goto nextTT
                     end
                     if cleaned == "Reaction" then
-                        speechData:Add("cost",
+                        speechData:AddProperty("Cost",
                             "Costs Reaction", "normal")
                         goto nextTT
                     end
 
                     -- Frequency.
                     if cleaned == "Per turn" then
-                        speechData:Add("frequency",
+                        speechData:AddProperty("Frequency",
                             "Once per turn", "normal")
                         goto nextTT
                     end
                     if cleaned == "Short Rest"
                         or cleaned == "Long Rest" then
-                        speechData:Add("frequency",
+                        speechData:AddProperty("Frequency",
                             "Recharges on " .. cleaned, "normal")
                         goto nextTT
                     end
 
                     -- Duration.
                     if cleaned:match("^%d+ turns?$") then
-                        speechData:Add("duration",
+                        speechData:AddProperty("Duration",
                             "Duration " .. cleaned, "normal")
                         goto nextTT
                     end
 
                     -- Attack type.
                     if cleaned == "Attack Roll" then
-                        speechData:Add("attackType",
+                        speechData:AddProperty("Attack type",
                             "Attack Roll", "normal")
                         goto nextTT
                     end
                     if cleaned == "Saving Throw" then
-                        speechData:Add("attackType",
+                        speechData:AddProperty("Attack type",
                             "Saving Throw", "normal")
                         goto nextTT
                     end
@@ -807,14 +813,14 @@ local function CreateSpellBookHandler(createPanelHandler)
                     local saveAbility = cleaned:match(
                         "^(%u+) Save$")
                     if saveAbility then
-                        speechData:Add("saveType",
+                        speechData:AddProperty("Save type",
                             saveAbility .. " Save", "normal")
                         goto nextTT
                     end
 
                     -- Range.
                     if cleaned == "Melee" then
-                        speechData:Add("range",
+                        speechData:AddProperty("Range",
                             "Melee range", "normal")
                         goto nextTT
                     end
@@ -822,14 +828,14 @@ local function CreateSpellBookHandler(createPanelHandler)
                         or cleaned:match("^[%d%.]+%s?ft$")
                         or cleaned:match("^[%d%.]+%s?feet$")
                         or cleaned:match("^%d+ft$") then
-                        speechData:Add("range",
+                        speechData:AddProperty("Range",
                             "Range " .. cleaned, "normal")
                         goto nextTT
                     end
 
                     -- Concentration.
                     if cleaned:lower() == "concentration" then
-                        speechData:Add("concentration",
+                        speechData:AddProperty("Concentration",
                             "Concentration", "normal")
                         goto nextTT
                     end
@@ -837,7 +843,7 @@ local function CreateSpellBookHandler(createPanelHandler)
                     -- Warning.
                     if cleaned:match("^No .+ equipped%.$") then
                         local warning = cleaned:sub(1, -2)
-                        speechData:Add("warning",
+                        speechData:Add("status",
                             warning, "brief")
                         goto nextTT
                     end
@@ -845,30 +851,20 @@ local function CreateSpellBookHandler(createPanelHandler)
                     ::nextTT::
                 end
 
-                if #speechData.fields == 0 then return nil end
+                if next(speechData.coreFields) == nil
+                    and #speechData.properties == 0 then
+                    return nil
+                end
                 return speechData
             end
 
-            -- VMPassive: iterate roles for full tooltip speech.
+            -- VMPassive: standard tooltip mapping.
             if focusedDCType == "ls.VMPassive" then
-                local speechData = Helpers.CreateSpeechData()
-                for _, tooltipEntry in ipairs(tooltipTexts) do
-                    local role = tooltipEntry.role or ""
-                    local entryText = Helpers.StripMarkupTags(
-                        tooltipEntry.text)
-                    if entryText and entryText ~= "" then
-                        if role == "Title" then
-                            speechData:Add("title", entryText, "brief")
-                        elseif role == "PropertyText" then
-                            speechData:Add("property",
-                                entryText, "normal")
-                        elseif role == "ContentText" then
-                            speechData:Add("description",
-                                entryText, "verbose")
-                        end
-                    end
+                local speechData = SpeechData.FromTooltip(tooltipTexts)
+                if next(speechData.coreFields) == nil
+                    and #speechData.properties == 0 then
+                    return nil
                 end
-                if #speechData.fields == 0 then return nil end
                 return speechData
             end
 
@@ -921,6 +917,13 @@ local function CreateSpellBookHandler(createPanelHandler)
                     detailList[#detailList + 1] = {
                         label = "Damage",
                         value = tooltipData.damageRange}
+                end
+
+                -- Healing range.
+                if tooltipData.healingRange then
+                    detailList[#detailList + 1] = {
+                        label = "Healing",
+                        value = tooltipData.healingRange}
                 end
 
                 -- Dice roll with ability attribution.

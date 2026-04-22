@@ -19,11 +19,12 @@ BG3Access = BG3Access or {}
 BG3Access.Client = BG3Access.Client or {}
 
 -- Module references (loaded before this file by _Init.lua).
-local Log   = BG3Access.Client.Log
-local Helpers = BG3Access.Client.Helpers
-local CC    = BG3Access.Client.CC
-local Cutscene = BG3Access.Client.Cutscene
-local Menus = BG3Access.Client.Menus
+local Log        = BG3Access.Client.Log
+local Helpers    = BG3Access.Client.Helpers
+local SpeechData = BG3Access.Client.SpeechData
+local CC         = BG3Access.Client.CC
+local Cutscene   = BG3Access.Client.Cutscene
+local Menus      = BG3Access.Client.Menus
 
 -- ---------------------------------------------------------------------------
 -- Cross-cutting state (not owned by any single handler).
@@ -33,14 +34,15 @@ local Menus = BG3Access.Client.Menus
 local suppressSnapshots   = true
 local lastWidgetRootStr   = nil
 local inspectWidgetActive = false  -- true while PinnedTooltips_c has focus
-local debugExploreMode    = false
 -- Explore mode uses its own lastSpokenFullText to avoid needing a handler state.
-local exploreLastSpoken   = nil
 -- Loading tips use their own dedup to avoid needing a handler state.
 -- Table used as a set because multiple tips can arrive in the same snapshot.
 local spokenLoadingTips = {}
 -- True when snapshots should route to WorldUI panel handlers instead of Menus.
 local routeToWorld        = false
+-- Last value of routeToWorld we logged at dispatch time.  Triggers a
+-- log line whenever the flag changes so silent flips become visible.
+local lastRouteToWorldLogged = nil
 -- True when a dialog overlay spoke on this tick while WorldUI is active.
 -- Suppresses the panel handler so dialog speech isn't interrupted.
 local worldDialogOverlayJustSpoke = false
@@ -116,8 +118,8 @@ local function HandleTickSnapshot(snapshot)
                             and not textValue:match("^%d+%%?$")
                             and not spokenLoadingTips[textValue] then
                             spokenLoadingTips[textValue] = true
-                            local tipSpeech = Helpers.CreateSpeechData()
-                            tipSpeech:Add("loadingTip", textValue, "normal")
+                            local tipSpeech = SpeechData.Create()
+                            tipSpeech:Add("description", textValue, "normal")
                             Log.Info("LOADING TIP: " .. textValue)
                             Ext.Tolk.Speak(tipSpeech:Format(), false)
                         end
@@ -221,8 +223,8 @@ local function HandleTickSnapshot(snapshot)
     if snapshot.contextMenuChanged then
         local itemText = snapshot.contextMenuItemText
         if itemText and itemText ~= "" then
-            local contextSpeech = Helpers.CreateSpeechData()
-            contextSpeech:Add("contextItem", itemText, "brief")
+            local contextSpeech = SpeechData.Create()
+            contextSpeech:Add("name", itemText, "brief")
             Log.Info("CONTEXT MENU: " .. itemText)
             Ext.Tolk.Speak(contextSpeech:Format(), true)
         end
@@ -506,13 +508,13 @@ local function HandleTickSnapshot(snapshot)
                 parts[#parts + 1] = hudInfo.characterInfo
             end
             if #parts > 0 then
-                local greetingSpeech = Helpers.CreateSpeechData()
+                local greetingSpeech = SpeechData.Create()
                 if hudInfo.characterName and hudInfo.characterName ~= "" then
-                    greetingSpeech:Add("characterName",
+                    greetingSpeech:Add("name",
                         hudInfo.characterName, "brief")
                 end
                 if hudInfo.characterInfo and hudInfo.characterInfo ~= "" then
-                    greetingSpeech:Add("characterInfo",
+                    greetingSpeech:Add("value",
                         hudInfo.characterInfo, "normal")
                 end
                 local greeting = greetingSpeech:Format()
@@ -524,52 +526,6 @@ local function HandleTickSnapshot(snapshot)
     end
 
     -- =================================================================
-    -- Debug explore mode: speak raw element info, skip all processing.
-    -- =================================================================
-    if debugExploreMode
-        and (snapshot.focusChanged or snapshot.selectionChanged) then
-        local data = focusedElement
-        local parts = {}
-        if data.isTab then
-            table.insert(parts, "Tab")
-            if data.tabName then table.insert(parts, data.tabName) end
-        else
-            if data.elemType then table.insert(parts, data.elemType) end
-            if data.elemName then table.insert(parts, data.elemName) end
-        end
-        if data.dcType then table.insert(parts, "DC:" .. data.dcType) end
-        if data.isFocusable then table.insert(parts, "focusable") end
-        local text = Helpers.ExtractTextFromData(data, nil, false)
-        if text then table.insert(parts, "text:" .. text) end
-        Log.Info("EXPLORE sel=" .. tostring(snapshot.selectionChanged)
-            .. " foc=" .. tostring(snapshot.focusChanged)
-            .. " isTab=" .. tostring(data.isTab)
-            .. " postSettle=" .. tostring(snapshot.postSettle)
-            .. " elemId=" .. tostring(data.elemId))
-        if data.dcProps then
-            local propParts = {}
-            for propName, propValue in pairs(data.dcProps) do
-                table.insert(propParts, propName .. "="
-                    .. tostring(propValue))
-            end
-            if #propParts > 0 then
-                table.sort(propParts)
-                Log.Info("EXPLORE dcProps: "
-                    .. table.concat(propParts, " | "))
-            end
-        end
-        local speech = Helpers.StripMarkupTags(table.concat(parts, " | "))
-        if speech ~= "" and speech ~= exploreLastSpoken then
-            exploreLastSpoken = speech
-            local exploreSpeech = Helpers.CreateSpeechData()
-            exploreSpeech:Add("exploreInfo", speech, "brief")
-            Log.Info("EXPLORE: " .. speech)
-            Ext.Tolk.Speak(exploreSpeech:Format(), true)
-        end
-        return
-    end
-
-    -- =================================================================
     -- Widget root tracking: detect UI teardown/rebuild.
     -- =================================================================
     local widgetRootId = focusedElement.widgetRootId or ""
@@ -577,8 +533,20 @@ local function HandleTickSnapshot(snapshot)
         lastWidgetRootStr = widgetRootId
         inspectWidgetActive = false  -- widget root changed, inspect closed
         Log.Info("Widget root changed to " .. widgetRootId)
+        -- Reset the radial-open flag on any widget root change.
+        -- Closing the radial hides it but doesn't fully unload the
+        -- widget, so widgetRemoved doesn't fire -- but the widget
+        -- root DOES change (back to PartyLine/Minimap/etc.).  LB/RB
+        -- page switches within an open radial do NOT change the
+        -- widget root, so this doesn't step on page-switch dedup.
+        -- If the new root IS the radial (fresh open), the subsequent
+        -- focus event on VMHotBar will re-arm inRadial via
+        -- HandleRadialOpen and speak "Action Radial" again.
+        local World = BG3Access.Client.WorldUI
+        if World and World.ClearRadialFocus then
+            World.ClearRadialFocus()
+        end
         if routeToWorld then
-            local World = BG3Access.Client.WorldUI
             if World then World.HandlePanelWidgetRootChanged() end
         else
             Menus.HandleWidgetRootChanged()
@@ -673,6 +641,13 @@ local function HandleTickSnapshot(snapshot)
     -- Without this gate, both CC and Menus (PartyLine) would process
     -- the same snapshot, causing duplicate speech.
     if not ccHandledThisTick then
+        -- Diagnostic: log every dispatch-time transition in routeToWorld
+        -- so silent flips become visible.  Once the stuck-routing issue
+        -- is diagnosed this can come out.
+        if lastRouteToWorldLogged ~= routeToWorld then
+            Log.Info("DISPATCH: routeToWorld=" .. tostring(routeToWorld))
+            lastRouteToWorldLogged = routeToWorld
+        end
         if routeToWorld then
             -- Dialog overlay just spoke on this tick -- suppress the panel
             -- handler so it doesn't immediately interrupt the dialog speech.
@@ -779,7 +754,6 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
 
     -- Reset router state.
     lastWidgetRootStr = nil
-    exploreLastSpoken = nil
     spokenLoadingTips = {}
     worldDialogOverlayJustSpoke = false
     suppressWorldEntryVisualText = false
@@ -807,37 +781,9 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     SetupGlobalFocusMonitor()
 end)
 
--- ---------------------------------------------------------------------------
--- Debug explore mode toggle (L3 + R3).
--- ---------------------------------------------------------------------------
-function BG3Access.Client.ToggleExploreMode()
-    debugExploreMode = not debugExploreMode
-    local modeState = debugExploreMode and "ON" or "OFF"
-    Log.Info("Explore mode: " .. modeState)
-    local modeSpeech = Helpers.CreateSpeechData()
-    modeSpeech:Add("exploreToggle", "Explore mode " .. modeState, "brief")
-    Ext.Tolk.Speak(modeSpeech:Format(), true)
-end
-
-local exploreComboState = { leftStickHeld = false, rightStickHeld = false }
-
-Ext.Events.ControllerButtonInput:Subscribe(function(event)
-    local buttonName = tostring(event.Button)
-    if debugExploreMode and event.Pressed then
-        Log.Debug("INPUT: " .. buttonName)
-    end
-    if buttonName == "LeftStick" then
-        exploreComboState.leftStickHeld = event.Pressed
-        if event.Pressed and exploreComboState.rightStickHeld then
-            BG3Access.Client.ToggleExploreMode()
-        end
-    elseif buttonName == "RightStick" then
-        exploreComboState.rightStickHeld = event.Pressed
-        if event.Pressed and exploreComboState.leftStickHeld then
-            BG3Access.Client.ToggleExploreMode()
-        end
-    end
-end)
+-- Dev-only log-level cycler (L3+R3 chord) lives in Client/DevConfig.lua,
+-- which is excluded from release packaging.  End users never see the
+-- binding or the speech feedback it produces.
 
 -- ---------------------------------------------------------------------------
 -- Startup
@@ -896,8 +842,9 @@ end
 --
 -- Owns the ControllerAxisInput subscription for the right stick.
 -- Dispatches to: DetailView (RS Left in UI), WorldNav GPS (RS Left
--- in free world), WorldNav HUD reader (RS Up/Down/Right in free world),
--- Combat turn order (RS Right in combat).
+-- in free world), WorldNav HUD reader (RS Up / RS Right in free
+-- world), Combat turn order (RS Right in combat), SpeechData
+-- verbosity cycler (RS Down, global -- fires in any context).
 
 local RS_DIRECTION_NONE  = 0
 local RS_DIRECTION_UP    = 1
@@ -972,7 +919,21 @@ local function HandleRSDirection(direction)
         if DetailView then
             local handler = FindActiveDetailHandler()
             if handler then
-                local handled = DetailView.Toggle(handler)
+                -- The detail-view builders rely on the tooltip as
+                -- source of truth for item facts; fetch the cached
+                -- tooltip texts from whichever module owns the
+                -- active handler.  Without this, builders see nil
+                -- tooltipTexts and produce nearly-empty lists.
+                local tooltipTexts = nil
+                local World = BG3Access.Client.WorldUI
+                if World and World.GetLastTooltipTexts then
+                    tooltipTexts = World.GetLastTooltipTexts()
+                end
+                if not tooltipTexts and Menus
+                    and Menus.GetLastTooltipTexts then
+                    tooltipTexts = Menus.GetLastTooltipTexts()
+                end
+                local handled = DetailView.Toggle(handler, tooltipTexts)
                 if handled then return end
             end
         end
@@ -982,13 +943,56 @@ local function HandleRSDirection(direction)
         return
     end
 
-    -- RS Up/Down/Right: HUD reader (free world only).
+    -- RS Down: cycle speech verbosity (verbose -> normal -> brief
+    -- -> verbose).  Fires in ANY context, not gated on IsUIActiveForRS
+    -- -- users may want to tune verbosity while navigating menus,
+    -- tooltips, dialogues, or anything else.  Announced via
+    -- SpeechData.Alert, so it interrupts whatever's currently
+    -- speaking and replies with the new level.
+    if direction == RS_DIRECTION_DOWN then
+        BG3Access.Client.CycleVerbosity()
+        return
+    end
+
+    -- RS Right: compare view (UI only).  When inside a menu with an
+    -- active panel handler whose last tooltip included a compare card,
+    -- RS Right toggles the CompareView grid.  Always-on close (user
+    -- can close it even if we somehow think UI isn't active).  Open
+    -- is gated on IsUIActiveForRS so world RS-Right stays HUD-only
+    -- and doesn't fire on stale handler state left over from a recent
+    -- menu visit.
+    if direction == RS_DIRECTION_RIGHT then
+        local CompareView = BG3Access.Client.CompareView
+        if CompareView and CompareView.IsOpen() then
+            CompareView.Close()
+            return
+        end
+        if IsUIActiveForRS() then
+            local World = BG3Access.Client.WorldUI
+            if World and World.GetActivePanelHandler then
+                local panelHandler = World.GetActivePanelHandler()
+                if panelHandler and panelHandler.GetCompareData then
+                    local focusedSpeech, compareSpeech =
+                        panelHandler.GetCompareData()
+                    if focusedSpeech and compareSpeech and CompareView then
+                        if CompareView.Open(
+                                focusedSpeech, compareSpeech) then
+                            return
+                        end
+                    end
+                end
+            end
+            -- UI active but no compare: do not fall through to HUD.
+            -- The game owns RS-Right in menus.
+            return
+        end
+    end
+
+    -- RS Up/Right (non-compare): HUD reader (free world only).
     if IsUIActiveForRS() then return end
 
     if direction == RS_DIRECTION_UP then
         Nav.SpeakCharacterInfo()
-    elseif direction == RS_DIRECTION_DOWN then
-        Nav.SpeakTargetInfo()
     elseif direction == RS_DIRECTION_RIGHT then
         local Combat = BG3Access.Client.Combat
         if Combat and Combat.IsInCombat and Combat.IsInCombat() then
