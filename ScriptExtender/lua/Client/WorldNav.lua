@@ -213,7 +213,7 @@ local GPS_PROXIMITY_TIER2_ENTER_M = 8.0
 local GPS_PROXIMITY_TIER2_EXIT_M  = 12.0
 
 -- Entity scanning.
-local ENTITY_SCAN_RADIUS      = 30    -- meters for entity scanning
+local ENTITY_SCAN_RADIUS      = 50    -- meters for entity scanning
 local ENTITY_SCAN_MOVEMENT    = 3.0   -- meters before rescanning
 
 -- Movement threshold for the proximity poller to run at all.
@@ -247,15 +247,17 @@ local DEGREES_PER_CLOCK_HOUR  = 30
 -- Empty categories stay in the cycle order and say "None" when
 -- visited rather than auto-skipping.
 local CATEGORY_NAMES          = {
-    "NPCs",          -- alive characters
-    "Doors",         -- doors, hatches, traversal
-    "Containers",    -- chests, crates, pods, corpses, lootables
-    "Quest items",   -- items flagged as story/quest-relevant
-    "Consumables",   -- potions, scrolls, grenades, utility
-    "Food",          -- trivial-heal consumables (<=3 HP)
-    "Equipment",     -- weapons, armor, wearables with a slot
-    "Loot",          -- valuables (gold value >= threshold)
-    "Miscellaneous", -- fallback for anything else (keys, books, notes)
+    "NPCs",           -- alive characters
+    "Doors",          -- doors, hatches, traversal
+    "Containers",     -- chests, crates, pods, corpses, lootables
+    "Quest items",    -- items flagged as story/quest-relevant
+    "Consumables",    -- potions, scrolls, grenades, utility
+    "Food",           -- trivial-heal consumables (<=3 HP)
+    "Herbs",          -- alchemy ingredients (harvestable plants)
+    "Equipment",      -- weapons, armor, wearables with a slot
+    "Loot",           -- valuables (gold value >= threshold)
+    "Books and keys", -- readable / letter / prayer / key items
+    "Miscellaneous",  -- fallback for anything else (scenery, props)
 }
 
 -- ============================================================================
@@ -484,6 +486,115 @@ end
 
 local function DistanceXZ(positionA, positionB)
     return math.sqrt(DistanceSquaredXZ(positionA, positionB))
+end
+
+--- Perpendicular distance from a point to a line segment in the XZ
+--- plane.  Standard point-to-segment formula: project the point
+--- onto the segment, clamp the parameter to [0,1] so the closest
+--- point is an endpoint when the projection falls outside the
+--- segment, then measure the distance to that clamped point.
+local function PointToSegmentDistanceXZ(point, segmentStart, segmentEnd)
+    local segDeltaX = segmentEnd[1] - segmentStart[1]
+    local segDeltaZ = segmentEnd[3] - segmentStart[3]
+    local segLengthSquared = segDeltaX * segDeltaX
+        + segDeltaZ * segDeltaZ
+    if segLengthSquared == 0 then
+        -- Degenerate: segment is a point.
+        return DistanceXZ(point, segmentStart)
+    end
+    local projectionParameter =
+        ((point[1] - segmentStart[1]) * segDeltaX
+            + (point[3] - segmentStart[3]) * segDeltaZ)
+        / segLengthSquared
+    if projectionParameter < 0 then projectionParameter = 0 end
+    if projectionParameter > 1 then projectionParameter = 1 end
+    local closestX = segmentStart[1]
+        + projectionParameter * segDeltaX
+    local closestZ = segmentStart[3]
+        + projectionParameter * segDeltaZ
+    local diffX = point[1] - closestX
+    local diffZ = point[3] - closestZ
+    return math.sqrt(diffX * diffX + diffZ * diffZ)
+end
+
+--- Minimum distance from a point to any segment of a path (the
+--- "how far off the path is this point" metric).  Returns
+--- math.huge when the path is empty.  Used by the path-commitment
+--- gate in RecalculatePath to decide whether the current path is
+--- still serving the player or whether A* needs a fresh answer.
+local function MinDistanceToPath(point, path)
+    if not path or #path == 0 then return math.huge end
+    if #path == 1 then return DistanceXZ(point, path[1]) end
+    local minDistance = math.huge
+    for nodeIndex = 1, #path - 1 do
+        local dist = PointToSegmentDistanceXZ(
+            point, path[nodeIndex], path[nodeIndex + 1])
+        if dist < minDistance then minDistance = dist end
+    end
+    return minDistance
+end
+
+--- Project a point onto the nearest segment of a path, and return
+--- the information forward-traversal accumulators need:
+---   nextNodeIndex   = index of the node immediately forward of
+---                     the projection (the first node "ahead" of
+---                     the player along the path).
+---   distanceForward = path-distance from the projection to
+---                     path[nextNodeIndex].  Used as the initial
+---                     pathDistanceAccum for forward scans.
+---
+--- This replaces the older "start accumulating from
+--- DistanceXZ(player, path[1])" approach, which inflated the
+--- accumulator by the distance the player had walked PAST node 1
+--- -- for a fixed downstream bend, the reported "turn in N meters"
+--- grew as the player walked toward the bend instead of shrinking,
+--- because the backward distance to node 1 kept adding up.
+---
+--- Returns nil, 0 when the path is empty or a single node (caller
+--- should handle those edge cases separately).
+local function GetForwardPathStart(playerPosition, path)
+    if not path or #path == 0 then return nil, 0 end
+    if #path == 1 then
+        return 1, DistanceXZ(playerPosition, path[1])
+    end
+
+    local nearestSegmentIndex = 1
+    local nearestDistance = math.huge
+    for segmentIndex = 1, #path - 1 do
+        local segmentDistance = PointToSegmentDistanceXZ(
+            playerPosition,
+            path[segmentIndex], path[segmentIndex + 1])
+        if segmentDistance < nearestDistance then
+            nearestDistance = segmentDistance
+            nearestSegmentIndex = segmentIndex
+        end
+    end
+
+    local segmentStart = path[nearestSegmentIndex]
+    local segmentEnd   = path[nearestSegmentIndex + 1]
+    local segmentDeltaX = segmentEnd[1] - segmentStart[1]
+    local segmentDeltaZ = segmentEnd[3] - segmentStart[3]
+    local segmentLengthSquared = segmentDeltaX * segmentDeltaX
+        + segmentDeltaZ * segmentDeltaZ
+    local parameter = 0
+    if segmentLengthSquared > 0 then
+        parameter =
+            ((playerPosition[1] - segmentStart[1]) * segmentDeltaX
+            + (playerPosition[3] - segmentStart[3]) * segmentDeltaZ)
+            / segmentLengthSquared
+        if parameter < 0 then parameter = 0 end
+        if parameter > 1 then parameter = 1 end
+    end
+    local projectionX = segmentStart[1] + parameter * segmentDeltaX
+    local projectionZ = segmentStart[3] + parameter * segmentDeltaZ
+    local distanceForward = math.sqrt(
+        (segmentEnd[1] - projectionX)
+            * (segmentEnd[1] - projectionX)
+        + (segmentEnd[3] - projectionZ)
+            * (segmentEnd[3] - projectionZ))
+
+    return nearestSegmentIndex + 1, distanceForward,
+        projectionX, projectionZ
 end
 
 local function BearingXZ(fromPosition, toPosition)
@@ -1035,6 +1146,20 @@ end
 --- set settles (level not loaded yet), each call rebuilds from the
 --- manual-hazard overrides and the result is not cached -- the next
 --- call after the level loads will pick up the full set.
+-- Hazards that show up in detection (so "Warning: X on route"
+-- still fires) but are EXCLUDED from A* avoidance weighting.
+-- These apply status effects or movement penalties but do not
+-- damage the player, so routing the path around them generates
+-- useless detours -- Deepwater especially, which sits along
+-- most shorelines near quest targets and produced the "Detour,
+-- bearing flip-flop" problem when the A* cost weighting fought
+-- the player's desire to walk through it anyway.  Lethal
+-- hazards (Fire, Lava, Poison, electrified water, clouds of
+-- any kind) stay in the avoidance set.
+local NON_AVOIDED_HAZARDS = {
+    Deepwater = true,
+}
+
 local function GetHazardAvoidanceInfluences()
     if hazardAvoidanceInfluences then
         return hazardAvoidanceInfluences
@@ -1043,20 +1168,22 @@ local function GetHazardAvoidanceInfluences()
     local hazardSet = GetHazardousSurfaces()
     local influences = {}
     for hazardLabel in pairs(hazardSet) do
-        -- Cloud surfaces live in the 39..74 range of the
-        -- SurfaceType enum and every label in that range ends
-        -- in "Cloud" (WaterCloud, PoisonCloud, CloudkillCloud,
-        -- FogCloud, ...).  No ground surface (1..38) uses the
-        -- "Cloud" suffix, so checking the last five characters
-        -- is sufficient to classify.  See
-        -- BG3Extender/GameDefinitions/Enumerations/Stats.inl
-        -- line 1393 (BEGIN_ENUM(SurfaceType)).
-        local isCloud = hazardLabel:sub(-5) == "Cloud"
-        table.insert(influences, {
-            SurfaceType = hazardLabel,
-            IsCloud = isCloud,
-            Influence = GPS_HAZARD_INFLUENCE,
-        })
+        if not NON_AVOIDED_HAZARDS[hazardLabel] then
+            -- Cloud surfaces live in the 39..74 range of the
+            -- SurfaceType enum and every label in that range ends
+            -- in "Cloud" (WaterCloud, PoisonCloud, CloudkillCloud,
+            -- FogCloud, ...).  No ground surface (1..38) uses the
+            -- "Cloud" suffix, so checking the last five characters
+            -- is sufficient to classify.  See
+            -- BG3Extender/GameDefinitions/Enumerations/Stats.inl
+            -- line 1393 (BEGIN_ENUM(SurfaceType)).
+            local isCloud = hazardLabel:sub(-5) == "Cloud"
+            table.insert(influences, {
+                SurfaceType = hazardLabel,
+                IsCloud = isCloud,
+                Influence = GPS_HAZARD_INFLUENCE,
+            })
+        end
     end
 
     -- Mirror GetHazardousSurfaces' caching gate: only hold onto the
@@ -1347,6 +1474,26 @@ local function CategoriseEntity(entity, displayName)
         return "Doors"
     end
 
+    -- Portal / fast-travel marker fallback.  Some door-like
+    -- entities (Ancient Door on the Nautiloid, fast-travel
+    -- waypoints) don't have the IsDoor tag -- they're marked via
+    -- client-only ecl::markers::AvailablePortalComponent and
+    -- PortalCandidateComponent, which aren't exposed through
+    -- Ext.Entity.GetComponent's named registry.  Scan the full
+    -- component-name list for those markers; per-entity cost is
+    -- a single call during classification (not per tick).
+    local okComponentNames, componentNames = pcall(
+        entity.GetAllComponentNames, entity, false)
+    if okComponentNames and componentNames then
+        for _, componentName in ipairs(componentNames) do
+            local componentString = tostring(componentName)
+            if componentString:find("AvailablePortal")
+                or componentString:find("PortalCandidate") then
+                return "Doors"
+            end
+        end
+    end
+
     -- ================================================================
     -- Phase 2: Server-provided authoritative data.
     -- ================================================================
@@ -1389,6 +1536,19 @@ local function CategoriseEntity(entity, displayName)
             end
         end
 
+        -- Herbs: stats name starts with CONS_Herbs_ (Mergrass,
+        -- Belladonna, Daggerroot, Knotted Roots, etc.).  BG3's own
+        -- UI places these in the "Misc" inventory tab, but for our
+        -- routing category list they deserve their own bucket --
+        -- the player cares whether a 20m-away Misc entry is a
+        -- prayer book, a dirt mound, or a harvestable alchemy
+        -- ingredient, and the stats-name prefix distinguishes
+        -- them cleanly.
+        if srvData.Stats
+            and string.match(srvData.Stats, "^CONS_Herbs_") then
+            return "Herbs"
+        end
+
         -- Equipment: server-side Weapon or Equipable component,
         -- or stats InventoryTab = Equipment.
         if srvData.has_Weapon then
@@ -1411,7 +1571,7 @@ local function CategoriseEntity(entity, displayName)
         end
 
         if inventoryTab == "BooksAndKeys" then
-            return "Miscellaneous"
+            return "Books and keys"
         end
 
         if inventoryTab == "Consumable"
@@ -1595,10 +1755,93 @@ function ClassifyScannedEntities()
         categories[categoryName] = {}
     end
 
+    -- TEMP DIAGNOSTIC: dump component lists AND cached server data
+    -- for entities whose name suggests they should be in a
+    -- specific category but landed in Miscellaneous.  Helps us see
+    -- which server-side fields populated (StatsInventoryTab,
+    -- StoryItem, etc.) so we know why the classifier fell through.
+    -- Reads from entityClassifyCache because by the time this
+    -- function runs the client has already received and cached the
+    -- server's response -- no need to wait for a fresh request.
+    local diagnosticLogged = 0
+    local DIAGNOSTIC_LIMIT = 12
+    local SUSPECT_NAME_PATTERNS = {
+        -- Doors / traversal
+        "door", "hatch", "ladder",
+        -- Live / dead characters
+        "shadowheart", "lae'zel", "astarion", "gale",
+        "aradin", "zevlor", "tiefling", "goblin",
+        "fisher", "commoner",
+        -- Items that landed in Misc but feel like Quest / Consumable
+        "shanties", "sigil", "mergrass", "belladonna",
+        "daggerroot", "knotted", "clamshell", "mound",
+        "spiderweb", "pouch",
+    }
+
     for _, entry in ipairs(scannedEntitiesRaw) do
         local category = CategoriseEntity(entry.entity, entry.name)
         if category and categories[category] then
             table.insert(categories[category], entry)
+        end
+
+        -- Diagnostic: if this entity's name matches a suspect
+        -- pattern AND it didn't classify into NPCs/Doors, log its
+        -- components so we can see why.
+        if diagnosticLogged < DIAGNOSTIC_LIMIT
+            and category ~= "NPCs"
+            and category ~= "Doors" then
+            local lowerName = entry.name:lower()
+            local suspect = false
+            for _, pattern in ipairs(SUSPECT_NAME_PATTERNS) do
+                if lowerName:find(pattern, 1, true) then
+                    suspect = true
+                    break
+                end
+            end
+            if suspect then
+                local okNames, names = pcall(
+                    entry.entity.GetAllComponentNames,
+                    entry.entity, false)
+                local namesList = "<failed>"
+                if okNames and names then
+                    local nameArray = {}
+                    for _, nameEntry in ipairs(names) do
+                        table.insert(nameArray, tostring(nameEntry))
+                    end
+                    namesList = table.concat(nameArray, ", ")
+                end
+
+                -- Also dump the cached server classification data
+                -- for this entity.  If any server-side fields
+                -- populated (Stats*, StoryItem, has_*), we'll see
+                -- them here.  Emptiness means the template has no
+                -- classification data on the server.
+                local serverData = GetCachedEntityData(entry.entity)
+                local serverParts = {}
+                if serverData then
+                    for key, value in pairs(serverData) do
+                        table.insert(serverParts,
+                            key .. "=" .. tostring(value))
+                    end
+                    table.sort(serverParts)
+                end
+                local serverDump = "<no cache>"
+                if #serverParts > 0 then
+                    serverDump = table.concat(serverParts, " | ")
+                elseif serverData then
+                    serverDump = "<cache empty>"
+                end
+
+                -- DEBUG-gated: quiet in normal play; flip log
+                -- level to DEBUG (L3 click from DevConfig) to
+                -- surface component lists + cached server
+                -- classification for item-categorisation work.
+                Log.Debug("CATEGORIZE DIAG: '" .. entry.name
+                    .. "' category=" .. tostring(category)
+                    .. " | server: " .. serverDump
+                    .. " | components: " .. namesList)
+                diagnosticLogged = diagnosticLogged + 1
+            end
         end
     end
 
@@ -2110,55 +2353,122 @@ local GPS_HAZARD_WARNING_M    = 12.0
 --- pathfinder actually aimed for -- tight (~1.5m, interaction
 --- range) when a walkable tile exists that close, loose (~3.5m,
 --- BG3's default move-to range) when it does not.
--- Minimum player movement (meters) before recomputing the path.
--- BeginPathfindingImmediate is a synchronous A* call that takes 8-12ms,
--- so running it every 300ms tick wastes CPU and floods the log with
--- BG3SE timing warnings.  1.0m is enough to detect meaningful position
--- changes while skipping idle ticks where the player is standing still
--- or barely drifting.
-local GPS_RECOMPUTE_MOVEMENT_M = 1.0
+-- Path commitment policy: once A* returns a path, keep using it
+-- until the path is demonstrably stale.  A* is deterministic on
+-- stable inputs but has tie-breaking behavior at equal-cost paths
+-- and (apparently) a nearest-walkable-tile fallback when the start
+-- tile is flagged non-walkable.  Tiny player-position jitter near
+-- hazards or unwalkable terrain can flip either of those and
+-- produce radically different path shapes on otherwise identical
+-- inputs.  The previous "recompute every N meters of movement"
+-- policy meant we kept asking A* for fresh opinions every 3 meters,
+-- surfacing that tie-breaking variance as announced bearing
+-- flip-flop even when the player was barely moving.
+--
+-- New policy: we only recompute when one of three conditions
+-- fires, in priority order:
+--   1. Target moved >= GPS_TARGET_MOVED_M since last recompute
+--      (NPC targets reposition and the path must follow).
+--   2. Player drifted > GPS_OFF_PATH_M perpendicular from the
+--      current path (player chose a different direction than the
+--      path's centerline suggested -- honor that by asking A* for
+--      a new path from where they actually are).
+--   3. No path exists yet (first tracking tick).
+--
+-- Absent those triggers, we commit to the current path and the
+-- analysis/speech layers work off stable inputs.  Bearings only
+-- change when the player has genuinely moved along the path, not
+-- because A* changed its mind about a tie.
+-- 4m (was 2.5m): hazard-adjacent walking (deepwater, in particular)
+-- jitters the player's physics capsule sideways by up to a couple
+-- of meters even when they're walking "straight."  A tight 2.5m
+-- off-path gate fired recomputes regularly during water crossings
+-- -- each recompute could produce a slightly different A* path
+-- due to tiebreaking near the water/shore boundary, which in turn
+-- fed state-classification flicker.  4m absorbs typical physics
+-- jitter without losing the "player chose a genuinely different
+-- direction" signal (they'd have to deviate by half a body-length
+-- from the path centerline to trigger recompute).
+local GPS_OFF_PATH_M     = 4.0  -- perpendicular drift that invalidates path
+local GPS_TARGET_MOVED_M = 3.0  -- target delta that invalidates path
 
--- Position of the player at the last path recompute.
-local lastRecomputePosition = nil
+-- Ratio of total path length to straight-line distance at the
+-- moment the current path was computed.  A property of the path
+-- shape itself (does it wind around obstacles?), not the player's
+-- progress along it.  Read by AnalyzePathGuidance for the
+-- on_detour state classification.
+local currentPathShapeRatio = 1.0
 
 local function RecalculatePath(playerPosition)
     if not trackingTarget then return end
 
-    -- Skip recompute if the player has not moved significantly since
-    -- the last one.  Always recompute on the very first tick
-    -- (lastRecomputePosition is nil) and when the target entity has
-    -- moved (NPC targets can reposition between ticks).
-    local targetMoved = false
     local playerEntity = GetPlayerEntity()
     if not playerEntity then return end
+
+    -- Refresh the target's world position.  Targets are stored
+    -- by entity handle; the cached position goes stale if the
+    -- target moves (NPC wanders, quest marker updates).
+    local targetMoved = false
     local refreshedPosition = GetEntityPosition(trackingTarget.entity)
     if refreshedPosition then
         if trackingTarget.position then
             local targetDelta = DistanceXZ(
                 refreshedPosition, trackingTarget.position)
-            if targetDelta >= GPS_RECOMPUTE_MOVEMENT_M then
+            if targetDelta >= GPS_TARGET_MOVED_M then
                 targetMoved = true
             end
         end
         trackingTarget.position = refreshedPosition
     end
 
-    if lastRecomputePosition and not targetMoved then
-        local playerDelta = DistanceXZ(
-            playerPosition, lastRecomputePosition)
-        if playerDelta < GPS_RECOMPUTE_MOVEMENT_M then
-            return  -- no significant movement, skip expensive pathfind
+    -- Path commitment check.  If we already have a path, the
+    -- target hasn't moved, and the player is still on/near the
+    -- path's centerline, reuse the existing path.  No fresh A*
+    -- call -- no tie-break variance, no node-count bounce, no
+    -- bearing flip-flop.
+    if currentPath and #currentPath > 0 and not targetMoved then
+        local offPathDistance = MinDistanceToPath(
+            playerPosition, currentPath)
+        if offPathDistance <= GPS_OFF_PATH_M then
+            return
         end
     end
 
-    lastRecomputePosition = {
-        playerPosition[1], playerPosition[2], playerPosition[3]
-    }
     local path, threshold = ComputePath(
         playerEntity, playerPosition, trackingTarget.position)
     currentPath = path
     if threshold then
         trackingTarget.arrivalThreshold = threshold
+    end
+
+    -- Snapshot the path's shape ratio at compute time.  Computing
+    -- this per-guidance-cycle from the current player position is
+    -- wrong -- pathLength's first term is "distance from player to
+    -- node 1," which GROWS as the player walks past node 1.  Paired
+    -- with straightLineDistance SHRINKING as the player approaches
+    -- target, the ratio inflates monotonically during any walk,
+    -- eventually crossing the on_detour threshold even on a
+    -- perfectly straight path.  The ratio is a property of the
+    -- PATH SHAPE, not the player's progress along it, so we
+    -- compute it once here and store it.  AnalyzePathGuidance
+    -- reads this stored value instead of recomputing.
+    if currentPath and #currentPath > 0 then
+        local straightLine = DistanceXZ(
+            playerPosition, trackingTarget.position)
+        local totalPathLength = DistanceXZ(
+            playerPosition, currentPath[1])
+        for nodeIndex = 2, #currentPath do
+            totalPathLength = totalPathLength + DistanceXZ(
+                currentPath[nodeIndex - 1],
+                currentPath[nodeIndex])
+        end
+        if straightLine > 0 then
+            currentPathShapeRatio = totalPathLength / straightLine
+        else
+            currentPathShapeRatio = 1.0
+        end
+    else
+        currentPathShapeRatio = 1.0
     end
 end
 
@@ -2310,208 +2620,6 @@ local function GetSteeringTargetPosition(playerPosition)
     end
 
     return currentPath[steeringNodeIndex]
-end
-
--- Minimum leg 1 length (in meters) before we bother mentioning a
--- detour in the initial tracking announcement.  Short leg 1 values
--- mean "the detour is right at your feet" -- by the time you take
--- your first step you are effectively past it, so announcing it
--- just adds noise.
-local GPS_DETOUR_LEG1_MIN_M = 1.5
-
--- Minimum bearing change (in clock hours) between leg 1 and leg 2
--- before we bother mentioning leg 2.  A small bearing change is a
--- gentle curve, not a corner, and gets described by the normal
--- per-tick guidance once the player has advanced.
-local GPS_DETOUR_LEG_TURN_MIN_HOURS = 2
-
---- Describe the first leg of the path and any sharp turn that
---- follows within GPS_DETOUR_LEG_MAX_M.  Used by StartTracking to
---- preview a local detour in the initial announcement so the
---- player knows "I'll tell you 5 o'clock first, then 3 o'clock"
---- BEFORE they've executed the first step.
----
---- Returns a description table on success:
----   {
----     hasDetour      = boolean -- true when leg 2 is worth saying
----     leg1Clock      = int     -- clock hour for leg 1
----     leg1Meters     = number  -- distance of leg 1 (rounded)
----     leg2Clock      = int     -- clock hour for leg 2 (if hasDetour)
----   }
---- Or nil when the path is too short / bearings unavailable.
----
---- The "detour is worth saying" test has three parts:
----   1. Leg 1 must be at least GPS_DETOUR_LEG1_MIN_M long.  A 0.5m
----      leg is effectively nothing; the player's first step will
----      clear it.
----   2. A node exists beyond the leg window with a valid bearing.
----   3. The leg 2 bearing differs from leg 1 by at least
----      GPS_DETOUR_LEG_TURN_MIN_HOURS clock hours (i.e. ~60 degrees).
----      Anything less is a gentle curve, not a corner, and doesn't
----      need a preview.
----
---- When hasDetour is false, the caller can still use leg1Clock /
---- leg1Meters as the normal initial-direction readout.
-local function DescribeInitialDetour(playerPosition, path)
-    if not path or #path == 0 then
-        Log.Info("DETOUR DEBUG: nil/empty path")
-        return nil
-    end
-
-    -- Find the first trustworthy bearing node and the end of leg 1.
-    -- These are the same computations GetSteeringTargetPosition
-    -- runs, duplicated here because StartTracking calls this
-    -- function BEFORE currentPath is set (so we pass the path as a
-    -- parameter instead of reading it from the module state).
-    local firstLegStartIndex = nil
-    for nodeIndex = 1, #path do
-        local dist = DistanceXZ(playerPosition, path[nodeIndex])
-        if dist >= GPS_BEARING_MIN_SEGMENT_M then
-            firstLegStartIndex = nodeIndex
-            break
-        end
-    end
-    if not firstLegStartIndex then
-        Log.Info(string.format(
-            "DETOUR DEBUG: no node >= %.2fm from player (%d nodes), "
-                .. "result=nil",
-            GPS_BEARING_MIN_SEGMENT_M, #path))
-        return nil
-    end
-
-    local leg1Clock, _ = ComputeClockDirection(
-        playerPosition, path[firstLegStartIndex])
-    if not leg1Clock then
-        Log.Info("DETOUR DEBUG: ComputeClockDirection failed "
-            .. "for leg1 start (camera unavailable?), result=nil")
-        return nil
-    end
-
-    local leg1EndIndex = firstLegStartIndex
-    local pivotIndex = nil
-    local pivotReason = "none"
-    for nodeIndex = firstLegStartIndex + 1, #path do
-        local candidate = path[nodeIndex]
-        local candidateDistance = DistanceXZ(
-            playerPosition, candidate)
-        if candidateDistance > GPS_DETOUR_LEG_MAX_M then
-            pivotReason = "reached-leg-window"
-            break
-        end
-
-        local candidateBearing = ComputeClockDirection(
-            playerPosition, candidate)
-        if not candidateBearing then
-            pivotReason = "bearing-unavailable"
-            break
-        end
-
-        local hourDelta = math.abs(candidateBearing - leg1Clock)
-        if hourDelta > 6 then hourDelta = 12 - hourDelta end
-
-        if hourDelta > 1 then
-            pivotIndex = nodeIndex
-            pivotReason = "bearing-diverged"
-            break
-        end
-        leg1EndIndex = nodeIndex
-    end
-
-    local leg1EndPosition = path[leg1EndIndex]
-    local leg1Meters = DistanceXZ(playerPosition, leg1EndPosition)
-
-    -- Leg 1 too short to bother announcing a two-leg plan.  Return
-    -- the single-bearing readout only.
-    if leg1Meters < GPS_DETOUR_LEG1_MIN_M then
-        Log.Info(string.format(
-            "DETOUR DEBUG: leg1=%dh, %.2fm (< %.1fm min) "
-                .. "-- hasDetour=false, reason=leg1-too-short",
-            leg1Clock, leg1Meters, GPS_DETOUR_LEG1_MIN_M))
-        return {
-            hasDetour = false,
-            leg1Clock = leg1Clock,
-            leg1Meters = math.floor(leg1Meters + 0.5),
-        }
-    end
-
-    -- No pivot found within the window -- just a single leg.
-    if not pivotIndex then
-        Log.Info(string.format(
-            "DETOUR DEBUG: leg1=%dh, %.2fm, no pivot "
-                .. "(reason=%s) -- hasDetour=false",
-            leg1Clock, leg1Meters, pivotReason))
-        return {
-            hasDetour = false,
-            leg1Clock = leg1Clock,
-            leg1Meters = math.floor(leg1Meters + 0.5),
-        }
-    end
-
-    -- Compute leg 2's bearing from the pivot position to a node
-    -- further along the path (roughly GPS_STEERING_DISTANCE past
-    -- the pivot).  Using a node well past the pivot stabilizes the
-    -- reading -- a bearing from pivot to the immediate next node
-    -- would be noisy because the next node is only one tile away.
-    local pivotPosition = path[pivotIndex]
-    local leg2TargetIndex = pivotIndex
-    for nodeIndex = pivotIndex + 1, #path do
-        local dist = DistanceXZ(
-            pivotPosition, path[nodeIndex])
-        if dist >= GPS_STEERING_DISTANCE then
-            leg2TargetIndex = nodeIndex
-            break
-        end
-    end
-    if leg2TargetIndex == pivotIndex
-        and pivotIndex < #path then
-        leg2TargetIndex = #path
-    end
-
-    local leg2Clock, _ = ComputeClockDirection(
-        pivotPosition, path[leg2TargetIndex])
-    if not leg2Clock then
-        Log.Info(string.format(
-            "DETOUR DEBUG: leg1=%dh, %.2fm, pivot@node=%d, "
-                .. "leg2 bearing unavailable "
-                .. "-- hasDetour=false",
-            leg1Clock, leg1Meters, pivotIndex))
-        return {
-            hasDetour = false,
-            leg1Clock = leg1Clock,
-            leg1Meters = math.floor(leg1Meters + 0.5),
-        }
-    end
-
-    -- Final sanity check: require a meaningful turn between leg 1
-    -- and leg 2.  A small bearing change is a gentle curve the
-    -- per-tick guidance handles on its own.
-    local turnHours = math.abs(leg2Clock - leg1Clock)
-    if turnHours > 6 then turnHours = 12 - turnHours end
-    if turnHours < GPS_DETOUR_LEG_TURN_MIN_HOURS then
-        Log.Info(string.format(
-            "DETOUR DEBUG: leg1=%dh, %.2fm, pivot@node=%d, "
-                .. "leg2=%dh, turn=%.0fh (< %dh min) "
-                .. "-- hasDetour=false, reason=turn-too-gentle",
-            leg1Clock, leg1Meters, pivotIndex, leg2Clock,
-            turnHours, GPS_DETOUR_LEG_TURN_MIN_HOURS))
-        return {
-            hasDetour = false,
-            leg1Clock = leg1Clock,
-            leg1Meters = math.floor(leg1Meters + 0.5),
-        }
-    end
-
-    Log.Info(string.format(
-        "DETOUR DEBUG: leg1=%dh, %.2fm, pivot@node=%d, "
-            .. "leg2=%dh, turn=%.0fh "
-            .. "-- hasDetour=true",
-        leg1Clock, leg1Meters, pivotIndex, leg2Clock, turnHours))
-    return {
-        hasDetour = true,
-        leg1Clock = leg1Clock,
-        leg1Meters = math.floor(leg1Meters + 0.5),
-        leg2Clock = leg2Clock,
-    }
 end
 
 --- Scan the upcoming path segment for dynamic hazards (Cloudkill
@@ -2979,19 +3087,53 @@ local function UpdateTrackingState(playerPosition)
 end
 
 -- Detour analysis constants.
--- First-leg tolerance: how far the first actionable path node can
--- diverge from the target bearing before we consider the player's
--- immediate next step to be a detour.  One hour = 30 degrees.  A
--- tighter threshold here is correct because even a minor bend at the
--- START of the route is navigationally significant -- a wall that
--- forces the path 45 degrees off target means the player cannot walk
--- the target bearing without colliding.
-local GPS_FIRST_LEG_DETOUR_HOURS = 1
+--
+-- Detour classification is based on the overall SHAPE of the path
+-- (total path length / straight-line distance), not on the first
+-- actionable leg's bearing delta.  First-leg bearing flips by 60+
+-- degrees for 30cm sidesteps around pebbles, doorway sills, and
+-- pillar edges, which produced per-tick "Detour, 8 o'clock / 1
+-- o'clock / 9 o'clock" oscillation on paths that were actually
+-- straight to within 2 percent.  Ratio-based classification only
+-- fires "Detour" when the pathfinder is genuinely routing around
+-- something that costs meaningful overhead.
+--
+-- ENTER/EXIT thresholds form a hysteresis band: ratio above ENTER
+-- starts qualifying as on_detour, below EXIT starts qualifying as
+-- straight, and the band between holds the previous state.  Paired
+-- with tick-persistence, this eliminates flicker from recompute
+-- jitter while still responding to real route changes in ~1s.
+local GPS_DETOUR_RATIO_ENTER   = 1.25
+local GPS_DETOUR_RATIO_EXIT    = 1.10
+-- Candidate state must hold for this many consecutive guidance
+-- cycles (each cycle = GPS_GUIDANCE_MOVEMENT = 2m) before the
+-- reported state flips.  Three ticks at running speed is ~1s of
+-- stable observation, which smooths out single-tick spikes from
+-- path recompute while still reporting real route changes
+-- promptly.
+local GPS_DETOUR_PERSIST_TICKS = 3
 -- Mid-path detour threshold: how far a later path node must diverge
 -- from the target bearing before we consider it a meaningful bend
 -- ahead.  Two hours = 60 degrees; the wider threshold avoids warning
 -- about gentle curves partway through the route.
 local GPS_MID_PATH_DETOUR_HOURS = 2
+-- Minimum path-distance at which a bend can trigger the "detour
+-- ahead" pre-warning.  Two classes of noise motivated this floor:
+--   (1) Passed-by nodes.  As the player walks forward, early path
+--       nodes end up BEHIND them.  The bearing from the player to
+--       a passed-by node inverts toward "back the way I came,"
+--       which looks like a sharp turn in the lookahead scan even
+--       though nothing is actually ahead.  Path-distance to a
+--       passed-by node is always small (under 2m), so a 4m floor
+--       excludes them.
+--   (2) Final-approach jogs.  The pathfinder tacks small bends
+--       onto the last 1-2m as it picks an in-tolerance approach
+--       tile near the target, which look like detours but produce
+--       "Detour ahead" speech right as the arrival-meter is
+--       ticking down.  The floor keeps those silent.
+-- 4m is ~0.7 seconds of reaction time at running speed (~6 m/s),
+-- which is the floor below which a warning can't be acted on.
+local GPS_DETOUR_WARN_MIN_M = 4
 -- How far along the path a detour can start from the player's current
 -- position to trigger the "detour ahead" pre-warning.  Sized to give
 -- about one second of reaction time at BG3's running speed (~6 m/s)
@@ -2999,9 +3141,202 @@ local GPS_MID_PATH_DETOUR_HOURS = 2
 -- so the warning lands with enough lead time for the player to hear
 -- it, process it, and adjust stick direction before the bend arrives.
 -- Speech fires every GPS_GUIDANCE_MOVEMENT meters (2m) so the effective
--- warning window is 6-8m; a second on_detour announcement follows at
+-- warning window is 4-8m; a second on_detour announcement follows at
 -- the turn itself to confirm the new bearing.
 local GPS_DETOUR_WARN_LOOKAHEAD_M = 8
+-- Hysteresis exit threshold for approaching_detour.  Once we've
+-- announced "In N meters, turn to X o'clock," the state only
+-- exits back to plain straight when the bend has moved past this
+-- distance -- not just past the 8m entry threshold.  Without the
+-- dead zone, a bend oscillating between 7.8m and 8.2m (common
+-- when path-recomputes in hazard-adjacent areas produce slightly
+-- different path shapes tick-to-tick) would flip state every
+-- recompute and produce back-to-back "In 8m, turn X / Continue
+-- straight / In 8m, turn X" speech.  A 2m band silences that
+-- noise while still letting legitimate transitions through.
+local GPS_DETOUR_WARN_LOOKAHEAD_EXIT_M = 10
+-- Suppress "Detour ahead" entirely when the straight-line distance
+-- to target is under this threshold.  Final-approach jogs are
+-- inherent to pathfinder close-enough logic and the player will
+-- hear the "Arriving at X" notice in another second or two anyway;
+-- a detour warning at this range is just noise.
+local GPS_DETOUR_WARN_TARGET_MIN_M = 5
+
+-- Hysteresis state for detour classification.  persistentState is
+-- the currently-reported state.  pendingState is the candidate the
+-- ratio has been producing for pendingTicks consecutive guidance
+-- cycles.  When pendingTicks reaches GPS_DETOUR_PERSIST_TICKS, the
+-- persistent state flips and pendingTicks resets.
+local detourPersistentState = "straight"
+local detourPendingState    = "straight"
+local detourPendingTicks    = 0
+-- Hysteresis flag for approaching_detour.  True when the most
+-- recent AnalyzePathGuidance call reported approaching_detour,
+-- used next tick to decide whether to apply the ENTER threshold
+-- (8m) or the EXIT threshold (10m).
+local approachingDetourActive = false
+-- When true, the next AnalyzePathGuidance call adopts the ratio's
+-- candidate state directly instead of running through the persist-
+-- ticks gate.  Set by ResetDetourHysteresis so the FIRST analysis
+-- after a tracking session starts reflects the actual path shape
+-- immediately -- otherwise the player hears "continue straight"
+-- on a clearly-curved initial route and doesn't hear "Detour"
+-- until three guidance cycles (six meters of walking) later.
+local detourNeedsFirstClassify = true
+
+--- Reset detour hysteresis.  Called when tracking starts or ends;
+--- a fresh route has no prior state to carry forward.
+local function ResetDetourHysteresis()
+    detourPersistentState      = "straight"
+    detourPendingState         = "straight"
+    detourPendingTicks         = 0
+    detourNeedsFirstClassify   = true
+    currentPathShapeRatio      = 1.0
+    approachingDetourActive    = false
+end
+
+-- How far along the path to sample when computing the detour
+-- bearing.  Using the first path node directly makes the reported
+-- clock hour flip wildly when the pathfinder recomputes (node
+-- count can bounce 6-40 nodes between consecutive ticks when
+-- hazard influence kicks in); the raw first node position shifts
+-- by a meter or more across recomputes.  Sampling a FIXED
+-- DISTANCE along the path gives us a point that stays in
+-- approximately the same world-space location across recomputes
+-- because the overall path shape is stable even when node density
+-- changes.  3m is enough distance to average out immediate jitter
+-- while still being short enough to represent the "next step"
+-- direction the player should walk.
+local GPS_DETOUR_BEARING_SAMPLE_M = 3.0
+
+--- Bearing from the player to a point GPS_DETOUR_BEARING_SAMPLE_M
+--- meters along the given path.  Interpolates between path nodes
+--- when the sample distance falls mid-segment.  Falls back to the
+--- final node when the entire path is shorter than the sample
+--- distance (residual arrival, short routes).  Returns nil when
+--- the path is empty or the bearing lookup fails.
+local function GetSmoothedPathBearing(playerPosition, path)
+    if not path or #path == 0 then return nil end
+    if #path == 1 then
+        return ComputeClockDirection(playerPosition, path[1])
+    end
+
+    -- Walk the path forward from the player's projection onto the
+    -- nearest segment.  Accumulating from DistanceXZ(player,
+    -- path[1]) would count the distance back to node 1 when the
+    -- player has walked past it -- inflating "3 meters ahead" to
+    -- "3 + (meters walked past node 1) ahead."  The projection
+    -- gives a true "forward distance along path" measurement.
+    local nextNodeIndex, distanceForward,
+        projectionX, projectionZ =
+        GetForwardPathStart(playerPosition, path)
+    if not nextNodeIndex then
+        return ComputeClockDirection(playerPosition, path[#path])
+    end
+
+    -- Case 1: the sample distance lands on the stub segment (from
+    -- the projection to path[nextNodeIndex]).  Interpolate within
+    -- that segment.
+    if distanceForward >= GPS_DETOUR_BEARING_SAMPLE_M then
+        local stubEnd = path[nextNodeIndex]
+        local stubT = 0
+        if distanceForward > 0 then
+            stubT = GPS_DETOUR_BEARING_SAMPLE_M / distanceForward
+        end
+        local samplePoint = {
+            projectionX + (stubEnd[1] - projectionX) * stubT,
+            stubEnd[2],
+            projectionZ + (stubEnd[3] - projectionZ) * stubT,
+        }
+        return ComputeClockDirection(playerPosition, samplePoint)
+    end
+
+    -- Case 2: the sample distance lands past the stub.  Accumulate
+    -- along successive segments until we cross the sample distance
+    -- or run out of path.
+    local accumulated = distanceForward
+    local previousNode = path[nextNodeIndex]
+    for nodeIndex = nextNodeIndex + 1, #path do
+        local node = path[nodeIndex]
+        local segmentLength = DistanceXZ(previousNode, node)
+        if accumulated + segmentLength
+            >= GPS_DETOUR_BEARING_SAMPLE_M then
+            local remaining =
+                GPS_DETOUR_BEARING_SAMPLE_M - accumulated
+            local segmentT = 0
+            if segmentLength > 0 then
+                segmentT = remaining / segmentLength
+            end
+            local samplePoint = {
+                previousNode[1]
+                    + (node[1] - previousNode[1]) * segmentT,
+                previousNode[2]
+                    + (node[2] - previousNode[2]) * segmentT,
+                previousNode[3]
+                    + (node[3] - previousNode[3]) * segmentT,
+            }
+            return ComputeClockDirection(
+                playerPosition, samplePoint)
+        end
+        accumulated = accumulated + segmentLength
+        previousNode = node
+    end
+
+    -- Whole remaining path shorter than the sample distance:
+    -- fall back to bearing to the final node.
+    return ComputeClockDirection(playerPosition, path[#path])
+end
+
+--- Scan the path forward from the player for the first node whose
+--- bearing diverges from the target bearing by GPS_MID_PATH_DETOUR_HOURS
+--- clock hours or more.  Returns (pathDistance, nodeBearing) for
+--- the first qualifying bend in the window [minDistance, maxDistance],
+--- or (nil, nil) when no such bend exists.  minDistance filters out
+--- passed-by nodes and close-jog false positives (see
+--- GPS_DETOUR_WARN_MIN_M); maxDistance caps the search for the
+--- approaching_detour classification, and is set to the path's total
+--- length for the "continue straight for N meters" lookup.
+local function FindNextPathBend(
+    playerPosition, path, targetBearing,
+    minDistance, maxDistance)
+    if not path or #path == 0 then return nil, nil end
+
+    -- Forward-accumulate path distance from the player's projection
+    -- onto the nearest segment.  Starting at DistanceXZ(player,
+    -- path[1]) inflates the accumulator by however far the player
+    -- has walked past node 1 -- a fixed downstream bend would then
+    -- be reported at progressively larger path distances as the
+    -- player walked toward it, making "turn in 5m" become "turn in
+    -- 10m" a few seconds later.  The projection gives the correct
+    -- forward distance.
+    local nextNodeIndex, stubDistance =
+        GetForwardPathStart(playerPosition, path)
+    if not nextNodeIndex then return nil, nil end
+
+    local pathDistanceAccum = stubDistance
+    for nodeIndex = nextNodeIndex, #path do
+        if pathDistanceAccum > maxDistance then return nil, nil end
+        local node = path[nodeIndex]
+        if DistanceXZ(playerPosition, node)
+            >= GPS_BEARING_MIN_SEGMENT_M then
+            local nodeBearing = ComputeClockDirection(
+                playerPosition, node)
+            if nodeBearing then
+                local delta = math.abs(nodeBearing - targetBearing)
+                if delta > 6 then delta = 12 - delta end
+                if delta >= GPS_MID_PATH_DETOUR_HOURS
+                    and pathDistanceAccum >= minDistance then
+                    return pathDistanceAccum, nodeBearing
+                end
+            end
+        end
+        if nodeIndex < #path then
+            pathDistanceAccum = pathDistanceAccum + DistanceXZ(
+                path[nodeIndex], path[nodeIndex + 1])
+        end
+    end
+    return nil, nil
+end
 
 --- AnalyzePathGuidance: classify the path into one of three states for
 --- guidance output.  All bearings are clock hours relative to the camera.
@@ -3013,6 +3348,9 @@ local GPS_DETOUR_WARN_LOOKAHEAD_M = 8
 ---     detourBearing  = clock hour of the detour leg (approaching/on only),
 ---     distanceToDetour = meters along path until the detour starts
 ---                        (approaching only),
+---     nextBendDistance = meters along path until the next bend (straight
+---                        state only; nil when the path is clean all the
+---                        way to the target),
 --- }
 local function AnalyzePathGuidance(playerPosition)
     if not trackingTarget or not currentPath or #currentPath == 0 then
@@ -3023,82 +3361,152 @@ local function AnalyzePathGuidance(playerPosition)
         playerPosition, trackingTarget.position)
     if not targetBearing then return nil end
 
-    -- First-leg bearing = the actionable direction for the player's
-    -- very next step.  Even when this differs from the target bearing
-    -- by only a clock hour (a wall forcing a 30 degree bend), the
-    -- player MUST walk the first-leg bearing -- walking the target
-    -- bearing would collide with whatever the path is routing around.
-    -- We trust the pathfinder's first step.
-    local firstLegIndex = nil
-    for nodeIndex = 1, #currentPath do
-        if DistanceXZ(playerPosition, currentPath[nodeIndex])
-            >= GPS_BEARING_MIN_SEGMENT_M then
-            firstLegIndex = nodeIndex
-            break
+    -- Smoothed bearing to a point GPS_DETOUR_BEARING_SAMPLE_M
+    -- meters along the path.  Replaces the previous "bearing to
+    -- first path node" heuristic, which flipped wildly across
+    -- pathfinder recomputes because the first node's position is
+    -- unstable when node density changes (hazard-influence
+    -- reroutes can produce 6-node vs 40-node paths to the same
+    -- target within consecutive ticks).  Sampling a fixed distance
+    -- along the path yields a stable point even when the node
+    -- list differs.
+    local smoothedBearing = GetSmoothedPathBearing(
+        playerPosition, currentPath)
+
+    -- No usable bearing at all (residual arrival, short path
+    -- entirely within the consumed threshold).  Reset hysteresis
+    -- and fall through to straight + target bearing.
+    if not smoothedBearing then
+        ResetDetourHysteresis()
+        return { state = "straight", bearing = targetBearing }
+    end
+
+    -- Path-shape ratio: snapshotted at path-computation time (see
+    -- RecalculatePath).  Computing this from the current player
+    -- position is wrong -- the first term of pathLength is
+    -- "distance from player to node 1," which GROWS as the player
+    -- walks past node 1, while straightLineDistance SHRINKS as
+    -- the player nears the target.  The ratio inflates
+    -- monotonically during any walk and would cross the detour
+    -- threshold even on a perfectly straight path.  The ratio is
+    -- a property of the path SHAPE, not the player's progress
+    -- along it; once computed it stays put until A* returns a
+    -- new path (drift off, target moved, arrival).
+    local ratio = currentPathShapeRatio
+    local straightLineDistance = DistanceXZ(
+        playerPosition, trackingTarget.position)
+
+    -- Ratio -> candidate state, with a hysteresis band between
+    -- ENTER and EXIT where the candidate holds whatever was
+    -- persistent.  This prevents a ratio hovering near a single
+    -- threshold from toggling the candidate every tick.
+    local candidateState
+    if ratio >= GPS_DETOUR_RATIO_ENTER then
+        candidateState = "on_detour"
+    elseif ratio <= GPS_DETOUR_RATIO_EXIT then
+        candidateState = "straight"
+    else
+        candidateState = detourPersistentState
+    end
+
+    -- Tick-persistence: the candidate must match for
+    -- GPS_DETOUR_PERSIST_TICKS consecutive guidance cycles before
+    -- persistent state flips.  Any change in the candidate resets
+    -- the counter so a single noisy tick cannot accumulate toward
+    -- the threshold.  First analysis after a reset bypasses this
+    -- gate so the initial announcement reflects the actual path
+    -- shape instead of the default "straight."
+    if detourNeedsFirstClassify then
+        detourPersistentState    = candidateState
+        detourPendingState       = candidateState
+        detourPendingTicks       = 0
+        detourNeedsFirstClassify = false
+    elseif candidateState == detourPersistentState then
+        detourPendingState = candidateState
+        detourPendingTicks = 0
+    else
+        if candidateState == detourPendingState then
+            detourPendingTicks = detourPendingTicks + 1
+        else
+            detourPendingState = candidateState
+            detourPendingTicks = 1
+        end
+        if detourPendingTicks >= GPS_DETOUR_PERSIST_TICKS then
+            detourPersistentState = candidateState
+            detourPendingTicks    = 0
         end
     end
-    local firstLegBearing = nil
-    if firstLegIndex then
-        firstLegBearing = ComputeClockDirection(
-            playerPosition, currentPath[firstLegIndex])
-    end
-    -- Fall back to target bearing when the whole path is inside the
-    -- noise floor (very short route, arriving).
-    if not firstLegBearing then
+
+    if detourPersistentState == "on_detour" then
+        -- Reference bearing for bend detection is the CURRENT leg
+        -- (smoothedBearing), not target bearing.  We're on a bent
+        -- leg already; the next actionable event is when that leg
+        -- itself ends and a new direction begins.  Scanning against
+        -- target bearing would call the entire detour a "bend,"
+        -- which is useless.
+        local legBendDistance, legBendBearing = FindNextPathBend(
+            playerPosition, currentPath, smoothedBearing,
+            GPS_DETOUR_WARN_MIN_M, math.huge)
         return {
-            state   = "straight",
-            bearing = targetBearing,
+            state            = "on_detour",
+            bearing          = smoothedBearing,
+            detourBearing    = legBendBearing,
+            distanceToDetour = legBendDistance,
         }
     end
 
-    local firstLegDelta = math.abs(firstLegBearing - targetBearing)
-    if firstLegDelta > 6 then firstLegDelta = 12 - firstLegDelta end
+    -- Persistent state is straight.  Look ahead along the full
+    -- path for the next node that bends sharply away (60+ degrees)
+    -- from the target bearing.  If the bend is within the
+    -- approaching-detour window it drives the "In N meters, turn
+    -- to X o'clock" speech (imminent turn, actionable).  Beyond
+    -- that window it drives the "continue straight for N meters"
+    -- phrase -- the player hears once when a bend is coming but
+    -- isn't close enough to act on yet, and stays silent until it
+    -- is.  When no bend exists anywhere on the path, we emit
+    -- "continue straight until arrival" and go silent until the
+    -- arrival notice.
+    --
+    -- Close-to-target suppression (GPS_DETOUR_WARN_TARGET_MIN_M):
+    -- approaching-detour classification is skipped when the
+    -- straight-line distance is small because final-approach jogs
+    -- inherent to pathfinder close-enough logic would produce a
+    -- spurious turn warning right before arrival.  The straight-
+    -- state nextBend scan still runs, so the player hears
+    -- "continue straight for N meters" if a legitimate late-path
+    -- bend exists.
+    local bendDistance, bendBearing = FindNextPathBend(
+        playerPosition, currentPath, targetBearing,
+        GPS_DETOUR_WARN_MIN_M, math.huge)
 
-    -- Player is on a detour when the first actionable step diverges
-    -- from the target bearing by one clock hour or more.  Announced
-    -- bearing is the first-leg bearing (what they can actually walk).
-    if firstLegDelta >= GPS_FIRST_LEG_DETOUR_HOURS then
+    -- Asymmetric hysteresis threshold: enter approaching_detour
+    -- when a bend falls inside LOOKAHEAD_M (8m), exit only when
+    -- it moves past LOOKAHEAD_EXIT_M (10m).  Prevents state
+    -- flip-flop from tiny bend-distance oscillations across
+    -- pathfinder recomputes near water / shore boundaries.
+    local approachingDetourThreshold = GPS_DETOUR_WARN_LOOKAHEAD_M
+    if approachingDetourActive then
+        approachingDetourThreshold = GPS_DETOUR_WARN_LOOKAHEAD_EXIT_M
+    end
+
+    if bendDistance
+        and bendDistance <= approachingDetourThreshold
+        and straightLineDistance >= GPS_DETOUR_WARN_TARGET_MIN_M then
+        approachingDetourActive = true
         return {
-            state   = "on_detour",
-            bearing = firstLegBearing,
+            state            = "approaching_detour",
+            bearing          = targetBearing,
+            detourBearing    = bendBearing,
+            distanceToDetour = bendDistance,
         }
     end
 
-    -- First step is aligned with the target.  Look ahead along the
-    -- path for a later node that bends sharply away (60+ degrees).
-    -- If that bend is within two speech cycles of the player, warn.
-    local pathDistanceAccum = 0
-    local previousPosition  = playerPosition
-    for nodeIndex = 1, #currentPath do
-        local node = currentPath[nodeIndex]
-        local segmentLength = DistanceXZ(previousPosition, node)
-        if DistanceXZ(playerPosition, node)
-            >= GPS_BEARING_MIN_SEGMENT_M then
-            local nodeBearing = ComputeClockDirection(
-                playerPosition, node)
-            if nodeBearing then
-                local delta = math.abs(nodeBearing - targetBearing)
-                if delta > 6 then delta = 12 - delta end
-                if delta >= GPS_MID_PATH_DETOUR_HOURS
-                    and pathDistanceAccum > GPS_BEARING_MIN_SEGMENT_M
-                    and pathDistanceAccum
-                        <= GPS_DETOUR_WARN_LOOKAHEAD_M then
-                    return {
-                        state            = "approaching_detour",
-                        bearing          = targetBearing,
-                        detourBearing    = nodeBearing,
-                        distanceToDetour = pathDistanceAccum,
-                    }
-                end
-            end
-        end
-        pathDistanceAccum = pathDistanceAccum + segmentLength
-        previousPosition  = node
-    end
+    approachingDetourActive = false
 
     return {
-        state   = "straight",
-        bearing = targetBearing,
+        state            = "straight",
+        bearing          = targetBearing,
+        nextBendDistance = bendDistance,  -- nil = clean to arrival
     }
 end
 
@@ -3108,6 +3516,98 @@ end
 --- refreshed currentPath for this tick and has already issued any
 --- hazard warnings (hazard detection lives in the silent tick so
 --- the player does not have to walk another 2m to hear a warning).
+-- Dedup state for guidance speech.  Keeps the announcement quiet
+-- when nothing material has changed since the last one -- the
+-- player hears "Continue straight until arrival" once and then
+-- silence until they're arriving, instead of the old behavior of
+-- re-announcing "N meters. 12 o'clock" every two meters walked.
+-- Reset when a new tracking session starts (ClearGPSState,
+-- StartTracking) so the first announcement of a new route always
+-- speaks.
+local lastSpokenState         = nil
+local lastSpokenBearing       = nil
+local lastSpokenDetourBearing = nil
+local lastSpokenDetourDistance = nil
+
+--- Reset all guidance-speech dedup so the next call to
+--- SpeakTrackingGuidance announces unconditionally.
+local function ResetGuidanceSpeechDedup()
+    lastSpokenState          = nil
+    lastSpokenBearing        = nil
+    lastSpokenDetourBearing  = nil
+    lastSpokenDetourDistance = nil
+end
+
+--- Build the Waze-style guidance phrase from an AnalyzePathGuidance
+--- result.  Used by both per-guidance-cycle speech (from
+--- SpeakTrackingGuidance) and the initial tracking announcement
+--- (from StartTracking) so the phrasing is identical in both
+--- places.
+---
+--- Returns "N meters. H o'clock. <suffix>" where the suffix is:
+---   In B meters, turn to X o'clock   (imminent turn)
+---   Continue straight for B meters   (distant turn)
+---   Continue straight                (no turn on the scanned path)
+---
+--- The "N meters" distance to target always appears; the player
+--- gets a sense of how far they are without any phrase needing to
+--- promise it.  "Continue straight" is deliberately non-committal
+--- -- it does NOT promise "until arrival" because the pathfinder
+--- can recompute any time and discover a bend that wasn't there
+--- on the previous cycle.  Saying "until arrival" and then
+--- announcing a turn two seconds later is a contradiction; saying
+--- "Continue straight" and then "In 4 meters, turn to X" is just
+--- an update as the path shape resolves.
+---
+--- Does NOT apply the "Detour." transition prefix -- callers
+--- prepend that when they know this is a state-entry event.
+local function BuildGuidancePhrase(guidanceData, distanceToTarget)
+    local distanceRounded = math.floor(distanceToTarget + 0.5)
+
+    -- Announce-path-distance cap: if the next bend on the path is
+    -- farther than the straight-line distance to the target, the
+    -- pathfinder's winding route costs more than it would to
+    -- approach target directly.  Telling the player "In 11 meters,
+    -- turn" when the target is 7 meters away is nonsensical -- the
+    -- turn sits past the destination, so committing to the full
+    -- path-distance no longer makes sense.  Drop the turn announcement
+    -- in that case; the player keeps the bearing and "Continue
+    -- straight" instead.  Common cause: hazard-avoidance routing
+    -- around deepwater near the target produces a path that loops
+    -- out and back.
+    local turnMeters = nil
+    if guidanceData.distanceToDetour
+        and guidanceData.distanceToDetour <= distanceToTarget then
+        turnMeters = math.floor(
+            guidanceData.distanceToDetour + 0.5)
+        if turnMeters < 1 then turnMeters = 1 end
+    end
+    local straightMeters = nil
+    if guidanceData.nextBendDistance
+        and guidanceData.nextBendDistance <= distanceToTarget then
+        straightMeters = math.floor(
+            guidanceData.nextBendDistance + 0.5)
+        if straightMeters < 1 then straightMeters = 1 end
+    end
+
+    local phrase = distanceRounded .. " meters. "
+        .. guidanceData.bearing .. " o'clock. "
+
+    if turnMeters then
+        phrase = phrase
+            .. "In " .. turnMeters .. " meters, turn to "
+            .. guidanceData.detourBearing .. " o'clock"
+    elseif straightMeters then
+        phrase = phrase
+            .. "Continue straight for "
+            .. straightMeters .. " meters"
+    else
+        phrase = phrase .. "Continue straight"
+    end
+
+    return phrase
+end
+
 local function SpeakTrackingGuidance(playerPosition)
     if not trackingTarget or not currentPath then return end
 
@@ -3118,25 +3618,72 @@ local function SpeakTrackingGuidance(playerPosition)
         playerPosition, trackingTarget.position)
     local distanceRounded = math.floor(distanceToTarget + 0.5)
 
-    -- Primary phrase depends on state:
-    --   straight            -> "N meters. H o'clock"
-    --   approaching_detour  -> "N meters. H o'clock. Detour ahead"
-    --   on_detour           -> "N meters. Detour, H o'clock"
-    -- In approaching_detour the primary bearing is the target bearing
-    -- (current course still valid for one more step or two).  In
-    -- on_detour it's the detour leg bearing, because walking the target
-    -- bearing would lead the player into whatever the path is routing
-    -- around.
-    local guidance
-    if guidanceData.state == "on_detour" then
-        guidance = distanceRounded .. " meters. Detour, "
-            .. guidanceData.bearing .. " o'clock"
-    else
-        guidance = distanceRounded .. " meters. "
-            .. guidanceData.bearing .. " o'clock"
-        if guidanceData.state == "approaching_detour" then
-            guidance = guidance .. ". Detour ahead"
+    -- Dedup: decide whether this guidance differs enough from the
+    -- last one spoken to deserve a new announcement.  A change in
+    -- state or bearing always speaks.  In approaching_detour or
+    -- on_detour, a change in the upcoming-turn bearing, or a drop
+    -- in turn distance of >= GPS_DETOUR_ANNOUNCE_DELTA_M meters,
+    -- also speaks (so the player hears the turn warning getting
+    -- closer as they walk toward it).  Target-distance progress
+    -- alone does NOT cause a re-announcement; the player already
+    -- knows they're walking, and re-hearing "N meters. 12 o'clock"
+    -- every two meters is the thing we're removing.
+    local GPS_DETOUR_ANNOUNCE_DELTA_M  = 2
+    -- Bearing hysteresis: only re-announce a bearing change when
+    -- the clock-hour delta is >= this many hours.  One-hour shifts
+    -- (30 degrees) are typically noise from pathfinder recomputes
+    -- near hazard boundaries or natural drift as the player walks
+    -- a gently curving path -- they don't represent an actionable
+    -- turn, so suppressing them avoids the "talk talk talk" the
+    -- player reported on detour-heavy routes.  Two hours (60
+    -- degrees) is a real turn that warrants spoken confirmation.
+    local GPS_BEARING_ANNOUNCE_MIN_HOURS = 2
+
+    local function ClockHourDelta(hourA, hourB)
+        local delta = math.abs(hourA - hourB)
+        if delta > 6 then delta = 12 - delta end
+        return delta
+    end
+
+    local shouldSpeak = false
+    if guidanceData.state ~= lastSpokenState then
+        shouldSpeak = true
+    elseif not lastSpokenBearing then
+        -- First announcement of the session.
+        shouldSpeak = true
+    elseif ClockHourDelta(guidanceData.bearing, lastSpokenBearing)
+        >= GPS_BEARING_ANNOUNCE_MIN_HOURS then
+        shouldSpeak = true
+    elseif guidanceData.state == "approaching_detour"
+        or guidanceData.state == "on_detour" then
+        if guidanceData.detourBearing
+            and lastSpokenDetourBearing
+            and ClockHourDelta(
+                guidanceData.detourBearing,
+                lastSpokenDetourBearing)
+                >= GPS_BEARING_ANNOUNCE_MIN_HOURS then
+            shouldSpeak = true
+        elseif guidanceData.distanceToDetour
+            and lastSpokenDetourDistance
+            and (lastSpokenDetourDistance
+                - guidanceData.distanceToDetour)
+                >= GPS_DETOUR_ANNOUNCE_DELTA_M then
+            shouldSpeak = true
         end
+    end
+
+    -- "Detour." names the EVENT of being rerouted -- prepended
+    -- only on the transition tick (straight -> on_detour), then
+    -- every subsequent on_detour speech uses normal turn-by-turn
+    -- phrasing.  A turn is just a turn; we don't keep saying
+    -- "detour" while the player walks through one.
+    local enteredDetour =
+        guidanceData.state == "on_detour"
+        and lastSpokenState ~= "on_detour"
+
+    local guidance = BuildGuidancePhrase(guidanceData, distanceToTarget)
+    if enteredDetour then
+        guidance = "Detour. " .. guidance
     end
 
     -- Distance trend for diagnostics.
@@ -3151,7 +3698,10 @@ local function SpeakTrackingGuidance(playerPosition)
     end
     lastDistanceToTarget = distanceToTarget
 
-    -- Log player's actual movement direction vs recommended direction.
+    -- Log player's actual movement direction vs recommended
+    -- direction.  This stays at Info level even when we suppress
+    -- the speech -- it's the primary diagnostic for "why did the
+    -- GPS tell me to walk Xh" debugging sessions.
     local movementClock = nil
     if lastGuidancePosition then
         local moveDist = DistanceXZ(
@@ -3166,21 +3716,41 @@ local function SpeakTrackingGuidance(playerPosition)
     local detourInfo = ""
     if guidanceData.state == "approaching_detour" then
         detourInfo = string.format(
-            " detourIn=%.1fm@%dh",
+            " turnIn=%.1fm@%dh",
             guidanceData.distanceToDetour,
             guidanceData.detourBearing)
     elseif guidanceData.state == "on_detour" then
-        detourInfo = " onDetour"
+        if guidanceData.distanceToDetour then
+            detourInfo = string.format(
+                " onDetour turnIn=%.1fm@%dh",
+                guidanceData.distanceToDetour,
+                guidanceData.detourBearing)
+        else
+            detourInfo = " onDetour cleanToEnd"
+        end
+    elseif guidanceData.nextBendDistance then
+        detourInfo = string.format(
+            " nextBendIn=%.1fm",
+            guidanceData.nextBendDistance)
     end
+    local suppressedTag = shouldSpeak and "" or " [suppressed]"
     Log.Info("GPS: " .. guidance .. trend
         .. " state=" .. guidanceData.state
         .. " guide=" .. guidanceData.bearing .. "h" .. moveInfo
         .. detourInfo
-        .. " nodes=" .. #currentPath)
+        .. " nodes=" .. #currentPath
+        .. suppressedTag)
+
+    if not shouldSpeak then return end
 
     local guidanceSpeech = SpeechData.Create()
     guidanceSpeech:AddProperty("Guidance", guidance, "brief")
     Ext.Tolk.Speak(guidanceSpeech:Format(), true)
+
+    lastSpokenState          = guidanceData.state
+    lastSpokenBearing        = guidanceData.bearing
+    lastSpokenDetourBearing  = guidanceData.detourBearing
+    lastSpokenDetourDistance = guidanceData.distanceToDetour
 end
 
 -- ============================================================================
@@ -3351,10 +3921,11 @@ local function ClearGPSState()
     blockedAnnounced = false
     lastHazardAnnouncedLabel = nil
     lastPathLength = 0
-    lastRecomputePosition = nil
     lastLoggedDetourLabel = nil
     lastLoggedPathHazardKey = nil
     hazardClearTickCount = 0
+    ResetDetourHysteresis()
+    ResetGuidanceSpeechDedup()
     pathWasAvailable = false
     noPathAnnounced = false
     noPathTickCount = 0
@@ -3516,10 +4087,11 @@ local function StartTracking(targetEntry)
     blockedAnnounced = false
     lastHazardAnnouncedLabel = nil
     lastPathLength = 0
-    lastRecomputePosition = nil
     lastLoggedDetourLabel = nil
     lastLoggedPathHazardKey = nil
     hazardClearTickCount = 0
+    ResetDetourHysteresis()
+    ResetGuidanceSpeechDedup()
 
     local initialPath, initialThreshold = ComputePath(
         playerEntity, playerPosition, trackingTarget.position)
@@ -3533,13 +4105,10 @@ local function StartTracking(targetEntry)
     local distanceRounded = math.floor(distanceToTarget + 0.5)
 
     if not currentPath then
-        local noPathTrackSpeech = SpeechData.Create()
-        noPathTrackSpeech:AddProperty("Tracking",
-            "Tracking " .. trackingTarget.name, "brief")
-        noPathTrackSpeech:AddProperty("Distance",
-            distanceRounded .. " meters", "brief")
-        noPathTrackSpeech:Add("status", "No path", "brief")
-        Ext.Tolk.Speak(noPathTrackSpeech:Format(), true)
+        SpeechData.Alert(
+            "Tracking " .. trackingTarget.name
+                .. ". " .. distanceRounded .. " meters. No path",
+            "interrupt")
         Log.Info("GPS: Tracking " .. trackingTarget.name
             .. " (" .. distanceRounded .. "m, no path)")
         -- StartTracking owns the initial no-path announcement;
@@ -3550,31 +4119,35 @@ local function StartTracking(targetEntry)
     else
         pathWasAvailable = true
 
-        -- Preview the first leg (and any sharp turn that follows)
-        -- so the player hears the full initial plan before they
-        -- take their first step.  This replaces the old "just
-        -- speak the bearing to a node 2m away" readout, which
-        -- could point at a direction the player could not actually
-        -- move in when the path started with a zigzag around an
-        -- obstacle.
-        local detour = DescribeInitialDetour(
-            playerPosition, currentPath)
-
-        local directionText = ""
-        if detour then
-            if detour.hasDetour then
-                -- "Initial obstacle. 5 o'clock for 3 meters, then
-                -- 3 o'clock."  The "Initial obstacle" prefix tells
-                -- the player why two directions are being given --
-                -- they are being routed around something nearby.
-                directionText = ". Initial obstacle. "
-                    .. detour.leg1Clock .. " o'clock for "
-                    .. detour.leg1Meters .. " meters, then "
-                    .. detour.leg2Clock .. " o'clock"
-            else
-                directionText = ". "
-                    .. detour.leg1Clock .. " o'clock"
+        -- Build the initial guidance phrase with the same
+        -- Waze-style pipeline SpeakTrackingGuidance uses.  This
+        -- gives the player the full actionable plan on track-
+        -- start ("Tracking X. 29 meters. 5 o'clock. In 4 meters,
+        -- turn to 12 o'clock") rather than requiring them to walk
+        -- two meters before hearing any direction at all.  The
+        -- "first classify" bypass in AnalyzePathGuidance means
+        -- the initial state reflects the actual path shape --
+        -- if we're starting on a detour, the player hears
+        -- "Detour" immediately instead of three guidance cycles
+        -- later when persistence catches up.
+        local guidanceData = AnalyzePathGuidance(playerPosition)
+        local guidancePhrase = nil
+        if guidanceData then
+            guidancePhrase = BuildGuidancePhrase(
+                guidanceData, distanceToTarget)
+            if guidanceData.state == "on_detour" then
+                guidancePhrase = "Detour. " .. guidancePhrase
             end
+            -- Record initial state into the speech-dedup locals
+            -- so SpeakTrackingGuidance does not re-announce the
+            -- same phrase on the first post-tracking movement
+            -- tick.  Without this the player would hear the full
+            -- initial phrase twice -- once here, once on the
+            -- first 2m guidance cycle.
+            lastSpokenState          = guidanceData.state
+            lastSpokenBearing        = guidanceData.bearing
+            lastSpokenDetourBearing  = guidanceData.detourBearing
+            lastSpokenDetourDistance = guidanceData.distanceToDetour
         end
 
         -- Warn if the computed path still crosses a hazard
@@ -3600,25 +4173,43 @@ local function StartTracking(targetEntry)
             end
         end
 
-        local trackSpeech = SpeechData.Create()
-        trackSpeech:AddProperty("Tracking",
-            "Tracking " .. trackingTarget.name, "brief")
-        trackSpeech:AddProperty("Distance",
-            distanceRounded .. " meters", "brief")
-        if directionText ~= "" then
-            trackSpeech:AddProperty("Direction", directionText, "brief")
+        -- Tracking-start is an event-driven announcement (user
+        -- pressed A on a target), not a focus change, so the
+        -- plain-text Alert pathway is the right tool.  Going
+        -- through core fields or AddProperty would either
+        -- misuse the semantic field labels (name, title, etc.)
+        -- or prepend "Tracking:" / "Direction:" filler words
+        -- that bury the actionable guidance behind category
+        -- labels.  The same pattern is used by combat events,
+        -- subregion transitions, and log-level changes.
+        local announcement = "Tracking " .. trackingTarget.name
+        if guidancePhrase then
+            announcement = announcement .. ". " .. guidancePhrase
+        else
+            announcement = announcement
+                .. ". " .. distanceRounded .. " meters"
         end
         if hazardText ~= "" then
-            trackSpeech:AddProperty("Hazard", hazardText, "normal")
+            announcement = announcement .. hazardText
         end
-        Ext.Tolk.Speak(trackSpeech:Format(), true)
+        SpeechData.Alert(announcement, "interrupt")
+
+        -- Prime the hazard-warning latch so UpdateTrackingState's
+        -- per-tick "Stop. X meters ahead" announcement does NOT
+        -- fire on the very next tick after StartTracking.  Without
+        -- this the hazard warning interrupts the tracking speech
+        -- mid-sentence and the player never hears the direction.
+        -- The latch clears naturally when the player exits the
+        -- hazard (CheckUpcomingPathHazard returns false for
+        -- GPS_REROUTE_STABILITY_TICKS consecutive ticks).
+        if hazardIndex then
+            lastHazardAnnouncedLabel = hazardLabel
+        end
+
         Log.Info("GPS: Tracking " .. trackingTarget.name
             .. " (" .. distanceRounded .. "m, "
             .. #currentPath .. " nodes"
             .. (hazardIndex and (", hazard=" .. hazardLabel) or "")
-            .. (detour and detour.hasDetour
-                and (", detour=" .. detour.leg1Clock .. "h->" ..
-                    detour.leg2Clock .. "h") or "")
             .. ")")
     end
 
@@ -3996,7 +4587,6 @@ local function OnTick()
     blockedAnnounced = false
     lastHazardAnnouncedLabel = nil
     lastPathLength = 0
-    lastRecomputePosition = nil
     lastLoggedDetourLabel = nil
     lastLoggedPathHazardKey = nil
     hazardClearTickCount = 0
@@ -4295,10 +4885,11 @@ local function ResetState()
     blockedAnnounced = false
     lastHazardAnnouncedLabel = nil
     lastPathLength = 0
-    lastRecomputePosition = nil
     lastLoggedDetourLabel = nil
     lastLoggedPathHazardKey = nil
     hazardClearTickCount = 0
+    ResetDetourHysteresis()
+    ResetGuidanceSpeechDedup()
     pathWasAvailable = false
     noPathAnnounced = false
     noPathTickCount = 0

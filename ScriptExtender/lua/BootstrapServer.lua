@@ -349,8 +349,18 @@ local function IsPartyMember(characterGuid)
     return checkOk and checkResult == true
 end
 
---- Resolve a status ID to a human-readable display name.
---- Falls back to the raw ID if no display name is found.
+--- Resolve a status ID to a human-readable display name.  Returns
+--- nil when the status has no localizable DisplayName, which is the
+--- standard mark of an internal/meta status (INSURFACE, INENCOUNTER,
+--- and similar engine-facing flags) that should not be relayed to
+--- the screen reader.  Callers treat nil as "skip this event."
+---
+--- Also filters placeholder display names that DID resolve but
+--- render as unresolved markers: "%%% EMPTY" (placeholder used by
+--- some engine-internal statuses with a populated-but-stub
+--- DisplayName handle), "h########" (raw LocaString handle that
+--- failed to resolve), "[ForceUpdate]" (unresolved Noesis binding
+--- marker).  These were slipping through the "empty string" gate.
 local function GetStatusDisplayName(statusId)
     local statusOk, statusName = pcall(function()
         local statEntry = Ext.Stats.Get(statusId)
@@ -364,8 +374,17 @@ local function GetStatusDisplayName(statusId)
         end
         return nil
     end)
-    if statusOk and statusName then return statusName end
-    return statusId
+    if not statusOk or not statusName then return nil end
+
+    -- Placeholder-name filter.
+    if string.sub(statusName, 1, 3) == "%%%" then return nil end
+    if string.find(statusName, "ForceUpdate", 1, true) then
+        return nil
+    end
+    -- Raw LocaString handle: starts with 'h' followed by hex.
+    if string.match(statusName, "^h[%x]+$") then return nil end
+
+    return statusName
 end
 
 --- Send a combat event payload to all clients.
@@ -428,12 +447,16 @@ Ext.Osiris.RegisterListener("Died", 1, "after",
         })
     end)
 
--- Status applied (party members only -- server filters).
+-- Status applied (party members only -- server filters).  Drops
+-- statuses whose DisplayName resolution returns nil; those are
+-- internal engine flags (INSURFACE, INENCOUNTER, etc.) that spam
+-- the screen reader without giving the player useful information.
 Ext.Osiris.RegisterListener("StatusApplied", 4, "after",
     function(characterGuid, statusId, causee, storyActionId)
         if not IsPartyMember(characterGuid) then return end
-        local characterName = GetCharacterName(characterGuid)
         local statusDisplayName = GetStatusDisplayName(statusId)
+        if not statusDisplayName then return end
+        local characterName = GetCharacterName(characterGuid)
         RelayCombatEvent({
             event = "StatusApplied",
             characterGuid = tostring(characterGuid),
@@ -444,12 +467,14 @@ Ext.Osiris.RegisterListener("StatusApplied", 4, "after",
         })
     end)
 
--- Status removed (party members only -- server filters).
+-- Status removed (party members only -- server filters).  Same
+-- DisplayName gate as StatusApplied: skip internal engine flags.
 Ext.Osiris.RegisterListener("StatusRemoved", 4, "after",
     function(characterGuid, statusId, causee, storyActionId)
         if not IsPartyMember(characterGuid) then return end
-        local characterName = GetCharacterName(characterGuid)
         local statusDisplayName = GetStatusDisplayName(statusId)
+        if not statusDisplayName then return end
+        local characterName = GetCharacterName(characterGuid)
         RelayCombatEvent({
             event = "StatusRemoved",
             characterGuid = tostring(characterGuid),

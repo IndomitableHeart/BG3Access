@@ -29,6 +29,21 @@ local currentTurnCharacterGuid = nil
 local currentRound = 0
 local pendingRoundAnnouncement = nil
 
+-- Rapid-fire status events (applied/removed on the same character
+-- within this window) are suppressed.  BG3 re-applies surface
+-- statuses on every tick the character remains on the surface, so
+-- walking through water with "Wet" / "Difficult Terrain" produces
+-- dozens of apply/remove cycles per minute.  A 2 second window
+-- swallows the thrash while still announcing genuine status
+-- changes (new buff cast, enemy applies poison, debuff wears off).
+local STATUS_DEDUP_WINDOW_MS = 2000
+-- Key = characterGuid|statusId|kind (applied/removed).  Value =
+-- last announce timestamp in ms from Ext.Utils.MonotonicTime.  The
+-- table grows bounded by party size * active statuses * 2 kinds,
+-- which is well under 100 entries in practice -- no eviction
+-- needed.  Cleared on ResetState.
+local statusLastAnnounceTime = {}
+
 -- ---------------------------------------------------------------------------
 -- Speech helpers
 -- ---------------------------------------------------------------------------
@@ -103,7 +118,29 @@ local function HandleDied(eventData)
     end
 end
 
+--- Return true if this status event should be announced; false if
+--- it duplicates a recent announcement for the same character +
+--- status + kind.  Updates the timestamp on a true return so the
+--- next caller sees a fresh window.
+local function ShouldAnnounceStatusEvent(characterGuid, statusId, kind)
+    local key = tostring(characterGuid)
+        .. "|" .. tostring(statusId)
+        .. "|" .. kind
+    local now = Ext.Utils.MonotonicTime()
+    local lastAnnounced = statusLastAnnounceTime[key]
+    if lastAnnounced
+        and (now - lastAnnounced) < STATUS_DEDUP_WINDOW_MS then
+        return false
+    end
+    statusLastAnnounceTime[key] = now
+    return true
+end
+
 local function HandleStatusApplied(eventData)
+    if not ShouldAnnounceStatusEvent(
+        eventData.characterGuid, eventData.statusId, "applied") then
+        return
+    end
     local characterName = eventData.characterName or "Unknown"
     local statusName = eventData.statusDisplayName
         or eventData.statusId or "unknown status"
@@ -111,6 +148,10 @@ local function HandleStatusApplied(eventData)
 end
 
 local function HandleStatusRemoved(eventData)
+    if not ShouldAnnounceStatusEvent(
+        eventData.characterGuid, eventData.statusId, "removed") then
+        return
+    end
     local characterName = eventData.characterName or "Unknown"
     local statusName = eventData.statusDisplayName
         or eventData.statusId or "unknown status"
@@ -326,6 +367,7 @@ local function ResetState()
     currentTurnCharacterGuid = nil
     currentRound = 0
     pendingRoundAnnouncement = nil
+    statusLastAnnounceTime = {}
 end
 
 --- Query: are we currently in combat?
