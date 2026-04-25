@@ -1296,11 +1296,26 @@ local function CreatePanelHandler(config)
             local tooltipSpeech = tooltipData:Format()
             if not tooltipSpeech or tooltipSpeech == "" then return end
             if tooltipSpeech == handlerState.lastTooltipSpeech then return end
+
+            -- Interrupt vs queue decision:
+            --   First tooltip after focus change -> queue, because
+            --   the item handler already spoke the name and the
+            --   tooltip is supplemental (lastTooltipSpeech is nil
+            --   here because DispatchTooltip resets it on focus /
+            --   selection change).
+            --   Tooltip refreshed in-place while focus stayed put
+            --   (e.g. user pressed A on a Reactions entry and the
+            --   ReactionStatusText flipped) -> interrupt, because
+            --   the new state is the only thing the user is waiting
+            --   to hear and they want immediate confirmation.
+            local previousSpeech = handlerState.lastTooltipSpeech
+            local isStateChange = previousSpeech ~= nil
+                and previousSpeech ~= ""
             handlerState.lastTooltipSpeech = tooltipSpeech
-            Log.Info("TOOLTIP: " .. tooltipSpeech)
-            -- Queue after item speech (interrupt=false).  The handler
-            -- already spoke the item name; tooltip is supplemental.
-            Ext.Tolk.Speak(tooltipSpeech, false)
+            Log.Info("TOOLTIP" .. (isStateChange
+                and " (state change, interrupt)" or "")
+                .. ": " .. tooltipSpeech)
+            Ext.Tolk.Speak(tooltipSpeech, isStateChange)
         end,
         ResetTooltipDedup = function()
             handlerState.lastTooltipSpeech = nil
@@ -1664,8 +1679,26 @@ local ExamineHandler = CreatePanelHandler({
             return speechData
         end
 
-        -- Other Examine types: use default formatter.
-        return nil
+        -- Other Examine types (VMAbility on creature ability cells,
+        -- ls.Character on race / level / HP tooltips, etc.): fall
+        -- through to the shared FromTooltip formatter so we surface
+        -- whatever role-mapped content the tooltip carries instead
+        -- of going silent.  Returning nil here was the bug -- the
+        -- factory's tooltip dispatch (see line ~1268) suppresses
+        -- speech entirely when customTooltipFn returns nil, so all
+        -- non-VMStat / non-VMResistance examine tooltips lost their
+        -- description, modifier, saving-throws content even though
+        -- the C++ side captured it correctly.  spokenRoles cross-off
+        -- prevents double-reading the name/value the item handler
+        -- already spoke.
+        local speechData = SpeechData.FromTooltip(
+            tooltipTexts, handlerState.spokenRoles)
+        if not speechData
+            or (next(speechData.coreFields) == nil
+                and #speechData.properties == 0) then
+            return nil
+        end
+        return speechData
     end,
     onReset = function(handlerState)
         -- Clear cached HP on handler deactivation.  The cache is
@@ -3321,6 +3354,14 @@ local DISCOVERY_ONLY_DC_TYPES = {
 -- runtime; no DC key would match.
 local WIDGET_NAME_HANDLERS = {
     ["JournalCombatLog_c"] = CombatLogHandler,
+    -- PartyLineActive_c: the expanded party panel that opens on LT.
+    -- Shares ls.DCPartyLine with PartyLine_c (HUD portrait row), so
+    -- the DC alone can't disambiguate.  PartyLine_c is in
+    -- DISCOVERY_ONLY_DC_TYPES because it's HUD noise; this name
+    -- override lets PartyLineActive_c bypass that filter and
+    -- activate PartyLineHandler properly when the user opens the
+    -- party panel.
+    ["PartyLineActive_c"]  = PartyLineHandler,
 }
 
 --- IsWorldDCType: returns true if the given DC type belongs to an
@@ -3357,14 +3398,31 @@ local function HandlePanelWidgetAdded(widgetData)
 
     -- Skip discovery-only DC types: these are HUD widgets that fire
     -- on every scan but should only activate when focus enters them.
-    if DISCOVERY_ONLY_DC_TYPES[widgetData.dcType] then return end
+    -- Discovery-only DC types are HUD elements that share a DC with
+    -- a real navigable panel (ls.DCPartyLine: PartyLine_c is the
+    -- always-visible HUD portrait row, while PartyLineActive_c is
+    -- the LT-opened party panel that should activate as a panel
+    -- handler).  Skip the DC filter when the widget x:Name matches
+    -- a known active panel name -- the name disambiguates the two
+    -- cases that the DC type alone cannot.
+    if DISCOVERY_ONLY_DC_TYPES[widgetData.dcType]
+        and not (widgetData.elemName
+            and WIDGET_NAME_HANDLERS[widgetData.elemName]) then
+        return
+    end
 
     -- Resolve handler: DC type first (the common case), then
     -- widget x:Name (for in-game widgets with generic ls.Widget
-    -- DCs that can't be routed by type alone).
-    local newHandler = DC_TYPE_HANDLERS[widgetData.dcType]
-    if not newHandler and widgetData.elemName then
+    -- DCs that can't be routed by type alone, OR for widgets that
+    -- share a DC with a discovery-only HUD element and need the
+    -- name to disambiguate).
+    local newHandler = nil
+    if widgetData.elemName
+        and WIDGET_NAME_HANDLERS[widgetData.elemName] then
         newHandler = WIDGET_NAME_HANDLERS[widgetData.elemName]
+    end
+    if not newHandler then
+        newHandler = DC_TYPE_HANDLERS[widgetData.dcType]
     end
     if not newHandler then return end
 
@@ -3590,7 +3648,33 @@ local function RoutePanelSnapshot(snapshot)
         local removedAddr = snapshot.removedWidgetData.widgetRootId
         if removedAddr and removedAddr ~= "" then
             if removedAddr == activePanelHandlerWidgetAddr then
-                if previousPanelHandler then
+                -- Overlay close: try to restore the previous panel
+                -- handler IF its widget is actually still alive.
+                -- The widget-removed event fires unreliably when a
+                -- panel closes (sibling widget removal can be the
+                -- only signal we see), so previousPanelHandler may
+                -- be pointing at a stale address whose widget
+                -- vanished without us being told.  Verify by
+                -- walking snapshot.widgetAddrs for the address.
+                -- If gone, clear instead of restore -- restoring a
+                -- dead handler causes it to swallow events meant
+                -- for whichever panel actually opens next (e.g.
+                -- examine-close-then-LT routes PartyLine focus
+                -- events through stale CharacterPanel and reads
+                -- "10/10" as if it were a character sheet item).
+                local previousAlive = false
+                if previousPanelHandler
+                    and previousPanelHandlerWidgetAddr
+                    and snapshot.widgetAddrs then
+                    for _, addrStr in ipairs(snapshot.widgetAddrs) do
+                        if addrStr == previousPanelHandlerWidgetAddr then
+                            previousAlive = true
+                            break
+                        end
+                    end
+                end
+
+                if previousPanelHandler and previousAlive then
                     Log.Info("Overlay closed, restoring: "
                         .. previousPanelHandler.name)
                     activePanelHandler.ResetState()
@@ -3600,9 +3684,20 @@ local function RoutePanelSnapshot(snapshot)
                     previousPanelHandler = nil
                     previousPanelHandlerWidgetAddr = nil
                 else
-                    Log.Info("Panel closed, deactivating: "
-                        .. activePanelHandler.name
-                        .. " widget=" .. tostring(activePanelHandlerWidgetAddr))
+                    if previousPanelHandler then
+                        Log.Info("Overlay closed but previous panel "
+                            .. "widget is gone, clearing both: "
+                            .. activePanelHandler.name .. " + "
+                            .. previousPanelHandler.name)
+                        previousPanelHandler.ResetState()
+                        previousPanelHandler = nil
+                        previousPanelHandlerWidgetAddr = nil
+                    else
+                        Log.Info("Panel closed, deactivating: "
+                            .. activePanelHandler.name
+                            .. " widget="
+                            .. tostring(activePanelHandlerWidgetAddr))
+                    end
                     CloseDetailView(true)
                     activePanelHandler.ResetState()
                     activePanelHandler = nil

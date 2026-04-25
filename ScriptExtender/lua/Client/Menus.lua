@@ -1149,6 +1149,21 @@ local function RouteSnapshot(snapshot)
                 end
             end
         end
+        -- Focused element's DC type maps to this handler = focus is
+        -- demonstrably inside the menu's DC scope, so the widget is
+        -- alive regardless of what widgetDCTypes / widgetEvents say.
+        -- Without this check, ticks that have no widgetEvents and an
+        -- empty / stale widgetDCTypes cache (e.g. d-pad nav between
+        -- buttons in the pause menu when the cached widget set is
+        -- temporarily empty) would falsely declare the handler stale
+        -- and route the next focus event to the default fallback.
+        if not widgetStillPresent
+            and snapshot.focusedElement
+            and snapshot.focusedElement.dcType
+            and DC_TYPE_HANDLERS[snapshot.focusedElement.dcType]
+                == activeHandler then
+            widgetStillPresent = true
+        end
         -- Handler's DC type still in widgetDCTypes = widget visible.
         if not widgetStillPresent and snapshot.widgetDCTypes then
             for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
@@ -1201,6 +1216,33 @@ local function RouteSnapshot(snapshot)
             Log.Info("Active handler: " .. activeHandler.name
                 .. " (widget=" .. snapshot.visualTextWidgetName .. ")")
         end
+    end
+
+    -- Fall back to the focused element's DC type if no handler is
+    -- active yet.  Covers the case where a widgetAdded event fired
+    -- earlier (so handler should be PauseMenu / Options / etc.) but
+    -- the staleness check cleared it on a tick where the cache was
+    -- temporarily incoherent.  The focused element's dcType is a
+    -- direct, reliable signal: focus is provably inside that DC's
+    -- widget right now.  Without this check, a stale-clear would
+    -- fall through to the MainMenu default and read pause-menu
+    -- buttons as if they were main-menu items.
+    if not activeHandler
+        and snapshot.focusedElement
+        and snapshot.focusedElement.dcType
+        and DC_TYPE_HANDLERS[snapshot.focusedElement.dcType] then
+        activeHandler = DC_TYPE_HANDLERS[
+            snapshot.focusedElement.dcType]
+        -- We don't know the original widget x:Name (no widget event
+        -- fired on this tick) -- the staleness check uses widget
+        -- name as one of several signals, so leaving it nil just
+        -- means that one signal is unavailable.  The focused-DC
+        -- check (added in the staleness scan above) keeps the
+        -- handler alive without it.
+        activeHandlerWidgetName = nil
+        Log.Info("Active handler (recovered from focused DC): "
+            .. activeHandler.name .. " dc="
+            .. snapshot.focusedElement.dcType)
     end
 
     -- If no handler is active yet (no widgetAdded event has fired),

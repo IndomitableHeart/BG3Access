@@ -679,6 +679,14 @@ local TOOLTIP_ROLE_MAP = {
     -- "Action", "Reaction".  Typically action cost.
     FooterItem         = {field = "property", label = "Cost",
                           tier = "normal"},
+    -- ReactionStatusText: trigger mode shown on the reaction
+    -- tooltip (Reactions tab in character sheet, in-combat
+    -- reaction popup).  Values are user-facing strings: "Will
+    -- not trigger" / "Trigger automatically" / "Ask".  Maps to
+    -- the state core field so the user hears the toggle state
+    -- alongside the reaction's name and description.  Speaks on
+    -- focus arrival AND on tooltip refresh after A/X toggle.
+    ReactionStatusText = {field = "state", tier = "brief"},
     PropertyText       = {field = "property", label = "Property",
                           tier = "normal"},
     SectionDuration    = {field = "property", label = "Duration",

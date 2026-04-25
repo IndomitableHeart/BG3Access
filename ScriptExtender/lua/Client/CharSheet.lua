@@ -1390,6 +1390,14 @@ local TOOLTIP_FORMATTERS = {
     ["gui::VMEquipmentProficiency"] = FormatVMAbilityTooltip,
     ["ls.VMClass"]                 = FormatGenericTooltip,
     ["ls.Character"]               = FormatGenericTooltip,
+    -- VMInterrupt (Reactions tab entries): the focused widget shows
+    -- state via image swaps, not text -- the tri-state mode lives
+    -- in the tooltip's ReactionStatusText (mapped to the state
+    -- core field via TOOLTIP_ROLE_MAP).  FromTooltip's spokenRoles
+    -- cross-off suppresses the duplicate name / description that
+    -- the item read already spoke; only the state (and any new
+    -- info) survives the delta when the user toggles A or X.
+    ["ls.VMInterrupt"]             = FormatGenericTooltip,
 }
 
 -- ============================================================================
@@ -1575,6 +1583,23 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                     return proficiencySpeech, nil, nil
                 end
                 return "", nil, nil
+            end
+
+            -- Reactions tab entries (Opportunity Attack, Sneak Attack,
+            -- Hellish Rebuke, etc.) -- VMInterrupt focused elements.
+            -- State (Will not trigger / Trigger automatically / Ask)
+            -- lives in the tooltip's ReactionStatusText, NOT in the
+            -- focused widget itself: per Reactions_c.xaml the entry
+            -- shows state via image swaps (IconReactionOn / Off /
+            -- Ask), and there is no state TextBlock inside the
+            -- ContentControl::FocusableContent subtree.  So a
+            -- customItemFn read from focused-element data alone
+            -- can't surface state.  The proper hook is the tooltip
+            -- pipeline -- see customTooltipFn below.  Fall through
+            -- here so the default item read still produces name +
+            -- description; tooltip handler enriches with state.
+            if dcType == "ls.VMInterrupt" then
+                return nil
             end
 
             -- Expander buttons: section headers.
