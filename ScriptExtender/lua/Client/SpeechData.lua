@@ -161,6 +161,32 @@ local function NormalizeForCompare(text)
     return text:lower():gsub("[%s%-%.]+", "")
 end
 
+--- Detect binary garbage that sometimes leaks through Noesis reads
+--- of stale / freed elements (C++ SEH catches the crash but not the
+--- bogus return value -- we see "dead object in ToString" logs
+--- followed by random memory interpreted as a string).  Speaking
+--- that garbage is both useless and irritating.
+---
+--- Check: any control character below 0x20 that ISN'T whitespace
+--- (tab 0x09, LF 0x0A, CR 0x0D) indicates non-text content.
+--- Legitimate game strings -- even fully localized with accents,
+--- CJK, etc. -- never carry these bytes.  High-bit bytes alone are
+--- NOT a garbage signal (UTF-8 uses them for non-ASCII text).
+local function LooksLikeBinaryGarbage(text)
+    if type(text) ~= "string" or text == "" then return false end
+    for i = 1, #text do
+        local byte = string.byte(text, i)
+        if byte < 0x20
+            and byte ~= 0x09   -- tab
+            and byte ~= 0x0A   -- LF
+            and byte ~= 0x0D   -- CR
+        then
+            return true
+        end
+    end
+    return false
+end
+
 -- ============================================================================
 -- SpeechData instance methods (attached to each created object)
 -- ============================================================================
@@ -175,6 +201,14 @@ local Create
 --- @param tier string|nil  "brief", "normal", or "verbose" (default "normal").
 local function Add(self, fieldName, fieldValue, tier)
     if not fieldValue or fieldValue == "" then return end
+    if LooksLikeBinaryGarbage(fieldValue) then
+        if Log then
+            Log.Warn("SpeechData: dropped binary garbage from field '"
+                .. tostring(fieldName)
+                .. "' (likely stale Noesis read)")
+        end
+        return
+    end
     if not CORE_FIELD_SET[fieldName] then
         if Log then
             Log.Warn("SpeechData: unknown core field '"
@@ -194,6 +228,14 @@ end
 --- @param tier string|nil  "brief", "normal", or "verbose" (default "normal").
 local function AddProperty(self, label, propertyValue, tier)
     if not propertyValue or propertyValue == "" then return end
+    if LooksLikeBinaryGarbage(propertyValue) then
+        if Log then
+            Log.Warn("SpeechData: dropped binary garbage from property '"
+                .. tostring(label)
+                .. "' (likely stale Noesis read)")
+        end
+        return
+    end
     self.properties[#self.properties + 1] = {
         label = label,
         value = propertyValue,
@@ -406,7 +448,17 @@ local function Format(self, verbosity)
                 local prop = sortedEntry.prop
                 local propRank = TIER_RANK[prop.tier] or 2
                 if propRank <= maxRank then
-                    local propText = prop.label .. ": " .. prop.value
+                    -- Empty/nil label = render just the value as a
+                    -- standalone phrase.  Used for self-explanatory
+                    -- context text that doesn't need a field prefix
+                    -- (e.g. "Target is too close" for disadvantage
+                    -- reasons -- the phrase IS the explanation).
+                    local propText
+                    if prop.label and prop.label ~= "" then
+                        propText = prop.label .. ": " .. prop.value
+                    else
+                        propText = prop.value
+                    end
                     propText = propText:gsub("[%.%s]+$", "")
                     if propText ~= "" then
                         parts[#parts + 1] = propText
@@ -501,6 +553,13 @@ SpeechDataModule.Create = Create
 --- @param priority string  "interrupt" or "queue".
 function SpeechDataModule.Alert(text, priority)
     if not text or text == "" then return end
+    if LooksLikeBinaryGarbage(text) then
+        if Log then
+            Log.Warn("SpeechData.Alert: dropped binary garbage"
+                .. " (likely stale Noesis read)")
+        end
+        return
+    end
     local interrupt = (priority == "interrupt")
     Log.Info("ALERT"
         .. (interrupt and "" or " (queue)")
@@ -635,6 +694,61 @@ local TOOLTIP_ROLE_MAP = {
                           transform = function(text)
                               return (text:gsub("^Lv%s+", ""))
                           end},
+
+    -- HealthText: HP values in character tooltips (SelectionFlyOut
+    -- search menu, character-under-cursor hover, etc.).  XAML
+    -- renders the value as "N/M"; transform to natural-language
+    -- "N of M" so TTS doesn't speak the slash character.
+    HealthText         = {field = "property", label = "HP",
+                          tier = "brief",
+                          transform = function(text)
+                              return (text:gsub(
+                                  "(%d+)%s*/%s*(%d+)", "%1 of %2"))
+                          end},
+
+    -- MovementText: remaining movement for the character.  XAML
+    -- renders "N /Mm" (note the space before the slash and the
+    -- trailing unit letter); transform to "N of M metres".
+    MovementText       = {field = "property", label = "Movement",
+                          tier = "brief",
+                          transform = function(text)
+                              return (text:gsub(
+                                  "(%d+)%s*/%s*(%d+)m",
+                                  "%1 of %2 metres"))
+                          end},
+
+    -- Texts: status / condition badges on a character tooltip
+    -- (e.g. "Dead", "Unconscious", "Burning", "Poisoned").  XAML
+    -- x:Name is pluralized because this renders an ItemsControl
+    -- of conditions, not a single TextBlock.  "Status" as the
+    -- spoken label fits both single and multiple values.
+    Texts              = {field = "property", label = "Status",
+                          tier = "normal"},
+
+    -- Alchemy ingredient / product tooltip block.  XAML uses
+    -- AlchemyTitle (the alchemy category), AlchemyResultName
+    -- (the item produced), AlchemyResultType (the category of
+    -- the produced item).  All three appear when hovering an
+    -- alchemy ingredient in the search flyout or inventory.
+    AlchemyTitle       = {field = "property", label = "Category",
+                          tier = "brief"},
+    AlchemyResultName  = {field = "property", label = "Result",
+                          tier = "normal"},
+    AlchemyResultType  = {field = "property", label = "Result type",
+                          tier = "normal"},
+
+    -- PassiveInfo: the passive / ingredient description block on
+    -- an item (e.g. "Alchemical Ingredient: Combine 3 of these to
+    -- calcinate them into Ashes").  The game's own text embeds an
+    -- inline prefix ("Alchemical Ingredient: ...") that serves as
+    -- the visible label for sighted players -- there is no
+    -- external "Passive:" / "Info:" label on screen.  Mapping to
+    -- additionalDescription keeps that parity: no added label,
+    -- and it doesn't collide with the flavor description slot
+    -- that the item-focus speech already claims (so cross-off
+    -- doesn't suppress it).
+    PassiveInfo        = {field = "additionalDescription",
+                          tier = "normal"},
     -- Note: "txt" is deliberately NOT in this map.  It's a generic
     -- XAML x:Name reused across many templates (CC spell tooltips
     -- show "Evocation Cantrip" under it, party-line tooltips show

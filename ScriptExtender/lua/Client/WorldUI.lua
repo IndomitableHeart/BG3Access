@@ -1355,6 +1355,170 @@ local ExamineHandler = CreatePanelHandler({
     customItemFn = function(focusedElement, handlerState, snapshot)
         local dcType = focusedElement.dcType or ""
 
+        -- ls.VMAbility: ability-score and saving-throw cells on a
+        -- creature's Examine panel both use VMAbility as their
+        -- DataContext.  The button's bound Content is the bare
+        -- numeric value ("6", "-2"), so the default pipeline
+        -- speaks just that -- no label -- and the player has no
+        -- idea which stat they landed on.  IDString holds the
+        -- ability abbreviation ("STR", "DEX", etc.); combine it
+        -- with the rendered elemText so focus produces e.g.
+        -- "STR: 6" (score) or "STR: -2" (saving throw).
+        if dcType:find("VMAbility") then
+            local dcProps = focusedElement.dcProps
+            local abilityName = dcProps and dcProps.IDString
+            local valueText = focusedElement.elemText or ""
+            if abilityName and tostring(abilityName) ~= ""
+                and valueText ~= "" then
+                -- AddProperty formats as "<label>: <value>" so the
+                -- formatter prints "Strength: 6" or "Strength: -2".
+                local speechData = SpeechData.Create()
+                speechData:AddProperty(tostring(abilityName),
+                    valueText, "brief")
+                return speechData
+            end
+        end
+
+        -- ls.Character decorations: creature-Examine XAML has
+        -- several TextBlocks whose DataContext is the creature
+        -- itself (dcType = ls.Character) but whose rendered text is
+        -- distinctive -- the race banner ("Aberration"), the
+        -- level/type line ("Level 1 Aberration"), section headers
+        -- ("Saving Throw Proficiencies"), etc.  The default
+        -- pipeline reads DC.Name for those, so every focus spoke
+        -- "Intellect Devourer" repeatedly and drowned out the
+        -- useful text.
+        --
+        -- Three sub-cases in priority order:
+        --   1. Non-empty elemText that differs from the creature
+        --      name -> speak elemText (race banner, level line,
+        --      section headers).
+        --   2. empty elemText + elemName == "SizeStat" -> emit
+        --      "Size: <ObjectSize>" from dcProps.
+        --   3. empty elemText + elemName == "PortraitHP" -> read
+        --      the subtree's rendered TextBlocks to extract the
+        --      HP numerals (HealthText + HealthMaxText), format as
+        --      "HP N of M".
+        -- Anything else (anonymous empty-text Character elements)
+        -- falls through to the default pipeline so behavior for
+        -- unexpected cases is unchanged.
+        if dcType == "ls.Character" or dcType == "gui::Character" then
+            local elemText = focusedElement.elemText or ""
+            local elemName = focusedElement.elemName or ""
+            local dcProps = focusedElement.dcProps
+            local creatureName = ""
+            if dcProps then
+                creatureName = tostring(dcProps.Name or "")
+            end
+
+            -- PortraitHP focus (initial Examine entry lands here):
+            -- read HP, cache for later reuse on creature-name focus,
+            -- speak "<name>. HP N of M" so the user hears both the
+            -- subject and the vital stat on entry.
+            if elemName == "PortraitHP" then
+                local readOk, textBlocks = pcall(
+                    Ext.UI.ReadFocusedTextBlocks)
+                if readOk and textBlocks and #textBlocks > 0 then
+                    -- HealthText is rendered as a bare number ("10")
+                    -- and HealthMaxText is prefixed with a slash
+                    -- ("/15").  Match the strict "N/M" pattern; if
+                    -- we can't confirm it's HP text, fall through
+                    -- rather than risk speaking unrelated text as
+                    -- if it were HP.
+                    local combined = table.concat(textBlocks)
+                    local currentHp, maxHp = combined:match(
+                        "^(%d+)%s*/%s*(%d+)$")
+                    if currentHp and maxHp then
+                        local hpValue = currentHp .. " of " .. maxHp
+                        -- Cache on handlerState so the creature-name
+                        -- focus (below) can reuse it without having
+                        -- to re-read a TextBlock that isn't in its
+                        -- own subtree.  Keyed on (creatureName,
+                        -- widgetRootId) together: creature name
+                        -- alone isn't unique for generic enemies
+                        -- (two goblins in a row with different
+                        -- HPs would collide), but widgetRootId
+                        -- changes on every new Examine widget so
+                        -- it's a clean per-session identity.  The
+                        -- handlerState.ResetNavigation path that
+                        -- runs on widget-root change doesn't hook
+                        -- our cache, but the ID check makes that
+                        -- reset implicit -- a new widget can't
+                        -- match the old widget's cached ID.
+                        handlerState.examineCachedHpName = creatureName
+                        handlerState.examineCachedHpWidget =
+                            focusedElement.widgetRootId
+                        handlerState.examineCachedHpValue = hpValue
+                        local speechData = SpeechData.Create()
+                        if creatureName and creatureName ~= "" then
+                            speechData:Add("name", creatureName, "brief")
+                        end
+                        speechData:AddProperty("HP", hpValue, "brief")
+                        return speechData
+                    end
+                end
+            end
+
+            -- Creature-name element (the big ContentControl whose
+            -- bound text IS the creature's name): speak name + HP
+            -- together so when the player navigates back to this
+            -- element they get the same "identity + vital stat"
+            -- pair they heard on entry.  Without the HP repetition,
+            -- a d-pad-up after d-pad-down only said "Intellect
+            -- Devourer" and the user lost the HP context.
+            if elemText ~= "" and elemText == creatureName then
+                local speechData = SpeechData.Create()
+                speechData:Add("name", creatureName, "brief")
+                -- Reuse the cached HP if it's for this creature AND
+                -- came from THIS widget's PortraitHP focus.  The
+                -- widgetRootId check catches the "two generic
+                -- enemies with the same display name" case: a
+                -- second goblin in a new Examine widget won't
+                -- match the previous widget's cached ID, so we
+                -- correctly skip the stale HP.
+                if handlerState.examineCachedHpName == creatureName
+                    and handlerState.examineCachedHpWidget
+                        == focusedElement.widgetRootId
+                    and handlerState.examineCachedHpValue
+                    and handlerState.examineCachedHpValue ~= "" then
+                    speechData:AddProperty("HP",
+                        handlerState.examineCachedHpValue, "brief")
+                end
+                return speechData
+            end
+
+            if elemText ~= "" and elemText ~= creatureName then
+                -- RaceTypeInfo shows the creature's D&D type /
+                -- race category alone ("Aberration", "Humanoid
+                -- (Human)", "Beast", etc.) with no visible label
+                -- in the XAML -- sighted players read the type
+                -- from positional context under the portrait.
+                -- For TTS it needs a "Type" label so the word
+                -- isn't decontextualized.  AddProperty handles the
+                -- label-colon formatting so we don't hand-concat.
+                if elemName == "RaceTypeInfo" then
+                    local speechData = SpeechData.Create()
+                    speechData:AddProperty("Type", elemText, "brief")
+                    return speechData
+                end
+                -- NPCRaceInfo already includes the level prefix
+                -- ("Level 1 Aberration") and section headers like
+                -- ProficienciesTitle are self-describing; speak
+                -- their elemText as-is.
+                return elemText
+            end
+
+            if elemName == "SizeStat" and dcProps then
+                local size = dcProps.ObjectSize
+                if size ~= nil and tostring(size) ~= "" then
+                    local speechData = SpeechData.Create()
+                    speechData:AddProperty(
+                        "Size", tostring(size), "brief")
+                    return speechData
+                end
+            end
+        end
+
         -- VMRangeStat / VMStat: read label + value from rendered
         -- TextBlocks, same approach as CharSheet.FormatStatFromTextBlocks.
         if dcType:find("VMRangeStat") or dcType:find("VMStat") then
@@ -1445,6 +1609,39 @@ local ExamineHandler = CreatePanelHandler({
             -- in an unnamed TextBlock (no x:Name).
             SpeechData.PromoteEmptyRoleDescription(
                 speechData, tooltipTexts, 30)
+
+            -- Stat tooltips carry a "ShortText" TextBlock that
+            -- concatenates the stat name with the help text, like
+            -- "Initiative. Initiative determines who acts first in
+            -- combat...".  FromTooltip falls back to exposing
+            -- unmapped roles as properties, so this lands as
+            -- "ShortText: Initiative. Initiative determines..."
+            -- with the role name audibly prepended, which the user
+            -- doesn't want.  Promote it to description, strip the
+            -- redundant leading stat-name sentence.  When the
+            -- ShortText is just a label word with no body (e.g.
+            -- "Weight" tooltips), drop it -- the stat label was
+            -- already spoken by the handler's customItemFn.
+            for index, prop in ipairs(speechData.properties) do
+                if prop.label == "ShortText" then
+                    local text = tostring(prop.value or "")
+                    local sentenceEnd = text:find("%.%s")
+                    if sentenceEnd then
+                        -- Keep text after the first "<name>. " chunk.
+                        local body = text:sub(sentenceEnd + 2)
+                        if body ~= ""
+                            and not speechData:HasField("description") then
+                            speechData:Add(
+                                "description", body, "verbose")
+                        end
+                    end
+                    -- Either way, drop the ShortText property so
+                    -- the "ShortText:" label doesn't get spoken.
+                    table.remove(speechData.properties, index)
+                    break
+                end
+            end
+
             if next(speechData.coreFields) == nil
                 and #speechData.properties == 0 then return nil end
             return speechData
@@ -1469,6 +1666,16 @@ local ExamineHandler = CreatePanelHandler({
 
         -- Other Examine types: use default formatter.
         return nil
+    end,
+    onReset = function(handlerState)
+        -- Clear cached HP on handler deactivation.  The cache is
+        -- additionally gated by widgetRootId match at read time so
+        -- re-examines within the same handler auto-invalidate when
+        -- the widget rebuilds; this reset handles the game-state
+        -- change / handler-swap path.
+        handlerState.examineCachedHpName = nil
+        handlerState.examineCachedHpWidget = nil
+        handlerState.examineCachedHpValue = nil
     end,
 })
 
@@ -1513,6 +1720,66 @@ local ContainerHandler = CreatePanelHandler({
 -- change (RollState transitions).  We track lastRollState to detect
 -- transitions and speak entry, re-roll, and result announcements.
 -- customItemFn handles bonus item navigation (VMBoost, VMAdvantage).
+--
+-- Pre-commit dice announcement (blind-player informed-reroll feature):
+--
+-- Previous attempt used a 200ms timer polling FindNameInWidget
+-- "ResultHolder" + ReadElementStructuredTextBlocks.  That failed
+-- every time because DiceAnimation.xaml ResultCountTemplateStyle
+-- sets Visibility=Hidden by default and only becomes Visible during
+-- the narrow RevealResultAnimation window -- 30 ticks of 0 entries.
+-- Even when visible, the Dice ContentControl Content binds to
+-- {Binding ResultNumber} / Tag to {Binding FinalResult} (see
+-- DiceAnimation.xaml:1211), which are DC properties, NOT
+-- tree-extractable text.
+--
+-- Real fix: onWidgetAdded is INPC-driven.  When RollState transitions
+-- (WaitForStart -> StartRoll -> StopRoll -> WaitForReRoll / ResultReady),
+-- the widget DC INPC fires and we get fresh dcProps.  The roll values
+-- (NaturalRoll, FinalResult, ResultNumber, etc.) are on dcProps.
+--
+-- This diagnostic block dumps every candidate DC field at each
+-- RollState transition so we can see which field carries the natural
+-- d20 face and at which state it's populated.  Remove the dump and
+-- wire the right field once the log confirms the answer.
+local function DumpActiveRollDcProps(dcProps, rollState)
+    if not dcProps then
+        Log.Info("ACTIVE ROLL DC dump [" .. tostring(rollState)
+            .. "]: dcProps is nil")
+        return
+    end
+    local candidateFields = {
+        "FinalResult", "NaturalRoll", "ResultNumber",
+        "RolledNumber", "DiceResult", "Result",
+        "RollTotal", "Natural",
+    }
+    for _, fieldName in ipairs(candidateFields) do
+        local fieldValue = dcProps[fieldName]
+        if fieldValue ~= nil then
+            Log.Info("ACTIVE ROLL DC dump [" .. tostring(rollState)
+                .. "]: " .. fieldName
+                .. "=" .. tostring(fieldValue))
+        end
+    end
+    -- Also inspect Roll sub-table if present.
+    local rollSub = dcProps.Roll
+    if rollSub and type(rollSub) == "table" then
+        local subFields = {
+            "RolledNumber", "NaturalRoll", "ResultNumber",
+            "FinalResult", "DifficultyCheck",
+        }
+        for _, fieldName in ipairs(subFields) do
+            local fieldValue = rollSub[fieldName]
+            if fieldValue ~= nil then
+                Log.Info("ACTIVE ROLL DC dump ["
+                    .. tostring(rollState) .. "]: Roll."
+                    .. fieldName .. "="
+                    .. tostring(fieldValue))
+            end
+        end
+    end
+end
+
 local ActiveRollHandler = CreatePanelHandler({
     name = "ActiveRoll",
     hint = false,
@@ -1525,6 +1792,16 @@ local ActiveRollHandler = CreatePanelHandler({
         if not rollState or rollState == "" then return end
 
         local previousState = handlerState.lastRollState
+
+        -- Diagnostic: log EVERY RollState transition (even duplicates
+        -- that the guard below would skip) so we can see the full
+        -- state-machine timeline the widget INPC actually delivers.
+        -- This tells us whether StartRoll / StopRoll / WaitForReRoll
+        -- fire as distinct INPC events before the player commits.
+        Log.Info("ACTIVE ROLL transition: prev="
+            .. tostring(previousState) .. " -> new="
+            .. tostring(rollState))
+        DumpActiveRollDcProps(dcProps, rollState)
 
         -- Suppress duplicate announcements for the same state.
         -- NOTE: lastRollState is committed AFTER successful speech,
@@ -1604,12 +1881,63 @@ local ActiveRollHandler = CreatePanelHandler({
                 speechData:Speak(handlerState, true)
             end
 
-        -- Re-roll available (Inspiration point or Lucky feat).
+            -- Pre-commit dice announcement (hearing the natural d20
+            -- BEFORE reroll choice) is handled by dedicated branches
+            -- below when the state machine transitions through
+            -- StartRoll / StopRoll / WaitForReRoll.  The removed
+            -- 200ms visual-tree poll couldn't work because
+            -- ResultCountTemplateStyle is Visibility=Hidden until
+            -- the narrow RevealResultAnimation window and the dice
+            -- number is bound to DC props not extractable TextBlocks.
+
+        -- Re-roll available (Inspiration point, Lucky feat, Bardic
+        -- Inspiration, Portent die, etc.).  The player sees the
+        -- dice face on screen and can choose to reroll before
+        -- committing.  For that decision to be informed, they
+        -- need to hear the current result BEFORE the reroll
+        -- prompt -- otherwise they'd either always reroll (wasting
+        -- resources on passes) or never reroll (locking in failures).
+        --
+        -- FinalResult may be populated at this state since the
+        -- game has computed the roll and is waiting on the player's
+        -- keep-or-reroll input.  Read it and speak the breakdown
+        -- alongside the reroll prompt.  If FinalResult is still 0
+        -- (game hasn't populated it yet), speak just the reroll
+        -- prompt -- the server RollFinished relay will fill in the
+        -- result when commit eventually fires.
         elseif rollState == "WaitForReRoll" then
             handlerState.lastRollState = rollState
+            local finalResult = dcProps.FinalResult
+            local success = dcProps.Success
             local speechData = SpeechData.Create()
+
+            if finalResult and finalResult ~= ""
+                and finalResult ~= "0" then
+                speechData:AddProperty(
+                    "Dice", "Rolled " .. finalResult, "brief")
+                local resultNumber = tonumber(finalResult) or 0
+                if success == "On" then
+                    if resultNumber == 20 then
+                        speechData:AddProperty("Outcome",
+                            "Critical Success!", "brief")
+                    else
+                        speechData:AddProperty(
+                            "Outcome", "Success.", "brief")
+                    end
+                else
+                    if resultNumber == 1 then
+                        speechData:AddProperty("Outcome",
+                            "Critical Failure!", "brief")
+                    else
+                        speechData:AddProperty(
+                            "Outcome", "Failure.", "brief")
+                    end
+                end
+            end
+
             speechData:Add("instructionHint",
-                "Re-roll available. Y to re-roll.", "brief")
+                "Re-roll available. Y to re-roll, A to accept.",
+                "brief")
             local formatted = speechData:Format()
             if formatted then
                 Log.Info("ACTIVE ROLL re-roll: " .. formatted)
@@ -1627,15 +1955,27 @@ local ActiveRollHandler = CreatePanelHandler({
         -- If FinalResult isn't available yet, don't commit state
         -- so the next INPC retry can pick it up with complete data.
         elseif rollState == "ResultReady" then
+            -- Commit fired.  The server-side RollFinished relay speaks
+            -- the full breakdown (natural roll + modifier + total).
             local finalResult = dcProps.FinalResult
             local success = dcProps.Success
             local skipped = dcProps.SkippedRoll
 
-            -- Defer if FinalResult isn't populated yet.
+            -- ResultReady only fires after the player presses A to
+            -- commit the roll; BG3 keeps the widget in the earlier
+            -- animation/reveal state during the dice resolve so the
+            -- player can still Inspiration- or Lucky-reroll.  By the
+            -- time we reach this branch, FinalResult is populated --
+            -- so the old "defer and retry" path never actually fired
+            -- (ResultReady never entered pre-commit).  No retry
+            -- needed.  If FinalResult is somehow still 0, log and
+            -- bail -- the server-side RollFinished relay will speak
+            -- the number regardless.
             if not finalResult or finalResult == ""
                 or finalResult == "0" then
                 Log.Debug("ACTIVE ROLL ResultReady: FinalResult="
-                    .. tostring(finalResult) .. ", deferring")
+                    .. tostring(finalResult)
+                    .. " (server relay will speak)")
                 return
             end
 
@@ -2091,6 +2431,59 @@ local JournalQuestsHandler = CreatePanelHandler({
 local JournalDialoguesHandler = CreatePanelHandler({
     name = "JournalDialogues",
     hint = false,
+})
+
+-- Full-screen Combat Log overlay (JournalCombatLog_c.xaml).
+-- Reachable from the RT shortcuts radial via the "Combat Log" entry.
+--
+-- Confirmed runtime DC: ls.Widget (generic, not a specialized DC
+-- like the other journal panels).  Widget x:Name is
+-- JournalCombatLog_c.  Because the DC isn't specialized, this
+-- handler is routed by widget name via WIDGET_NAME_HANDLERS below
+-- -- the same mechanism Menus.lua uses for shortcutsMenu sharing
+-- gui::DCGameMenu with PauseMenu.
+--
+-- Structure: ListBox x:Name="Log" with ItemsSource bound to
+-- Data.CombatLog.EntryGroupsReversed.  Each entry's content is
+-- rendered via CtxTransString with parameter substitution
+-- (player names, damage values, status names).
+-- GetProperty("Text") returns nil for these bound strings, so we
+-- read each focused ListBoxItem's TextBlock subtree via
+-- Ext.UI.ReadFocusedTextBlocks -- the same fallback
+-- JournalQuestsHandler uses for category / quest titles.
+local CombatLogHandler = CreatePanelHandler({
+    name = "CombatLog",
+    hint = "Up and down to browse entries."
+        .. " Right stick click for details. B to close.",
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local elemId = focusedElement.elemId or ""
+        -- Skip the ListBox container itself; only speak each
+        -- focused entry (ListBoxItem::N).
+        if not elemId:find("^ListBoxItem::") then
+            return nil
+        end
+
+        local readOk, entryTexts = pcall(
+            Ext.UI.ReadFocusedTextBlocks)
+        if not readOk or not entryTexts or #entryTexts == 0 then
+            return ""
+        end
+
+        -- Stitch all TextBlocks in the focused entry into one
+        -- phrase.  Most entries are a single line, but multi-Run
+        -- formats appear (e.g. "Intellect Devourer received
+        -- Condition: Dash" where the condition name is a separate
+        -- styled Run).  Strip markup tags from each chunk.
+        local cleanedParts = {}
+        for _, entryText in ipairs(entryTexts) do
+            local cleaned = Helpers.StripMarkupTags(entryText)
+            if cleaned and cleaned ~= "" then
+                cleanedParts[#cleanedParts + 1] = cleaned
+            end
+        end
+        if #cleanedParts == 0 then return "" end
+        return table.concat(cleanedParts, " ")
+    end,
 })
 
 -- Illithid power tree progression.
@@ -2865,6 +3258,7 @@ local ALL_PANEL_HANDLERS = {
     CampHandler,
     JournalQuestsHandler,
     JournalDialoguesHandler,
+    CombatLogHandler,
     TadpoleHandler,
     SelectionFlyOutHandler,
     RewardHandler,
@@ -2916,6 +3310,19 @@ local DISCOVERY_ONLY_DC_TYPES = {
     ["ls.DCPartyLine"]   = true,
 }
 
+-- Widget name overrides: when an in-game widget has a generic
+-- runtime DC (ls.Widget) so DC-type routing alone can't dispatch
+-- it, register it here by its x:Name.  Same mechanism Menus.lua
+-- uses for shortcutsMenu sharing gui::DCGameMenu with PauseMenu --
+-- here it's used because the widget has no specialized DC at all.
+--
+-- Confirmed via debug log "WIDGET EVENT: dcType=ls.Widget
+-- name=JournalCombatLog_c" that Combat Log uses ls.Widget at
+-- runtime; no DC key would match.
+local WIDGET_NAME_HANDLERS = {
+    ["JournalCombatLog_c"] = CombatLogHandler,
+}
+
 --- IsWorldDCType: returns true if the given DC type belongs to an
 --- in-game panel handled by WorldUI.
 --- @param dcType string  The DataContext type from a widget.
@@ -2924,6 +3331,20 @@ local function IsWorldDCType(dcType)
     if not dcType then return false end
     if DISCOVERY_ONLY_DC_TYPES[dcType] then return false end
     return DC_TYPE_HANDLERS[dcType] ~= nil
+end
+
+--- IsWorldWidgetName: returns true if the given widget x:Name
+--- belongs to an in-game panel handled by WorldUI via widget-name
+--- routing (used when the widget has a generic ls.Widget DC).
+--- EventRouter consults this for generic-DC widget events to
+--- decide whether to forward to WorldUI even when routeToWorld is
+--- currently false (e.g. opening Combat Log from the shortcuts
+--- radial while ShortcutsMenuHandler is the active Menus handler).
+--- @param widgetName string  The widget x:Name from a widget event.
+--- @return boolean
+local function IsWorldWidgetName(widgetName)
+    if not widgetName then return false end
+    return WIDGET_NAME_HANDLERS[widgetName] ~= nil
 end
 
 
@@ -2938,7 +3359,13 @@ local function HandlePanelWidgetAdded(widgetData)
     -- on every scan but should only activate when focus enters them.
     if DISCOVERY_ONLY_DC_TYPES[widgetData.dcType] then return end
 
+    -- Resolve handler: DC type first (the common case), then
+    -- widget x:Name (for in-game widgets with generic ls.Widget
+    -- DCs that can't be routed by type alone).
     local newHandler = DC_TYPE_HANDLERS[widgetData.dcType]
+    if not newHandler and widgetData.elemName then
+        newHandler = WIDGET_NAME_HANDLERS[widgetData.elemName]
+    end
     if not newHandler then return end
 
     if newHandler ~= activePanelHandler then
@@ -3255,12 +3682,55 @@ local function TryActivateFromSnapshot(snapshot)
             end
         end
     end
-    -- Fallback: all widget DC types, skip discovery-only (HUD noise).
-    if not panelDCType and snapshot.widgetDCTypes then
-        for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-            if not DISCOVERY_ONLY_DC_TYPES[widgetDCType]
-                and DC_TYPE_HANDLERS[widgetDCType] then
-                panelDCType = widgetDCType
+    -- Fallback: map the focused element's widget root to a known
+    -- panel DC type via widgetAddrs / widgetDCTypes (parallel arrays
+    -- in the snapshot).
+    --
+    -- This replaces the prior "scan widgetDCTypes, pick the first
+    -- known panel type" behaviour which hijacked routing the instant
+    -- the user opened the pause menu after a skill check: PauseMenu
+    -- activated, then the very next focus tick saw DCActiveRoll still
+    -- in widgetDCTypes (C++ widget scan hadn't yet noticed the
+    -- ActiveRoll widget went invisible) and Strategy 4 happily flipped
+    -- routeToWorld back to true, starving the pause menu of everything
+    -- past "Resume".
+    --
+    -- The correct gate is: only activate a panel whose widget the
+    -- user's focus is actually INSIDE.  focusedElement.widgetRootId
+    -- identifies the containing widget; pairing that with widgetAddrs
+    -- / widgetDCTypes gives us that widget's DC type.  If the focus
+    -- moved to a pause-menu button, the widget root is the pause menu
+    -- widget and no world-panel DC type matches -- correct.
+    -- Pair widgetRootId with the parallel widget arrays to find the
+    -- containing widget's DC type AND x:Name.  We track both so a
+    -- generic-DC widget (e.g. JournalCombatLog_c whose runtime DC is
+    -- ls.Widget) can still be routed via WIDGET_NAME_HANDLERS even
+    -- when no widgetAdded event fired this tick.
+    local widgetXName = nil
+    if not panelDCType
+        and snapshot.focusedElement
+        and snapshot.focusedElement.widgetRootId
+        and snapshot.focusedElement.widgetRootId ~= ""
+        and snapshot.widgetDCTypes
+        and snapshot.widgetAddrs then
+        local focusedWidgetRootId =
+            snapshot.focusedElement.widgetRootId
+        for widgetIndex, widgetAddr in ipairs(snapshot.widgetAddrs) do
+            if widgetAddr == focusedWidgetRootId then
+                local widgetDCType = snapshot.widgetDCTypes[widgetIndex]
+                if widgetDCType
+                    and not DISCOVERY_ONLY_DC_TYPES[widgetDCType]
+                    and DC_TYPE_HANDLERS[widgetDCType] then
+                    panelDCType = widgetDCType
+                end
+                -- Capture x:Name in parallel so we can fall back to
+                -- widget-name routing when the DC is generic.  The
+                -- snapshot.widgetNames array lands here from the C++
+                -- side via the same SEH-protected pass that already
+                -- populates widgetDCTypes / widgetAddrs.
+                if snapshot.widgetNames then
+                    widgetXName = snapshot.widgetNames[widgetIndex]
+                end
                 break
             end
         end
@@ -3268,8 +3738,24 @@ local function TryActivateFromSnapshot(snapshot)
     if panelDCType then
         local syntheticWidgetData = {
             dcType = panelDCType,
-            elemName = snapshot.focusedElement
-                and snapshot.focusedElement.widgetRootId or nil,
+            elemName = widgetXName
+                or (snapshot.focusedElement
+                    and snapshot.focusedElement.widgetRootId)
+                or nil,
+        }
+        HandlePanelWidgetAdded(syntheticWidgetData)
+        return activePanelHandler ~= nil
+    end
+    -- Widget-name fallback: when DC is generic (or DC routing didn't
+    -- match a registered handler) but the widget x:Name is in
+    -- WIDGET_NAME_HANDLERS, synthesise a widgetAdded for the
+    -- name-based handler.  This is what activates Combat Log when
+    -- it opens via the shortcuts radial without firing a fresh
+    -- widget event.
+    if widgetXName and WIDGET_NAME_HANDLERS[widgetXName] then
+        local syntheticWidgetData = {
+            dcType = "ls.Widget",
+            elemName = widgetXName,
         }
         HandlePanelWidgetAdded(syntheticWidgetData)
         return activePanelHandler ~= nil
@@ -3320,6 +3806,7 @@ BG3Access.Client.WorldUI = {
     HandleRadialSlot           = HandleRadialSlot,
     -- Panel routing
     IsWorldDCType              = IsWorldDCType,
+    IsWorldWidgetName          = IsWorldWidgetName,
     HandlePanelWidgetAdded     = HandlePanelWidgetAdded,
     HandlePanelWidgetRootChanged = HandlePanelWidgetRootChanged,
     RoutePanelSnapshot         = RoutePanelSnapshot,

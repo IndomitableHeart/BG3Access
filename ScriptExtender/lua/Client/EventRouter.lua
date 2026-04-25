@@ -61,6 +61,12 @@ local snapshotHasUIFocus = false
 -- Suppresses the post-settle widget scan so background widgets like
 -- PartyLine_c don't trigger handler activation on menu close.
 local suppressNextWidgetScan = false
+-- Authoritative game state for RS gating.  Updated on GameStateChanged
+-- and seeded at startup from Ext.Utils.GetGameState.  Used by
+-- IsUIActiveForRS so pre-game states always gate the stick, and in-game
+-- free world always lets it through -- independent of routeToWorld,
+-- which is purely about handler dispatch.
+local currentGameState = "Unknown"
 
 -- ---------------------------------------------------------------------------
 -- HandleTickSnapshot: thin router.
@@ -293,6 +299,20 @@ local function HandleTickSnapshot(snapshot)
                             -- reset WorldUI routing.
                             Menus.HandleWidgetAdded(widgetEvent)
                             menuActivated = true
+                        elseif World and World.IsWorldWidgetName
+                            and World.IsWorldWidgetName(
+                                widgetEvent.elemName) then
+                            -- Known in-game widget with a generic DC
+                            -- (e.g. JournalCombatLog_c whose runtime
+                            -- DC is ls.Widget).  Route to WorldUI by
+                            -- widget x:Name, same way Menus uses
+                            -- widget-name routing for shortcutsMenu.
+                            -- This also flips routeToWorld back to
+                            -- true via the worldActivated branch
+                            -- below, so subsequent generic-DC HUD
+                            -- noise resumes routing through WorldUI.
+                            World.HandlePanelWidgetAdded(widgetEvent)
+                            worldActivated = true
                         else
                             -- Generic/unknown DC type (HUD noise).
                             -- Forward to WorldUI only in world mode
@@ -718,6 +738,7 @@ local initOk, currentState = pcall(function()
 end)
 if initOk and currentState then
     local stateStr = tostring(currentState)
+    currentGameState = stateStr
     suppressSnapshots = LOADING_STATES[stateStr] or false
     if not suppressSnapshots then
         -- Running or Menu state: allow snapshots immediately.
@@ -746,6 +767,8 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     if Nav then Nav.ResetState() end
     local Combat = BG3Access.Client.Combat
     if Combat then Combat.ResetState() end
+    local TargetSelect = BG3Access.Client.TargetSelect
+    if TargetSelect then TargetSelect.ResetState() end
 
     -- Reset RS input state.
     lastRSDirection = RS_DIRECTION_NONE
@@ -760,6 +783,7 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     suppressNextWidgetScan = false
 
     local toState = tostring(e.ToState)
+    currentGameState = toState
     suppressSnapshots = LOADING_STATES[toState] or false
     -- Suppress C++ Tick() entirely during loading to prevent deadlocks.
     -- Noesis tree walks can hang when the loading thread is
@@ -876,13 +900,25 @@ local function GetRSDirection()
 end
 
 --- Find the active handler with BuildDetailList support.
---- Priority: CC > WorldUI > Menus.
+--- Priority: CC > TargetSelect (combat effects view) > WorldUI > Menus.
+---
+--- TargetSelect takes priority over WorldUI/Menus when the user has
+--- a currently-cycled combat target, so RS-Left during target
+--- select opens the effects view (statuses on the targeted
+--- character) rather than, e.g., the hotbar's detail view.
 local function FindActiveDetailHandler()
     if CC.IsInCC and CC.IsInCC() then
         local ccHandler = CC.GetActiveHandler
             and CC.GetActiveHandler()
         if ccHandler and ccHandler.BuildDetailList then
             return ccHandler
+        end
+    end
+    local TargetSelect = BG3Access.Client.TargetSelect
+    if TargetSelect and TargetSelect.GetActiveDetailHandler then
+        local effectsHandler = TargetSelect.GetActiveDetailHandler()
+        if effectsHandler and effectsHandler.BuildDetailList then
+            return effectsHandler
         end
     end
     local World = BG3Access.Client.WorldUI
@@ -902,11 +938,48 @@ local function FindActiveDetailHandler()
 end
 
 --- IsUIActiveForRS: checks whether UI is consuming RS input.
+---
+--- Previously gated on `routeToWorld`, but that flag is about which
+--- handler module (WorldUI vs. Menus) processes snapshots -- NOT
+--- about UI ownership of controller input.  In practice the game
+--- sometimes closes menus by collapsing the widget (no
+--- widgetRemoved event), leaving routeToWorld stuck at false even
+--- after the player is back in free world.  That bricked RS Up /
+--- Left / Right while RS Down kept working because the verbosity
+--- cycle bypasses this gate.
+---
+--- The authoritative signal is `snapshotHasUIFocus`: the tick
+--- monitor reports focused=nil in free world and a real focused
+--- element in every menu/panel/dialog.  Pre-game states (Menu,
+--- LoadMenu) always have a focused main-menu button, so they
+--- naturally gate true without needing a separate check.  CC and
+--- the inspect panel have their own flags that outlive
+--- snapshotHasUIFocus transitions, so those stay explicit.
+---
+--- Pre-game state gate: GameState != Running means we're in the
+--- main menu / load sequence / transitions where stick input
+--- should NEVER trigger GPS / HUD reader / combat turn-order.
+--- We track `currentGameState` via GameStateChanged.
 local function IsUIActiveForRS()
-    if not routeToWorld then return true end
+    if currentGameState ~= "Running" then return true end
     if CC.IsInCC and CC.IsInCC() then return true end
     if inspectWidgetActive then return true end
     return snapshotHasUIFocus
+end
+
+--- Diagnostic: explains WHY IsUIActiveForRS returned true on a given
+--- call.  Called from RS-direction dispatch when a user's stick input
+--- was gated away.  Emitted at Debug level so it doesn't spam normal
+--- logs but is available when the user is trying to diagnose "my
+--- stick doesn't do anything" reports.
+local function DescribeRSGateReason()
+    if currentGameState ~= "Running" then
+        return "gameState=" .. tostring(currentGameState)
+    end
+    if CC.IsInCC and CC.IsInCC() then return "CC active" end
+    if inspectWidgetActive then return "inspect panel active" end
+    if snapshotHasUIFocus then return "UI focused" end
+    return "unknown"
 end
 
 local function HandleRSDirection(direction)
@@ -915,9 +988,13 @@ local function HandleRSDirection(direction)
 
     -- RS Left: detail view toggle or GPS cycle.
     if direction == RS_DIRECTION_LEFT then
+        Log.Info("RS LEFT: fired, looking for detail handler")
         local DetailView = BG3Access.Client.DetailView
         if DetailView then
             local handler = FindActiveDetailHandler()
+            Log.Info("RS LEFT: FindActiveDetailHandler -> "
+                .. (handler and ("handler='"
+                    .. tostring(handler.name or "?") .. "'") or "nil"))
             if handler then
                 -- The detail-view builders rely on the tooltip as
                 -- source of truth for item facts; fetch the cached
@@ -937,7 +1014,28 @@ local function HandleRSDirection(direction)
                 if handled then return end
             end
         end
-        if IsUIActiveForRS() then return end
+        if IsUIActiveForRS() then
+            Log.Info("RS Left gated: " .. DescribeRSGateReason())
+            return
+        end
+        -- In combat, RS-Left is exclusively for the effects view.
+        -- If we got here, no effects handler was available (no
+        -- target cycled, target stale, etc.) -- stay silent rather
+        -- than falling through to GPS, which would announce "GPS
+        -- not available in combat" and be misleading: the user
+        -- pressed RS-Left for effects, not GPS, so "hit d-pad to
+        -- select a target first" is closer to the truth.
+        local Combat = BG3Access.Client.Combat
+        if Combat and Combat.IsInCombat and Combat.IsInCombat() then
+            local hintSpeech = SpeechData.Create()
+            hintSpeech:Add("instructionHint",
+                "Select a target first with d-pad", "brief")
+            local formatted = hintSpeech:Format()
+            if formatted and formatted ~= "" then
+                Ext.Tolk.Speak(formatted, true)
+            end
+            return
+        end
         if Nav.IsEntityListOpen() then return end
         Nav.CycleGPSMode()
         return
@@ -989,7 +1087,11 @@ local function HandleRSDirection(direction)
     end
 
     -- RS Up/Right (non-compare): HUD reader (free world only).
-    if IsUIActiveForRS() then return end
+    if IsUIActiveForRS() then
+        Log.Info("RS " .. tostring(direction)
+            .. " gated: " .. DescribeRSGateReason())
+        return
+    end
 
     if direction == RS_DIRECTION_UP then
         Nav.SpeakCharacterInfo()

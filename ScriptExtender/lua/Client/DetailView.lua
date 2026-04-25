@@ -91,23 +91,34 @@ local function Toggle(handler, tooltipTexts)
         return true
     end
 
-    -- Focus-alive check.
-    local focusCheckOk, focusedElement = pcall(Ext.UI.GetFocusedElement)
-    if not focusCheckOk or not focusedElement then
-        return false
-    end
-
     -- Need a handler with BuildDetailList.
     if not handler or not handler.BuildDetailList then
         return false
     end
 
-    -- Get cached focused element data.
+    -- Get focused data.  Panel / menu handlers use
+    -- GetLastFocusedData which pulls from the last-focused UI
+    -- element cache; the effects-view handler (combat target
+    -- select) pulls from its own module state (lastTargetEntity).
+    -- If GetLastFocusedData returns non-nil, trust it -- the
+    -- handler knows its own data source and has already said
+    -- "yes, I can build a detail list."
     local focusedData = nil
     if handler.GetLastFocusedData then
         focusedData = handler.GetLastFocusedData()
     end
     if not focusedData then
+        -- Fallback: if the handler doesn't provide its own data
+        -- source, fall back to the focused-element sanity check
+        -- so we don't open the view in a dead state.  Previously
+        -- this check was unconditional and blocked the effects
+        -- view entirely (in combat target select, world-cursor
+        -- mode, no UI element is focused).
+        local focusCheckOk, focusedElement =
+            pcall(Ext.UI.GetFocusedElement)
+        if not focusCheckOk or not focusedElement then
+            return false
+        end
         return false
     end
 
@@ -152,10 +163,13 @@ local function Toggle(handler, tooltipTexts)
             end
         end)
 
-    -- Announce entry and speak first item.
+    -- Announce entry and speak first item.  Handlers can override
+    -- the view title via handler.viewLabel so the effects view
+    -- says "Effects view" instead of the generic "Detail view".
     local firstEntry = detailViewList[1]
     local openSpeechData = SpeechData.Create()
-    openSpeechData:Add("title", "Detail view", "brief")
+    local viewTitle = handler.viewLabel or "Detail view"
+    openSpeechData:Add("title", viewTitle, "brief")
     openSpeechData:Add("name", firstEntry.label, "brief")
     openSpeechData:Add("value", firstEntry.value, "brief")
     local openSpeech = openSpeechData:Format()

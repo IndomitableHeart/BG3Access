@@ -823,6 +823,7 @@ local ShortcutsMenuHandler = CreateMenuHandler({
     end,
 })
 
+
 local DifficultyHandler = CreateMenuHandler({
     name = "Difficulty",
     hintFn = function(screenTitle)

@@ -717,6 +717,20 @@ end
 -- All caches build lazily on first access from game APIs.
 -- ---------------------------------------------------------------------------
 
+--- Check whether a "resolved" string is actually a failed-resolve
+--- sentinel that should be rejected.  Two patterns:
+---   * `^h%x` -- raw handle ("h1234abcd5678") leaked through unchanged
+---   * `s_HandleUnknown` substring -- BG3SE's sentinel for "the loca
+---     repository had no entry for this handle"; comes back as
+---     `ls::TranslatedStringRepository::s_HandleUnknown`
+--- Either pattern means we got no real text; callers should skip.
+local function IsFailedResolve(text)
+    if type(text) ~= "string" or text == "" then return true end
+    if text:match("^h%x") then return true end
+    if text:find("s_HandleUnknown", 1, true) then return true end
+    return false
+end
+
 --- ResolveTranslatedString: resolve a TranslatedString from a cached
 --- prototype's DescriptionInfo.  Handles string, userdata, and table formats.
 --- @param translatedString any  String, userdata, or table with Handle.
@@ -726,7 +740,7 @@ local function ResolveTranslatedString(translatedString)
     local stringType = type(translatedString)
     if stringType == "string" and translatedString ~= "" then
         local resolved = GetTranslatedStringIfHandle(translatedString)
-        if resolved and not resolved:match("^h%x") then return resolved end
+        if not IsFailedResolve(resolved) then return resolved end
         return nil
     elseif stringType == "userdata" then
         local handleSuccess, handle = pcall(function()
@@ -736,7 +750,7 @@ local function ResolveTranslatedString(translatedString)
             local handleStr = tostring(handle)
             if handleStr and handleStr ~= "" then
                 local resolved = GetTranslatedStringIfHandle(handleStr)
-                if resolved and not resolved:match("^h%x") then
+                if not IsFailedResolve(resolved) then
                     return resolved
                 end
             end
@@ -745,7 +759,7 @@ local function ResolveTranslatedString(translatedString)
             return translatedString.Value
         end)
         if valueSuccess and type(value) == "string"
-            and value ~= "" and not value:match("^h%x") then
+            and not IsFailedResolve(value) then
             return value
         end
         return nil
@@ -754,13 +768,13 @@ local function ResolveTranslatedString(translatedString)
             and translatedString.Handle.Handle then
             local resolved = GetTranslatedStringIfHandle(
                 translatedString.Handle.Handle)
-            if resolved and not resolved:match("^h%x") then
+            if not IsFailedResolve(resolved) then
                 return resolved
             end
         end
         for _, key in ipairs({"Value", "Name", "Str"}) do
             if type(translatedString[key]) == "string"
-                and translatedString[key] ~= "" then
+                and not IsFailedResolve(translatedString[key]) then
                 return translatedString[key]
             end
         end

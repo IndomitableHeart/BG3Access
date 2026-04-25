@@ -338,6 +338,26 @@ local function GetCharacterName(characterGuid)
     return "Unknown"
 end
 
+--- Read a character entity's current and maximum hit points.
+--- Returns {hp=number, maxHp=number} or nil when unavailable (entity
+--- missing, Health component absent on level-transient objects, or
+--- server-side read faults).  Used to attach defender HP context to
+--- damage / miss announcements so the screen reader can say
+--- "Gale took 7 fire damage.  13 of 60 remaining."
+local function GetCharacterHitpoints(characterGuid)
+    local readOk, hitpoints = pcall(function()
+        local entity = Ext.Entity.Get(characterGuid)
+        if not entity or not entity.Health then return nil end
+        local health = entity.Health
+        local currentHp = tonumber(health.Hp)
+        local maxHp = tonumber(health.MaxHp)
+        if not currentHp or not maxHp then return nil end
+        return { hp = currentHp, maxHp = maxHp }
+    end)
+    if readOk and hitpoints then return hitpoints end
+    return nil
+end
+
 --- Check whether a character GUID belongs to a player party member.
 local function IsPartyMember(characterGuid)
     local checkOk, checkResult = pcall(function()
@@ -495,6 +515,7 @@ Ext.Osiris.RegisterListener("AttackedBy", 7, "after",
 
         local defenderName = GetCharacterName(defender)
         local attackerName = GetCharacterName(attackerOwner)
+        local defenderHp = GetCharacterHitpoints(defender)
         RelayCombatEvent({
             event = "AttackedBy",
             defenderGuid = tostring(defender),
@@ -503,6 +524,32 @@ Ext.Osiris.RegisterListener("AttackedBy", 7, "after",
             attackerName = attackerName,
             damageType = tostring(damageType),
             damageAmount = damageAmount,
+            damageCause = tostring(damageCause or ""),
+            defenderIsParty = defenderIsParty,
+            attackerIsParty = attackerIsParty,
+            defenderHp     = defenderHp and defenderHp.hp or nil,
+            defenderMaxHp  = defenderHp and defenderHp.maxHp or nil,
+        })
+    end)
+
+-- Attack missed (party member attacker or defender).  BG3's AttackedBy
+-- fires only on damaging hits; misses need a dedicated event or the
+-- player never hears "Tav missed the goblin."  MissedBy signature is
+-- (defender, attackerOwner, attacker, storyActionId) -- 4 args.
+Ext.Osiris.RegisterListener("MissedBy", 4, "after",
+    function(defender, attackerOwner, attacker, storyActionId)
+        local defenderIsParty = IsPartyMember(defender)
+        local attackerIsParty = IsPartyMember(attackerOwner)
+        if not defenderIsParty and not attackerIsParty then return end
+
+        local defenderName = GetCharacterName(defender)
+        local attackerName = GetCharacterName(attackerOwner)
+        RelayCombatEvent({
+            event = "MissedBy",
+            defenderGuid = tostring(defender),
+            defenderName = defenderName,
+            attackerGuid = tostring(attackerOwner),
+            attackerName = attackerName,
             defenderIsParty = defenderIsParty,
             attackerIsParty = attackerIsParty,
         })
@@ -510,6 +557,724 @@ Ext.Osiris.RegisterListener("AttackedBy", 7, "after",
 
 _P("BG3Access: Combat event relay registered on '"
     .. COMBAT_CHANNEL .. "'")
+
+-- ---------------------------------------------------------------------------
+-- Roll detail relay.
+--
+-- BG3's Osiris-level combat events (AttackedBy, MissedBy) tell us
+-- outcomes but don't carry the d20 breakdown.  The server-side
+-- RollSystem tracks every finished roll (attack, save, ability /
+-- skill check, initiative, etc.) on a one-frame component called
+-- `ServerRollFinishedEvent`, populated with a `FinishedEvent` struct
+-- that exposes `NaturalRoll`, `DiceAdditionalValue`, `DC`,
+-- `Advantage`, `Disadvantage`, `Roller`, `Subject`, `RollType`,
+-- `Ability`, `Skill`, and `Canceled`.
+--
+-- We subscribe with `Ext.Entity.OnCreateDeferred` for that component
+-- type -- the callback fires any time an entity receives the
+-- component (BG3SE handles the one-frame lifetime transparently).
+-- For each finished event we resolve roller / subject names, filter
+-- to rolls involving a party member (same party-only gate as
+-- AttackedBy), categorize the roll type, and relay to the client.
+-- The client merges attack rolls into subsequent AttackedBy /
+-- MissedBy announcements and speaks save / skill / ability-check
+-- rolls standalone.
+-- ---------------------------------------------------------------------------
+
+--- Resolve an EntityHandle from a roll event to its translated
+--- display name.  Rolls come with EntityHandle fields (not GUID
+--- strings), so we can't use the GetCharacterName path directly.
+--- Returns "Unknown" on any failure -- the relay is best-effort.
+local function GetEntityDisplayName(entityHandle)
+    if entityHandle == nil then return "Unknown" end
+    local resolveOk, resolved = pcall(function()
+        local entity = Ext.Entity.Get(entityHandle)
+        if not entity or not entity.DisplayName then return nil end
+        local nameKey = entity.DisplayName.NameKey
+        if not nameKey or not nameKey.Handle
+            or not nameKey.Handle.Handle then
+            return nil
+        end
+        local translated = Ext.Loca.GetTranslatedString(
+            nameKey.Handle.Handle)
+        if translated and translated ~= "" then return translated end
+        return nil
+    end)
+    if resolveOk and resolved then return resolved end
+    return "Unknown"
+end
+
+--- Check whether an EntityHandle belongs to a party member.  Same
+--- idea as the GUID-based IsPartyMember, but operates on handles.
+local function IsPartyEntity(entityHandle)
+    if entityHandle == nil then return false end
+    local checkOk, result = pcall(function()
+        local entity = Ext.Entity.Get(entityHandle)
+        if not entity then return false end
+        return entity.PartyMember ~= nil
+    end)
+    return checkOk and result == true
+end
+
+--- Resolve a BG3SE enum-typed value to its string name.  Enum
+--- fields on components sometimes come through as the raw numeric
+--- value rather than the named string ("RollType=8" instead of
+--- "RollType=SkillCheck").  This first log from the roll relay
+--- confirmed that: the SkillCheck roll fired with RollType=8.
+--- Tostring on a number gives the digits, so the string-match
+--- classification below never caught it.  Use Ext.Enums to do
+--- the integer -> name translation when needed, and pass strings
+--- through unchanged so future BG3SE builds that expose the names
+--- directly still work.
+local function EnumName(enumName, value)
+    if value == nil then return "" end
+    -- Coerce whatever BG3SE gave us (number, enum userdata, string)
+    -- to a string representation first.
+    local text = tostring(value) or ""
+    if text == "" then return "" end
+    -- Already a non-numeric string (the enum name)?  Pass through.
+    if not text:match("^%d+$") then return text end
+    -- Looks numeric.  Look up via Ext.Enums.  The result could be
+    -- a string OR an enum value (userdata with a __tostring meta)
+    -- depending on BG3SE internals -- force another tostring to
+    -- normalize to a Lua string so callers can :find / == etc.
+    -- without the "Enum values have no property named 'find'"
+    -- crash we hit on the first attempt.
+    local enumTable = Ext.Enums and Ext.Enums[enumName]
+    if enumTable then
+        local resolved = enumTable[tonumber(text)]
+        if resolved ~= nil then
+            local name = tostring(resolved) or ""
+            -- Guard against tostring falling back to digits (which
+            -- would imply no name metatable); keep the original
+            -- numeric text in that case so at least downstream
+            -- string ops don't crash.
+            if name ~= "" and not name:match("^%d+$") then
+                return name
+            end
+        end
+    end
+    return text
+end
+
+--- Classify a RollType enum into the three buckets the client
+--- actually wants to speak about: "attack" (merges with damage /
+--- miss announcements), "save" (standalone), "check" (standalone,
+--- covers ability checks + skill checks), or "skip" (damage rolls,
+--- which AttackedBy already announces, and any other noise).
+local function ClassifyRollType(rollType)
+    local name = EnumName("StatsRollType", rollType)
+    -- Damage-type rolls are redundant with AttackedBy's damage
+    -- amount.  Skip entirely.
+    if name:find("Damage") then return "skip" end
+    -- Attack-type rolls (Attack, MeleeWeaponAttack, etc.).
+    if name:find("Attack") then return "attack" end
+    -- Saving throws.
+    if name == "SavingThrow" or name == "DeathSavingThrow" then
+        return "save"
+    end
+    -- Ability and skill checks (the interactive-ActiveRoll flavour
+    -- plus Osiris-driven checks like Perception).
+    if name == "SkillCheck" or name == "RawAbility" then
+        return "check"
+    end
+    return "skip"
+end
+
+-- Live-path self-dedup.  OnChange("RequestedRoll") empirically fires
+-- TWICE per roll (confirmed via the "spokenRollUuids size=1 sample=
+-- <this roll's own uuid>" diagnostic): once very early with
+-- NaturalRoll populated but Result.Total still zero, and a second
+-- time shortly after with the same state.  Without dedup we'd speak
+-- the preview twice for every roll.  Scoped to the live path only --
+-- the commit path (ServerRollFinishedEvent) gets its own complete
+-- breakdown and MUST NOT be deduped against the live preview, or
+-- the user loses the "plus 7, total 20, skill name, DC" detail that
+-- lives on the commit-time FinishedEvent and that we can't recover
+-- from the pre-commit RequestedRollComponent.
+--
+-- Kept as a simple Lua table keyed by stringified UUID.  Rolls are
+-- consumed at most once per playthrough; unbounded growth is a
+-- non-issue in practice.
+local livePreviewSpokenUuids = {}
+
+--- Normalize a RollUuid-ish field to a string key.  BG3SE sometimes
+--- gives us a string, sometimes a struct with a .Value, sometimes a
+--- userdata that tostring handles.  Any empty / nil result means
+--- "treat as non-dedup-able" -- we speak but don't register.
+local function NormalizeRollUuidKey(rollUuid)
+    if rollUuid == nil then return nil end
+    local text = tostring(rollUuid) or ""
+    if text == "" then return nil end
+    return text
+end
+
+--- Relay a single FinishedEvent struct to the client.  This is the
+--- commit-time path -- fires on A-press and carries the complete
+--- breakdown (NaturalRoll + DiceAdditionalValue + DC + advantage
+--- flags + outcome).  Always speaks; NEVER deduped against the live
+--- path (the live preview only has the natural d20, the commit
+--- carries the rest).
+local function RelayRollEvent(finishedEvent)
+    if finishedEvent.Canceled then
+        _P("BG3Access:   skipped (canceled)")
+        return
+    end
+
+    local rollBucket = ClassifyRollType(finishedEvent.RollType)
+    _P("BG3Access:   classified as bucket=" .. rollBucket)
+    if rollBucket == "skip" then return end
+
+    local rollerIsParty = IsPartyEntity(finishedEvent.Roller)
+    local subjectIsParty = IsPartyEntity(finishedEvent.Subject)
+    _P("BG3Access:   rollerParty=" .. tostring(rollerIsParty)
+        .. " subjectParty=" .. tostring(subjectIsParty))
+    -- Same party-only gate as AttackedBy.  We care when a party
+    -- member rolled or when a non-party roll is targeting a party
+    -- member (enemy attack rolls, enemy-forced saves).
+    if not rollerIsParty and not subjectIsParty then
+        _P("BG3Access:   skipped (neither side is party)")
+        return
+    end
+
+    local naturalRoll = tonumber(finishedEvent.NaturalRoll) or 0
+    -- Skip rolls that never actually produced a d20 result (0).
+    -- Happens on canceled / replaced rolls that slipped past the
+    -- Canceled check above.
+    if naturalRoll == 0 then
+        _P("BG3Access:   skipped (NaturalRoll=0)")
+        return
+    end
+
+    local modifier = tonumber(finishedEvent.DiceAdditionalValue) or 0
+    local dc = tonumber(finishedEvent.DC) or 0
+    -- DC of 0 means "no target DC" (e.g. some ability checks with
+    -- no contested number).  Leave nil so the client can skip the
+    -- "DC N" phrase when it doesn't apply.
+    if dc == 0 then dc = nil end
+
+    _P("BG3Access:   relaying Natural=" .. naturalRoll
+        .. " mod=" .. modifier
+        .. " DC=" .. tostring(dc))
+    RelayCombatEvent({
+        event          = "RollFinished",
+        rollUuid       = NormalizeRollUuidKey(finishedEvent.RollUuid) or "",
+        rollBucket     = rollBucket,
+        -- Resolve enum numbers to names so the client can string-
+        -- match against "DeathSavingThrow" etc. without repeating
+        -- the integer-vs-name dance.
+        rollTypeName   = EnumName("StatsRollType", finishedEvent.RollType),
+        naturalRoll    = naturalRoll,
+        modifier       = modifier,
+        total          = naturalRoll + modifier,
+        dc             = dc,
+        advantage      = finishedEvent.Advantage == true,
+        disadvantage   = finishedEvent.Disadvantage == true,
+        rollerName     = GetEntityDisplayName(finishedEvent.Roller),
+        subjectName    = GetEntityDisplayName(finishedEvent.Subject),
+        rollerIsParty  = rollerIsParty,
+        subjectIsParty = subjectIsParty,
+        abilityName    = EnumName("AbilityId", finishedEvent.Ability),
+        skillName      = EnumName("SkillId", finishedEvent.Skill),
+    })
+end
+
+--- Live pre-commit roll preview relay.
+---
+--- Reads RequestedRollComponent when OnChange fires during roll
+--- resolution.  Empirical behaviour:
+---   * OnChange fires TWICE per roll with essentially the same state
+---     (NaturalRoll populated, Result.Total still 0, Finished=false).
+---   * Self-dedup via livePreviewSpokenUuids prevents double-speech.
+---   * Canceled stays false throughout a normal roll lifecycle.
+---
+--- We send a minimal "RollPreview" event carrying only the natural
+--- d20 + roll type so the client can speak a terse "<roller> rolled
+--- N" announcement.  The subsequent commit-side RollFinished event
+--- carries the complete breakdown (modifier, total, DC, advantage,
+--- skill/ability name, outcome) and fires independently -- no dedup
+--- against the preview.
+---
+--- That split is deliberate.  The live component lacks the modifier
+--- (DiceAdditionalValue only exists on the one-frame FinishedEvent)
+--- and Result.Total isn't populated when OnChange fires, so any
+--- attempt to relay a complete announcement from here reads total=
+--- natural and mod=0 -- misleading for the reroll decision the
+--- feature is meant to support.  Preview-only keeps the announcement
+--- truthful and the commit announcement untouched.
+local function RelayLiveRollComponent(rollComp)
+    if not rollComp then return end
+    if rollComp.Canceled == true then return end
+
+    local naturalRoll = tonumber(rollComp.NaturalRoll) or 0
+    if naturalRoll == 0 then return end
+
+    local uuidKey = NormalizeRollUuidKey(rollComp.RollUuid)
+    if uuidKey and livePreviewSpokenUuids[uuidKey] then return end
+
+    local rollBucket = ClassifyRollType(rollComp.RollType)
+    if rollBucket == "skip" then
+        -- Mark so we also suppress the second OnChange fire for this
+        -- roll (damage rolls, etc. that we intentionally ignore).
+        if uuidKey then livePreviewSpokenUuids[uuidKey] = true end
+        return
+    end
+
+    local rollerIsParty = IsPartyEntity(rollComp.Roller)
+    local subjectIsParty = IsPartyEntity(rollComp.Subject)
+    if not rollerIsParty and not subjectIsParty then
+        if uuidKey then livePreviewSpokenUuids[uuidKey] = true end
+        return
+    end
+
+    _P("BG3Access: LIVE preview relaying"
+        .. " uuid=" .. tostring(uuidKey)
+        .. " bucket=" .. rollBucket
+        .. " Natural=" .. naturalRoll)
+    if uuidKey then livePreviewSpokenUuids[uuidKey] = true end
+    RelayCombatEvent({
+        event          = "RollPreview",
+        rollUuid       = uuidKey or "",
+        rollBucket     = rollBucket,
+        rollTypeName   = EnumName("StatsRollType", rollComp.RollType),
+        naturalRoll    = naturalRoll,
+        rollerName     = GetEntityDisplayName(rollComp.Roller),
+        subjectName    = GetEntityDisplayName(rollComp.Subject),
+        rollerIsParty  = rollerIsParty,
+        subjectIsParty = subjectIsParty,
+    })
+end
+
+--- Subscribe to ServerRollFinishedEvent creation.  Instrumented
+--- heavily: if the subscription fails outright the error surfaces;
+--- if the callback fires we log it unconditionally BEFORE any
+--- filtering, so a silent pipeline (no logs) tells us the issue is
+--- the subscription itself, and a noisy pipeline with no relays
+--- tells us the filters are dropping events.  Remove the per-event
+--- logs once we confirm end-to-end flow.
+local rollSubId = nil
+local rollSubErr = nil
+local subscribeOk, subscribeResult = pcall(
+    Ext.Entity.OnCreateDeferred, "ServerRollFinishedEvent",
+    function(entity, componentType)
+        _P("BG3Access: RollFinished callback fired")
+        local processOk, processErr = pcall(function()
+            local comp = entity.ServerRollFinishedEvent
+            if not comp then
+                _P("BG3Access:   entity.ServerRollFinishedEvent is nil")
+                return
+            end
+            if not comp.Events then
+                _P("BG3Access:   comp.Events is nil")
+                return
+            end
+            _P("BG3Access:   iterating " .. tostring(#comp.Events)
+                .. " events")
+            for i, rollEvent in ipairs(comp.Events) do
+                _P("BG3Access:   event[" .. i .. "] RollType="
+                    .. tostring(rollEvent.RollType)
+                    .. " Natural=" .. tostring(rollEvent.NaturalRoll)
+                    .. " Canceled=" .. tostring(rollEvent.Canceled))
+                RelayRollEvent(rollEvent)
+            end
+        end)
+        if not processOk then
+            _P("BG3Access: RollFinished handler error: "
+                .. tostring(processErr))
+        end
+    end)
+if subscribeOk then
+    rollSubId = subscribeResult
+    _P("BG3Access: Roll detail relay subscription registered, id="
+        .. tostring(rollSubId))
+else
+    rollSubErr = subscribeResult
+    _P("BG3Access: Roll detail relay SUBSCRIPTION FAILED: "
+        .. tostring(rollSubErr))
+end
+
+-- Live pre-commit roll subscription.  OnChange fires when any field
+-- on a RequestedRollComponent mutates -- typically many times per
+-- roll as Roller, Subject, DC, then NaturalRoll / Result / Finished
+-- get populated.  Our dedup + (Finished==true && NaturalRoll!=0)
+-- gate guarantees we only actually relay once per roll.
+local liveRollSubId = nil
+local liveRollSubErr = nil
+local liveSubscribeOk, liveSubscribeResult = pcall(
+    Ext.Entity.OnChange, "RequestedRoll",
+    function(entity, componentType)
+        local processOk, processErr = pcall(function()
+            local rollComp = entity.RequestedRoll
+            if not rollComp then
+                return
+            end
+            RelayLiveRollComponent(rollComp)
+        end)
+        if not processOk then
+            _P("BG3Access: LIVE roll handler error: "
+                .. tostring(processErr))
+        end
+    end)
+if liveSubscribeOk then
+    liveRollSubId = liveSubscribeResult
+    _P("BG3Access: Live roll relay subscription registered, id="
+        .. tostring(liveRollSubId))
+else
+    liveRollSubErr = liveSubscribeResult
+    _P("BG3Access: Live roll relay SUBSCRIPTION FAILED: "
+        .. tostring(liveRollSubErr))
+end
+
+-- ---------------------------------------------------------------------------
+-- Combat attack-hit relay (HitResultEvent).
+--
+-- Combat attack rolls (Fire Bolt, melee swings, weapon attacks, spell
+-- attacks) DO NOT go through ServerRollFinishedEvent -- that path is
+-- reserved for the "active roll" UI pipeline used by skill checks,
+-- saving throws, and reaction prompts.  Combat hits resolve through
+-- esv::hit::HitSystem and fire esv::hit::HitResultEventOneFrameComponent
+-- exposed as "HitResultEvent".
+--
+-- Single HitResultEvent per attack resolution carries EVERYTHING:
+-- the attack roll breakdown (NaturalRoll / Total / Critical), itemized
+-- modifier sources, damage per type, total damage done, target, AC,
+-- and lethal / should-be-downed flags.  Replaces the old multi-fire
+-- AttackedBy announcements (which spoke once per damage sub-instance
+-- and never carried roll info) with a single coherent announcement.
+--
+-- Party gate: relay only when the attacker or target is a party
+-- member.  Same rationale as the existing AttackedBy gate.
+-- ---------------------------------------------------------------------------
+
+--- Safely read a field from a nested component path.  Returns nil on
+--- any access failure -- the HitResultEvent structure has deep
+--- optional nesting (Hit.ConditionRolls[1].StatsRoll.Result.*) that
+--- can miss a link if the game didn't populate an attack roll
+--- (e.g. save-or-suck spells where damage happens without a to-hit
+--- roll).
+local function SafeIndex(root, ...)
+    local current = root
+    for _, key in ipairs({...}) do
+        if type(current) ~= "table" and type(current) ~= "userdata" then
+            return nil
+        end
+        local ok, nextValue = pcall(function() return current[key] end)
+        if not ok then return nil end
+        current = nextValue
+        if current == nil then return nil end
+    end
+    return current
+end
+
+--- Pull the attack-roll StatsRoll out of HitDesc.ConditionRolls.
+---
+--- Verified against Hit.h:100-111:
+---   struct ConditionRoll {
+---       uint8_t DataType;
+---       ConditionRollType RollType;   -- AttackRoll / AbilityCheckRoll / etc.
+---       std::variant<StatsRoll, StatsExpressionResolved> Roll;
+---       int Difficulty;
+---       Guid RollUuid;
+---       bool SwappedSourceAndTarget;
+---       AbilityId Ability;
+---       SkillId Skill;
+---   }
+---
+---   struct StatsRoll {
+---       Roll Roll;                 -- dice definition
+---       StatsRollResult Result;    -- Total, NaturalRoll, Critical
+---       StatsRollMetadata Metadata;-- ProficiencyBonus, RollBonus, ResolvedRollBonuses
+---   }
+---
+---   struct StatsRollResult {
+---       int Total; int NaturalRoll; int DiscardedDiceTotal;
+---       RollCritical Critical; ...
+---   }
+---
+--- So the path is:
+---   conditionRoll.Roll.Result.NaturalRoll
+---   conditionRoll.Roll.Result.Total
+---   conditionRoll.Roll.Result.Critical  (enum, not bool)
+---
+--- The field on ConditionRoll is named "Roll", NOT "StatsRoll".
+--- Earlier version had "StatsRoll" based on a research summary and
+--- never extracted anything.
+---
+--- We accept the first entry whose ConditionRollType names it as
+--- an attack roll.  If we can't determine the type, fall back to
+--- "first entry with non-zero NaturalRoll."
+local function ExtractAttackRoll(hitDesc)
+    local conditionRolls = SafeIndex(hitDesc, "ConditionRolls")
+    if not conditionRolls then return nil end
+    local rollCount = 0
+    pcall(function() rollCount = #conditionRolls end)
+    if rollCount == 0 then return nil end
+    for rollIndex = 1, rollCount do
+        local conditionRoll = conditionRolls[rollIndex]
+        if conditionRoll then
+            local statsRoll = SafeIndex(conditionRoll, "Roll")
+            if statsRoll then
+                local naturalRoll = tonumber(SafeIndex(
+                    statsRoll, "Result", "NaturalRoll")) or 0
+                if naturalRoll > 0 then
+                    return statsRoll
+                end
+            end
+        end
+    end
+    return nil
+end
+
+--- Sum DamageList into a { typeName -> amount } table and a total.
+--- BG3's DamageList is typically a vector of { Amount, DamageType }.
+--- DamageType is an enum (Fire, Slashing, Force, etc.) that may come
+--- through as either a string name or an integer we need to resolve
+--- via Ext.Enums.DamageType.
+local function SummarizeDamageList(damageList)
+    local perType = {}
+    local total = 0
+    if not damageList then return perType, total end
+    local entryCount = 0
+    pcall(function() entryCount = #damageList end)
+    if entryCount == 0 then return perType, total end
+    for damageIndex = 1, entryCount do
+        local entry = damageList[damageIndex]
+        if entry then
+            local amount = tonumber(SafeIndex(entry, "Amount")) or 0
+            local damageType = SafeIndex(entry, "DamageType")
+            local typeName = EnumName("DamageType", damageType)
+            if typeName == "" then typeName = "Damage" end
+            if amount > 0 then
+                perType[typeName] = (perType[typeName] or 0) + amount
+                total = total + amount
+            end
+        end
+    end
+    return perType, total
+end
+
+--- Build a compact string describing an attack's damage for the
+--- client formatter, e.g. "9 fire" or "4 fire, 3 piercing".  The
+--- client composes this into the full announcement; we keep it as
+--- pre-formatted text here so the client doesn't need the damage-
+--- type enum resolution logic.
+local function FormatDamageBreakdown(perType, total)
+    if total == 0 then return "" end
+    -- Single-type: "N <type> damage"
+    local typeCount = 0
+    local soleTypeName, soleAmount = nil, nil
+    for typeName, amount in pairs(perType) do
+        typeCount = typeCount + 1
+        soleTypeName = typeName
+        soleAmount = amount
+    end
+    if typeCount == 1 then
+        return tostring(soleAmount) .. " " .. soleTypeName:lower()
+    end
+    -- Multi-type: "N1 <type1>, N2 <type2>, ..."
+    local parts = {}
+    for typeName, amount in pairs(perType) do
+        parts[#parts + 1] = tostring(amount) .. " "
+            .. typeName:lower()
+    end
+    return table.concat(parts, ", ")
+end
+
+--- Relay a single HitResultEvent to the client.
+local function RelayHitResultEvent(entity)
+    local hitResult = entity.HitResultEvent
+    if not hitResult then return end
+    local hitDesc = SafeIndex(hitResult, "Hit")
+    if not hitDesc then return end
+
+
+    -- Resolve attacker / target.
+    -- Inflicter is the entity that caused the hit.  For spells cast
+    -- by a character, Inflicter is the spell/projectile and
+    -- InflicterOwner is the caster -- the caster is what we want to
+    -- name.  Fall back to Inflicter if InflicterOwner is empty.
+    local inflicter = SafeIndex(hitDesc, "Inflicter")
+    local inflicterOwner = SafeIndex(hitDesc, "InflicterOwner")
+    local attackerHandle = inflicterOwner or inflicter
+    local targetHandle = SafeIndex(hitResult, "Target")
+
+    local attackerName = GetEntityDisplayName(attackerHandle)
+    local targetName = GetEntityDisplayName(targetHandle)
+    local attackerIsParty = IsPartyEntity(attackerHandle)
+    local targetIsParty = IsPartyEntity(targetHandle)
+
+    _P("BG3Access: HitResultEvent fired"
+        .. " attacker=" .. attackerName
+        .. " target=" .. targetName
+        .. " attackerParty=" .. tostring(attackerIsParty)
+        .. " targetParty=" .. tostring(targetIsParty))
+
+    -- Party gate.
+    if not attackerIsParty and not targetIsParty then
+        _P("BG3Access:   CombatHit skipped (neither side party)")
+        return
+    end
+
+    -- Attack roll extraction.  May be nil for save-or-suck spells
+    -- (no to-hit roll, target rolls a save).
+    --
+    -- Verified paths (Hit.h:39-47, 81-86, 100-111):
+    --   conditionRoll.Roll                 -- StatsRoll (variant field)
+    --   conditionRoll.Roll.Roll.Advantage  -- inner Roll struct (disambiguate!)
+    --   conditionRoll.Roll.Roll.Disadvantage
+    --   conditionRoll.Roll.Result.NaturalRoll
+    --   conditionRoll.Roll.Result.Total
+    --   conditionRoll.Roll.Result.Critical -- RollCritical enum: None/Success/Fail
+    local attackRoll = ExtractAttackRoll(hitDesc)
+    local naturalRoll = nil
+    local rollTotal = nil
+    local critical = false
+    local criticalMiss = false
+    local advantage = false
+    local disadvantage = false
+    local modifier = nil
+    if attackRoll then
+        naturalRoll = tonumber(SafeIndex(
+            attackRoll, "Result", "NaturalRoll"))
+        rollTotal = tonumber(SafeIndex(
+            attackRoll, "Result", "Total"))
+        -- RollCritical is an enum: None=0, Success=1 (natural 20),
+        -- Fail=2 (natural 1).  BG3SE delivers enums as their string
+        -- names via tostring (userdata with __tostring), so compare
+        -- to "Success" / "Fail" rather than ==true.
+        local critEnumValue = SafeIndex(attackRoll, "Result", "Critical")
+        local critName = ""
+        if critEnumValue ~= nil then
+            critName = tostring(critEnumValue) or ""
+        end
+        critical = (critName == "Success")
+        criticalMiss = (critName == "Fail")
+        -- Advantage / disadvantage live on the INNER Roll struct
+        -- (Hit.h:30 - struct Roll { ... bool Advantage; bool Disadvantage; }).
+        -- Path is statsRoll.Roll.Advantage (yes, Roll.Roll -- the
+        -- outer is StatsRoll, inner is its Roll field).
+        advantage = SafeIndex(
+            attackRoll, "Roll", "Advantage") == true
+        disadvantage = SafeIndex(
+            attackRoll, "Roll", "Disadvantage") == true
+        if naturalRoll and rollTotal then
+            modifier = rollTotal - naturalRoll
+        end
+    end
+
+    -- Damage.  Prefer DamageList (per-type breakdown) over flat
+    -- Damage int (which would lose the per-type split we need for
+    -- natural speech).
+    local damageList = SafeIndex(hitDesc, "DamageList")
+    local perType, totalDamage = SummarizeDamageList(damageList)
+    if totalDamage == 0 then
+        -- Fall back to TotalDamageDone if DamageList was empty
+        -- (unusual but possible for some hit types).
+        totalDamage = tonumber(SafeIndex(
+            hitDesc, "TotalDamageDone")) or 0
+    end
+    local damagePhrase = FormatDamageBreakdown(perType, totalDamage)
+
+    -- Target HP after the hit.  GetCharacterHitpoints returns a
+    -- single table {hp=N, maxHp=M} (or nil), NOT two return values;
+    -- destructure here rather than assigning both to the same var.
+    local targetHp, targetMaxHp = nil, nil
+    local hitpoints = GetCharacterHitpoints(targetHandle)
+    if hitpoints then
+        targetHp = hitpoints.hp
+        targetMaxHp = hitpoints.maxHp
+    end
+
+    -- Classify the damage source.  HitResultEvent fires once per
+    -- damage DELIVERY (not per attack): primary spell hit, surface
+    -- tick, status tick (Burning), etc. each fire their own event.
+    -- The user needs to hear what's actually damaging them -- a
+    -- fire-surface tick attributed to "Tav" is wrong.  CauseType
+    -- (Stats.inl:760-773) tells us the source category; StatusId
+    -- and SurfaceType name the specific source.
+    local causeType = EnumName("CauseType", SafeIndex(hitDesc, "CauseType"))
+    local surfaceTypeName = EnumName(
+        "SurfaceType", SafeIndex(hitDesc, "SurfaceType"))
+    -- StatusId is a FixedString like "BURNING"; pass as-is and let
+    -- the client humanize.  Empty string when not status-caused.
+    local statusId = tostring(SafeIndex(hitDesc, "StatusId") or "")
+    if statusId == "nil" then statusId = "" end
+
+    -- Miss detection: HitResultEvent fires for misses too, with
+    -- the Miss bit set in EffectFlags (DamageFlags bitmask,
+    -- Stats.inl:776-782).  BG3SE bitmasks typically tostring() as
+    -- a comma list like "Hit,Critical" -- match literally on the
+    -- "Miss" token.  Falls back to damage==0 as a fuzzy miss
+    -- indicator for cases where EffectFlags isn't populated.
+    local effectFlagsText = tostring(
+        SafeIndex(hitDesc, "EffectFlags") or "")
+    local isMiss = effectFlagsText:find("Miss") ~= nil
+
+    -- Lethal flag: did this hit drop the target to 0?
+    local lethal = SafeIndex(hitResult, "Lethal") == true
+    local shouldBeDowned = SafeIndex(hitResult, "ShouldBeDowned") == true
+    local ac = tonumber(SafeIndex(hitResult, "AC"))
+
+    _P("BG3Access:   CombatHit"
+        .. " cause=" .. causeType
+        .. " surface=" .. surfaceTypeName
+        .. " status=" .. statusId
+        .. " miss=" .. tostring(isMiss)
+        .. " roll=" .. tostring(naturalRoll)
+        .. " total=" .. tostring(rollTotal)
+        .. " crit=" .. tostring(critical)
+        .. " damage=" .. tostring(totalDamage)
+        .. " damagePhrase='" .. damagePhrase .. "'"
+        .. " targetHp=" .. tostring(targetHp) .. "/" .. tostring(targetMaxHp)
+        .. " lethal=" .. tostring(lethal))
+
+    RelayCombatEvent({
+        event           = "CombatHit",
+        attackerName    = attackerName,
+        targetName      = targetName,
+        attackerIsParty = attackerIsParty,
+        targetIsParty   = targetIsParty,
+        causeType       = causeType,
+        surfaceType     = surfaceTypeName,
+        statusId        = statusId,
+        isMiss          = isMiss,
+        naturalRoll     = naturalRoll,
+        rollTotal       = rollTotal,
+        modifier        = modifier,
+        critical        = critical,
+        criticalMiss    = criticalMiss,
+        advantage       = advantage,
+        disadvantage    = disadvantage,
+        damageAmount    = totalDamage,
+        damagePhrase    = damagePhrase,
+        ac              = ac,
+        defenderHp      = targetHp,
+        defenderMaxHp   = targetMaxHp,
+        lethal          = lethal,
+        shouldBeDowned  = shouldBeDowned,
+    })
+end
+
+local hitSubId = nil
+local hitSubErr = nil
+local hitSubscribeOk, hitSubscribeResult = pcall(
+    Ext.Entity.OnCreateDeferred, "HitResultEvent",
+    function(entity, componentType)
+        local processOk, processErr = pcall(RelayHitResultEvent, entity)
+        if not processOk then
+            _P("BG3Access: HitResultEvent handler error: "
+                .. tostring(processErr))
+        end
+    end)
+if hitSubscribeOk then
+    hitSubId = hitSubscribeResult
+    _P("BG3Access: HitResultEvent subscription registered, id="
+        .. tostring(hitSubId))
+else
+    hitSubErr = hitSubscribeResult
+    _P("BG3Access: HitResultEvent SUBSCRIPTION FAILED: "
+        .. tostring(hitSubErr))
+end
 
 -- ============================================================================
 -- Subregion transition relay

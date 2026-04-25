@@ -4620,7 +4620,51 @@ local function FormatAmount(value)
     return string.format("%.1f", value)
 end
 
---- Read character info: name, race/class, HP.
+--- Read the Movement action resource for an entity.  Returns
+--- amount, maxAmount as numbers, or nil, nil when the resource
+--- isn't present.  Movement is stored in metres directly (a fresh
+--- character has Amount = 9 = 9 metres of remaining movement).
+---
+--- Discovers Movement by iterating ActionResources.Resources and
+--- looking up each resource's name via Ext.StaticData.Get(uuid,
+--- "ActionResource").  Avoids hardcoding the Movement UUID --
+--- mods can introduce additional movement-like resources, and the
+--- StaticData lookup is the same approach SpeakActionResources
+--- uses for the full resource list.
+local function ReadMovementResource(playerEntity)
+    if not playerEntity then return nil, nil end
+    local readOk, amount, maxAmount = pcall(function()
+        local actionResources = playerEntity.ActionResources
+        if not actionResources or not actionResources.Resources then
+            return nil, nil
+        end
+        for resourceUuid, resourceEntries
+            in pairs(actionResources.Resources) do
+            local nameOk, resourceName = pcall(function()
+                local resourceDef = Ext.StaticData.Get(
+                    resourceUuid, "ActionResource")
+                if resourceDef and resourceDef.Name then
+                    return resourceDef.Name
+                end
+                return nil
+            end)
+            if nameOk and resourceName == "Movement" then
+                for _, entry in pairs(resourceEntries) do
+                    local entryAmount = entry.Amount or 0
+                    local entryMax = entry.MaxAmount or 0
+                    if entryMax > 0 then
+                        return entryAmount, entryMax
+                    end
+                end
+            end
+        end
+        return nil, nil
+    end)
+    if not readOk then return nil, nil end
+    return amount, maxAmount
+end
+
+--- Read character info: name, race/class, HP, movement.
 --- In combat, also includes turn status and round number.
 --- RS Up handler.
 local function SpeakCharacterInfo()
@@ -4633,20 +4677,35 @@ local function SpeakCharacterInfo()
         characterInfo = hudInfo.characterInfo or ""
     end
 
-    -- HP from entity API.
+    -- HP from entity API.  Build the value as just "N of M" (no
+    -- trailing "HP") so AddProperty("HP", ...) renders cleanly as
+    -- "HP: 10 of 10" rather than "HP: 10 of 10 HP".
     local hpText = ""
     local playerEntity = GetPlayerEntity()
     if playerEntity then
         local hpOk, hpResult = pcall(function()
             local health = playerEntity.Health
             if health then
-                return tostring(health.Hp) .. " of " .. tostring(health.MaxHp) .. " HP"
+                return tostring(health.Hp) .. " of "
+                    .. tostring(health.MaxHp)
             end
             return nil
         end)
         if hpOk and hpResult then
             hpText = hpResult
         end
+    end
+
+    -- Movement: current and max in metres.  Critical in combat
+    -- (decides whether you can reach a target without an AoO
+    -- provoke), useful out of combat too.  Format uses FormatAmount
+    -- (one decimal trim) since BG3 movement values can be
+    -- fractional after partial moves.
+    local movementText = ""
+    local moveAmount, moveMax = ReadMovementResource(playerEntity)
+    if moveAmount and moveMax then
+        movementText = FormatAmount(moveAmount) .. " of "
+            .. FormatAmount(moveMax) .. " metres"
     end
 
     -- Build speech via SpeechData.
@@ -4660,8 +4719,13 @@ local function SpeakCharacterInfo()
     if hpText ~= "" then
         charSpeech:AddProperty("HP", hpText, "brief")
     end
+    if movementText ~= "" then
+        charSpeech:AddProperty("Movement", movementText, "brief")
+    end
 
-    -- Combat info: whose turn and round number.
+    -- Combat info: whose turn and round number.  Build value
+    -- without redundant prefix -- AddProperty("Round", "1") renders
+    -- as "Round: 1", not "Round: Round 1".
     local Combat = BG3Access.Client.Combat
     if Combat and Combat.IsInCombat and Combat.IsInCombat() then
         local currentTurn = Combat.GetCurrentTurnName
@@ -4680,7 +4744,7 @@ local function SpeakCharacterInfo()
         end
         if currentRound and currentRound > 0 then
             charSpeech:AddProperty("Round",
-                "Round " .. tostring(currentRound), "normal")
+                tostring(currentRound), "normal")
         end
     end
 

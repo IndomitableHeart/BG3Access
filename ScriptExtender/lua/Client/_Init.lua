@@ -18,6 +18,7 @@ BG3Access.Shared.RequireFiles("Client/", {
 "WorldUI",
 "Menus",
 "Combat",
+"TargetSelect",
 "Subregion",
 "WorldNav",
 "EventRouter",
