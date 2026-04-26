@@ -2186,9 +2186,62 @@ local ActiveRollHandler = CreatePanelHandler({
 -- Reaction ability decision popup during combat.
 -- Appears when the player can use a reaction (Opportunity Attack, Counterspell,
 -- etc.) on an enemy turn.  Focus lands on VMInterruptDecision items.
+--
+-- onWidgetAdded reads the trigger description -- WHY this reaction is
+-- being prompted ("Goblin Worg moves out of Shadowheart's reach",
+-- "Skeleton casts Bless on Goblin", etc.).  The XAML
+-- (ReactionDecisionPopup_c.xaml line 334) has a TextBlock named
+-- "ReactionTypeText" inside the per-event DataTemplate.  Its content
+-- is populated by CtxTransStringRunGeneratorBehavior with Source
+-- bound to VMInterruptEvent.Description, so the rendered text is
+-- the human-readable trigger description after CtxTransString
+-- substitution (character names, spell names, etc. are spliced in).
+--
+-- Reading the rendered text via FindNameInWidget +
+-- ReadElementStructuredTextBlocks is more reliable than walking
+-- dcProps to InterruptEvents[0].Description: the dcProps extractor
+-- captures shallow widget DC properties, but the InterruptEvents
+-- collection lives on the widget DC's Data sub-object and the
+-- per-event Description is a TranslatedString reference that
+-- Lua-side resolution would need to chase manually.  The TextBlock
+-- already holds the resolved+substituted text -- just read it.
 local ReactionHandler = CreatePanelHandler({
     name = "Reaction",
     hint = "A to use reaction. B to skip all.",
+    onWidgetAdded = function(widgetData, handlerState)
+        local findOk, textBlock = pcall(
+            Ext.UI.FindNameInWidget, "ReactionTypeText")
+        if not findOk or not textBlock then return end
+        local readOk, entries = pcall(
+            Ext.UI.ReadElementStructuredTextBlocks, textBlock)
+        if not readOk or not entries or #entries == 0 then return end
+        -- CtxTransStringRunGeneratorBehavior emits a sequence of
+        -- Run elements alternating between literal text and
+        -- parameter-style runs (character names, etc.).  The
+        -- structured reader returns one entry per Run; concatenate
+        -- with single spaces to reconstruct the readable sentence.
+        -- Filter unresolved binding placeholders / loca handles
+        -- that occasionally slip through during the same-tick
+        -- read window.
+        local pieces = {}
+        for _, entry in ipairs(entries) do
+            local text = entry.text or ""
+            if text ~= ""
+                and not text:find("%[ForceUpdate%]")
+                and not text:match("^h%x+g")
+                and not text:find("s_HandleUnknown") then
+                pieces[#pieces + 1] = text
+            end
+        end
+        if #pieces == 0 then return end
+        local triggerText = table.concat(pieces, " ")
+        -- Use titleOverride (not bodyOverride) so the trigger text
+        -- precedes the navigation hint -- urgent context (WHY I'm
+        -- being asked) leads, choice mechanics follow.  The user
+        -- hears: "Reaction: Goblin moves out of Shadowheart's reach.
+        -- A to use reaction. B to skip all. Opportunity Attack."
+        handlerState.titleOverride = "Reaction: " .. triggerText
+    end,
     customItemFn = function(focusedElement, handlerState, snapshot)
         local dcProps = focusedElement.dcProps
         if not dcProps then return nil end
@@ -2370,7 +2423,9 @@ local JournalQuestsHandler = CreatePanelHandler({
         end
 
         -- Quest objective (ls.QuestObjective):
-        -- Has Description property directly.
+        -- Has Description property directly.  AddProperty puts the
+        -- "Objective" label and the description in one labeled fact,
+        -- avoiding the prior "Objective: " concat into the value.
         if dcType == "ls.QuestObjective" and dcProps then
             local objectiveText = dcProps.Description
             if type(objectiveText) == "table" then
@@ -2381,7 +2436,10 @@ local JournalQuestsHandler = CreatePanelHandler({
                 objectiveText = Helpers.GetTranslatedStringIfHandle(
                     objectiveText)
                 objectiveText = Helpers.StripMarkupTags(objectiveText)
-                return "Objective: " .. objectiveText, nil, nil
+                local objSpeech = SpeechData.Create()
+                objSpeech:AddProperty("Objective",
+                    objectiveText, "brief")
+                return objSpeech
             end
             -- Fallback: text blocks.
             local readOk, texts = pcall(
@@ -2389,7 +2447,10 @@ local JournalQuestsHandler = CreatePanelHandler({
             if readOk and texts and #texts > 0 then
                 local text = Helpers.StripMarkupTags(texts[1])
                 if text and text ~= "" then
-                    return "Objective: " .. text, nil, nil
+                    local objSpeech = SpeechData.Create()
+                    objSpeech:AddProperty("Objective",
+                        text, "brief")
+                    return objSpeech
                 end
             end
             return "", nil, nil
@@ -2684,6 +2745,8 @@ local ReportHandler = CreatePanelHandler({
 local PartyLineHandler = CreatePanelHandler({
     name = "PartyLine",
     hint = "Up and down to browse party members."
+        .. " A to switch active control."
+        .. " X to group, Y to split, hold X to group all."
         .. " RB to level up if available.",
     customItemFn = function(focusedElement, handlerState, snapshot)
         local dcType = focusedElement.dcType
@@ -2991,12 +3054,18 @@ local MapHandler = CreatePanelHandler({
         end
         waypointName = Helpers.StripMarkupTags(waypointName)
 
-        -- Announce "Waypoints" once when the waypoint panel
-        -- opens (first VMWaypoint focus).
+        -- Announce "Waypoints" once when the waypoint panel opens
+        -- (first VMWaypoint focus).  "Waypoints" goes through the
+        -- `title` core field (sits before `name` in the formatter's
+        -- order) so the formatter renders "Waypoints. <name>." from
+        -- two distinct fields rather than the prior packed string.
         if focusedElement.dcType == "ls.VMWaypoint"
             and not handlerState.waypointsAnnounced then
             handlerState.waypointsAnnounced = true
-            return "Waypoints. " .. waypointName, nil, nil
+            local waypointSpeech = SpeechData.Create()
+            waypointSpeech:Add("title", "Waypoints", "brief")
+            waypointSpeech:Add("name", waypointName, "brief")
+            return waypointSpeech
         end
 
         return waypointName, nil, nil
@@ -3362,6 +3431,16 @@ local WIDGET_NAME_HANDLERS = {
     -- activate PartyLineHandler properly when the user opens the
     -- party panel.
     ["PartyLineActive_c"]  = PartyLineHandler,
+    -- SpellBook_c: the widget itself doesn't carry ls.VMSpellBook --
+    -- that DC is only on an inner DataContext element.  So the
+    -- widget-DC routing path can't recognize SpellBook from the
+    -- widgetAdded event; routing has to wait for a focused element
+    -- to surface ls.VMSpellBook, which races against Menus' default
+    -- MainMenu fallback and loses on cold loads.  Name-based
+    -- routing closes the race: on the widgetAdded event itself we
+    -- recognize SpellBook_c and route to WorldUI deterministically,
+    -- regardless of cache state.
+    ["SpellBook_c"]        = SpellBookHandler,
 }
 
 --- IsWorldDCType: returns true if the given DC type belongs to an

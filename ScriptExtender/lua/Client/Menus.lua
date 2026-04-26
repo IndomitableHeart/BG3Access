@@ -905,6 +905,16 @@ local DC_TYPE_HANDLERS = {
     ["gui::DCLobbyBrowser"]      = MultiplayerHandler,
     ["gui::DCCharacterAssign"]   = MultiplayerHandler,
     ["gui::DCSavegames"]         = SaveLoadHandler,
+    -- Per-item save VM: each individual save under a campaign expander
+    -- focuses with this DC.  Mapping it to SaveLoad keeps the staleness
+    -- check (focused-DC path) passing while the user navigates the
+    -- save list -- otherwise transient empty widgetDCTypes / empty
+    -- widgetEvents ticks make the staleness check think the SaveLoad
+    -- widget vanished, falling back to MainMenu mid-session.
+    ["ls.VMSavegame"]            = SaveLoadHandler,
+    -- Campaign expander's DC.  Same rationale: focusing the expander
+    -- shouldn't drop SaveLoad just because the cache is briefly empty.
+    ["ls.VMPlaythroughHolder"]   = SaveLoadHandler,
     ["gui::DCGameMenu"]          = PauseMenuHandler,
     ["gui::DCNewGameSettings"]   = DifficultyHandler,
     ["gui::VMPreset"]            = DifficultyHandler,
@@ -1144,6 +1154,25 @@ local function RouteSnapshot(snapshot)
         if not widgetStillPresent and snapshot.widgetEvents then
             for _, widgetEvent in ipairs(snapshot.widgetEvents) do
                 if widgetEvent.elemName == activeHandlerWidgetName then
+                    widgetStillPresent = true
+                    break
+                end
+            end
+        end
+        -- Identity check via the C++ widgetNames parallel array.
+        -- TickSnapshot.widgetNames carries the x:Name of every visible
+        -- widget on this tick (parallel to widgetAddrs / widgetDCTypes).
+        -- This is the AUTHORITATIVE per-tick liveness signal: if our
+        -- handler's widget name is in the array, the widget is still
+        -- on screen this tick, regardless of whether widgetEvents
+        -- fired or focused-DC happens to map to the handler.  Without
+        -- this, ticks that have no widget add/remove events AND a
+        -- focused element whose DC type isn't in DC_TYPE_HANDLERS
+        -- (e.g. focus on a ContentPresenter wrapping a VMTickBoxSetting
+        -- inside Options) wrongly declare the widget gone.
+        if not widgetStillPresent and snapshot.widgetNames then
+            for _, widgetName in ipairs(snapshot.widgetNames) do
+                if widgetName == activeHandlerWidgetName then
                     widgetStillPresent = true
                     break
                 end

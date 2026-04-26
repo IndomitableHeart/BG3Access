@@ -1093,14 +1093,15 @@ local function HandleRSDirection(direction)
         return
     end
 
+    local HUDReader = BG3Access.Client.HUDReader
     if direction == RS_DIRECTION_UP then
-        Nav.SpeakCharacterInfo()
+        if HUDReader then HUDReader.SpeakCharacterInfo() end
     elseif direction == RS_DIRECTION_RIGHT then
         local Combat = BG3Access.Client.Combat
         if Combat and Combat.IsInCombat and Combat.IsInCombat() then
             Combat.SpeakTurnOrder()
-        else
-            Nav.SpeakActionResources()
+        elseif HUDReader then
+            HUDReader.SpeakActionResources()
         end
     end
 end

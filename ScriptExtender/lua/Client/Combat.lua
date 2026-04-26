@@ -262,6 +262,27 @@ local function HandleStatusRemoved(eventData)
     SpeakCombatQueued(statusName .. " expired on " .. characterName)
 end
 
+--- Concentration loss announcement.  Server fires this when a
+--- party member's concentration is interrupted (failed Con save
+--- on damage, death, dispel, etc.) per the
+--- ConcentrationChangedOneFrameComponent path documented in
+--- BootstrapServer.lua.  The Constitution save's pass/fail was
+--- already announced by the existing roll relay; this announcement
+--- adds the affected spell so the user knows which buff just
+--- dropped.  Queue (not interrupt) so it falls naturally after the
+--- Con-save outcome that triggered it: the user hears
+---   "Goblin hit Shadowheart for 11 damage, 9 of 20 remaining"
+---   "Shadowheart, rolled 8 plus 4, total 12, Constitution save,
+---    DC 11, failed"
+---   "Shadowheart lost concentration on Bless"
+--- in cause-effect order.
+local function HandleConcentrationLost(eventData)
+    local casterName = eventData.casterName or "Unknown"
+    local spellName = eventData.spellName or "spell"
+    SpeakCombatQueued(
+        casterName .. " lost concentration on " .. spellName)
+end
+
 --- Build a "N of M remaining" suffix for defender HP.  Returns an
 --- empty string when HP data is unavailable so callers can unconditionally
 --- concatenate.
@@ -439,6 +460,21 @@ local function HandleRollFinishedSave(eventData)
         else
             parts[#parts + 1] = "failed"
         end
+    end
+
+    -- Forced-by-party-spell context.  Server populates
+    -- forcingSpellName only when the standard party gate would
+    -- have skipped the relay (enemy-vs-enemy save) AND the save
+    -- target was just hit by a party spell cast (per the
+    -- pendingPartyCastTargets cache in BootstrapServer.lua).
+    -- Append "against <spell>" so the player knows which of their
+    -- spells just got resisted / soaked: "Goblin, rolled 14,
+    -- Wisdom save, DC 13, passed against Sleep" tells them their
+    -- Sleep didn't take this enemy.  Nil for normal party-side
+    -- rolls -- omit suffix entirely so no awkward "against nil".
+    if eventData.forcingSpellName
+        and eventData.forcingSpellName ~= "" then
+        parts[#parts + 1] = "against " .. eventData.forcingSpellName
     end
 
     -- Queue instead of interrupt.  A saving throw fired during
@@ -662,9 +698,20 @@ local function SpeakAttackHit(eventData)
         end
     end
 
-    -- Action clause.
+    -- Action clause.  Immune is its own branch: even if the rolled
+    -- damage was non-zero, the target ate it all -- the player needs
+    -- to know the spell did NOTHING so they can adjust their plan
+    -- (switch damage type, target someone else).  isMiss / criticalMiss
+    -- still take precedence (no damage was even rolled).
+    local wasImmune = eventData.wasImmune == true
     if isMiss or criticalMiss then
         parts[#parts + 1] = "missed " .. targetName
+    elseif wasImmune then
+        parts[#parts + 1] = "hit " .. targetName
+            .. ", immune to "
+            .. tostring(tonumber(eventData.rolledDamage)
+                or eventData.originalDamage or 0)
+            .. " damage"
     elseif damageAmount == 0 then
         parts[#parts + 1] = "hit " .. targetName .. " for no damage"
     else
@@ -677,9 +724,25 @@ local function SpeakAttackHit(eventData)
         if damageText ~= "" then
             parts[#parts + 1] = "for " .. damageText
         end
+        -- Resistance hint: server flagged that the rolled damage
+        -- exceeded what was applied (resistance, partial absorption,
+        -- temp HP).  Append "(resisted from N)" so the player
+        -- understands why the actual number is lower than the dice
+        -- they rolled.  wasImmune branch above already covers
+        -- damageAmount == 0; this branch is for partial reduction.
+        if eventData.wasReduced == true and not wasImmune then
+            local rolled = tonumber(eventData.rolledDamage)
+                or tonumber(eventData.originalDamage)
+            if rolled and rolled > damageAmount then
+                parts[#parts + 1] = "resisted from "
+                    .. tostring(rolled)
+            end
+        end
     end
 
-    -- HP suffix skipped for pure misses.
+    -- HP suffix skipped for pure misses.  Immune cases still get
+    -- the suffix because HP didn't change but the player benefits
+    -- from confirmation ("HP unchanged at 20 of 20").
     if not (isMiss or criticalMiss) then
         local hpSuffix = FormatHpSuffix(
             tonumber(eventData.defenderHp),
@@ -1046,22 +1109,27 @@ end
 -- ---------------------------------------------------------------------------
 
 local EVENT_HANDLERS = {
-    CombatStarted = HandleCombatStarted,
-    CombatEnded   = HandleCombatEnded,
-    RoundStarted  = HandleRoundStarted,
-    TurnStarted   = HandleTurnStarted,
-    Died          = HandleDied,
-    StatusApplied = HandleStatusApplied,
-    StatusRemoved = HandleStatusRemoved,
-    AttackedBy    = HandleAttackedBy,
-    MissedBy      = HandleMissedBy,
-    RollFinished  = HandleRollFinished,
-    RollPreview   = HandleRollPreview,
+    CombatStarted      = HandleCombatStarted,
+    CombatEnded        = HandleCombatEnded,
+    RoundStarted       = HandleRoundStarted,
+    TurnStarted        = HandleTurnStarted,
+    Died               = HandleDied,
+    StatusApplied      = HandleStatusApplied,
+    StatusRemoved      = HandleStatusRemoved,
+    AttackedBy         = HandleAttackedBy,
+    MissedBy           = HandleMissedBy,
+    RollFinished       = HandleRollFinished,
+    RollPreview        = HandleRollPreview,
     -- HitResultEvent relay (server-side) fires once per combat
     -- attack resolution with the full roll + damage + HP picture.
     -- HandleCombatHit speaks the coherent announcement and
     -- suppresses the AttackedBy sub-damage fires that follow.
-    CombatHit     = HandleCombatHit,
+    CombatHit          = HandleCombatHit,
+    -- Concentration interrupted on a party member.  Pairs with the
+    -- existing Constitution-save announcement to tell the user
+    -- which spell just dropped.  See server BootstrapServer.lua
+    -- ConcentrationChanged subscription.
+    ConcentrationLost  = HandleConcentrationLost,
 }
 
 local function HandleCombatEvent(eventData)

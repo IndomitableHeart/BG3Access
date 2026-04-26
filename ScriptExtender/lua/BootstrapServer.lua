@@ -709,6 +709,28 @@ local function NormalizeRollUuidKey(rollUuid)
     return text
 end
 
+-- Cache: enemy-target entity handle -> {spellName, expiresAtMs}.
+-- Populated by the ServerRollStartSpellRequest subscription (below)
+-- whenever a party member casts a spell with one or more targets.
+-- Consumed by RelayRollEvent: when an enemy-vs-enemy save fires
+-- (neither Roller nor Subject is party), we look up the Roller's
+-- entity handle here to detect "this enemy is rolling a save
+-- because of a party-cast spell that targeted them."  Without
+-- this association, the existing party-only roll gate silently
+-- drops every enemy save against player spells (Sleep, Hold
+-- Person, Command, etc.) -- the player casts the spell and never
+-- hears whether any target succeeded or failed the save.
+--
+-- TTL of 5 seconds: spell cast -> save resolution can take
+-- multiple ticks (especially for projectile spells with travel
+-- time, or AoEs where each target rolls independently).  5s is
+-- generous enough to cover the slowest cases without leaking
+-- stale associations into a later, unrelated save the same
+-- target rolls.  Entries are also one-shot: consumed on first
+-- match so a second save by the same target isn't misattributed.
+local pendingPartyCastTargets = {}
+local PARTY_CAST_TARGET_TTL_MS = 5000
+
 --- Relay a single FinishedEvent struct to the client.  This is the
 --- commit-time path -- fires on A-press and carries the complete
 --- breakdown (NaturalRoll + DiceAdditionalValue + DC + advantage
@@ -729,12 +751,35 @@ local function RelayRollEvent(finishedEvent)
     local subjectIsParty = IsPartyEntity(finishedEvent.Subject)
     _P("BG3Access:   rollerParty=" .. tostring(rollerIsParty)
         .. " subjectParty=" .. tostring(subjectIsParty))
-    -- Same party-only gate as AttackedBy.  We care when a party
-    -- member rolled or when a non-party roll is targeting a party
-    -- member (enemy attack rolls, enemy-forced saves).
+
+    -- Forced-by-party spell context lookup.  When the standard
+    -- party-only gate would skip (neither side is party), check
+    -- whether the rolling entity is the target of a recent
+    -- party-cast spell.  If so, this is an enemy rolling a save
+    -- against the player's spell -- relay it with the spell name
+    -- attached so the client can announce
+    -- "<enemy>, rolled X, <save> DC Y, passed/failed against <spell>".
+    -- Only saves are eligible: ability/skill checks aren't typically
+    -- forced by an enemy spell cast (and would be noisy if relayed).
+    local forcingSpellName = nil
     if not rollerIsParty and not subjectIsParty then
-        _P("BG3Access:   skipped (neither side is party)")
-        return
+        if rollBucket ~= "save" then
+            _P("BG3Access:   skipped (neither side is party)")
+            return
+        end
+        local cacheKey = tostring(finishedEvent.Roller or "")
+        local cachedCast = pendingPartyCastTargets[cacheKey]
+        if not cachedCast
+            or Ext.Utils.MonotonicTime()
+                > cachedCast.expiresAtMs then
+            pendingPartyCastTargets[cacheKey] = nil
+            _P("BG3Access:   skipped (enemy save, no party-cast match)")
+            return
+        end
+        forcingSpellName = cachedCast.spellName
+        pendingPartyCastTargets[cacheKey] = nil
+        _P("BG3Access:   matched enemy save vs party cast: "
+            .. tostring(forcingSpellName))
     end
 
     local naturalRoll = tonumber(finishedEvent.NaturalRoll) or 0
@@ -776,6 +821,13 @@ local function RelayRollEvent(finishedEvent)
         subjectIsParty = subjectIsParty,
         abilityName    = EnumName("AbilityId", finishedEvent.Ability),
         skillName      = EnumName("SkillId", finishedEvent.Skill),
+        -- Populated only for enemy-vs-enemy saves where a party
+        -- spell is forcing the save (per the
+        -- pendingPartyCastTargets lookup above).  Nil for normal
+        -- party-side rolls -- the client uses presence/absence to
+        -- decide whether to append "against <spell>" to the
+        -- announcement.
+        forcingSpellName = forcingSpellName,
     })
 end
 
@@ -923,6 +975,189 @@ else
     liveRollSubErr = liveSubscribeResult
     _P("BG3Access: Live roll relay SUBSCRIPTION FAILED: "
         .. tostring(liveRollSubErr))
+end
+
+-- ---------------------------------------------------------------------------
+-- Spell display-name resolver (shared by party-cast tracker AND
+-- concentration relay below).  Defined before either subscription so
+-- both closures capture the local properly -- Lua's local-scope
+-- rules require the declaration to precede the closure that
+-- references it, otherwise the closure binds to a global lookup
+-- (nil at runtime).
+--
+-- Returns nil when the spell prototype is empty or the name handle
+-- fails to resolve; falls back to the prototype string when the
+-- cached spell exists but has no resolvable DisplayName so the
+-- player at least hears "Spell_Bless" rather than silence.
+-- ---------------------------------------------------------------------------
+local function GetSpellDisplayName(spellId)
+    if spellId == nil then return nil end
+    local prototypeOk, prototype = pcall(function()
+        return tostring(spellId.Prototype or "")
+    end)
+    if not prototypeOk or not prototype or prototype == "" then
+        return nil
+    end
+    local cachedOk, cached = pcall(Ext.Stats.GetCachedSpell, prototype)
+    if not cachedOk or not cached or not cached.Description then
+        return prototype
+    end
+    local nameKey = cached.Description.DisplayName
+    if not nameKey then return prototype end
+    local handleOk, handleStr = pcall(function()
+        return tostring(nameKey.Handle.Handle)
+    end)
+    if not handleOk or not handleStr or handleStr == "" then
+        return prototype
+    end
+    local translateOk, translated = pcall(
+        Ext.Loca.GetTranslatedString, handleStr)
+    if translateOk and translated and translated ~= "" then
+        return translated
+    end
+    return prototype
+end
+
+-- ---------------------------------------------------------------------------
+-- Party-cast spell tracker (feeds enemy-save relay).
+--
+-- Subscribes to ServerRollStartSpellRequest
+-- (esv::active_roll::StartSpellRequestOneFrameComponent in
+-- BG3Extender/GameDefinitions/Components/Roll.h:182): fires on every
+-- spell-cast roll start with Caster, Spell, and Targets array.  When
+-- the caster is a party member, we record each target entity handle
+-- in pendingPartyCastTargets so RelayRollEvent's enemy-vs-enemy save
+-- branch can detect "this enemy is rolling a save BECAUSE of a
+-- party-cast spell" and relay accordingly.
+--
+-- We intentionally cache ALL party-cast spells, not just save-forcing
+-- ones, because there's no reliable way to know in advance whether a
+-- specific spell will trigger a save without inspecting its
+-- SpellRoll metadata (deep, version-fragile).  Cache entries that
+-- never match a save are pruned by the TTL check at lookup time
+-- (PARTY_CAST_TARGET_TTL_MS = 5000).  Wasted entries cost a few
+-- bytes; missed associations would cost the player a needed
+-- combat announcement.
+-- ---------------------------------------------------------------------------
+
+local startSpellSubId = nil
+local startSpellSubErr = nil
+local startSpellSubscribeOk, startSpellSubscribeResult = pcall(
+    Ext.Entity.OnCreateDeferred, "ServerRollStartSpellRequest",
+    function(entity, componentType)
+        local processOk, processErr = pcall(function()
+            local comp = entity.ServerRollStartSpellRequest
+            if not comp then return end
+            local casterEntity = comp.Caster
+            if not casterEntity then return end
+            if not IsPartyEntity(casterEntity) then return end
+            local spellName = GetSpellDisplayName(comp.Spell)
+            if not spellName or spellName == "" then return end
+            local expiresAtMs = Ext.Utils.MonotonicTime()
+                + PARTY_CAST_TARGET_TTL_MS
+            local targets = comp.Targets or {}
+            for _, initialTarget in ipairs(targets) do
+                -- BaseTarget.Target is the EntityHandle; tostring
+                -- gives us the stable hash key the relay path
+                -- looks up by.  TargetProxy (the optional
+                -- override) is a UI-only concept and isn't what
+                -- the save actually rolls under.
+                local targetHandle = initialTarget.Target
+                if targetHandle then
+                    local key = tostring(targetHandle)
+                    pendingPartyCastTargets[key] = {
+                        spellName   = spellName,
+                        expiresAtMs = expiresAtMs,
+                    }
+                end
+            end
+        end)
+        if not processOk then
+            _P("BG3Access: StartSpellRequest handler error: "
+                .. tostring(processErr))
+        end
+    end)
+if startSpellSubscribeOk then
+    startSpellSubId = startSpellSubscribeResult
+    _P("BG3Access: Party-cast tracker registered, id="
+        .. tostring(startSpellSubId))
+else
+    startSpellSubErr = startSpellSubscribeResult
+    _P("BG3Access: Party-cast tracker SUBSCRIPTION FAILED: "
+        .. tostring(startSpellSubErr))
+end
+
+-- ---------------------------------------------------------------------------
+-- Concentration loss relay.
+--
+-- BG3 fires the one-frame component `ConcentrationChanged`
+-- (esv::concentration::ConcentrationChangedOneFrameComponent in
+-- BG3Extender/GameDefinitions/Components/SpellCast.h:884) whenever a
+-- caster's concentration state transitions: starts, stops, or is
+-- interrupted.  Fields:
+--   Started     SpellId  -- the spell newly being concentrated on
+--   Ended       SpellId  -- the spell concentration that just ended
+--   Interrupted bool     -- true when ended due to damage save fail,
+--                           death, dispel, etc.; false when the
+--                           caster voluntarily ended (recast, cancel)
+--
+-- The Constitution save itself is already announced by the existing
+-- roll relay path (RollFinishedEvent -> client HandleRollFinishedSave).
+-- What that path can't say is which save was a CONCENTRATION save and
+-- whether it took the spell down.  This relay closes the gap by
+-- announcing the consequence ("X lost concentration on Bless") on the
+-- frame the spell drops -- the user has already heard the Con save's
+-- pass/fail, so the loss announcement adds the affected spell.
+--
+-- Filter: party only (same gate as StatusApplied / StatusRemoved -- a
+-- world full of enemy spellcasters losing concentration would be
+-- noise; the party's own concentration choices are tactical).
+-- Interrupted only (voluntary cancel / spell-replace cases produce no
+-- new info for the screen reader -- the cast UI already speaks).
+-- ---------------------------------------------------------------------------
+
+local concentrationSubId = nil
+local concentrationSubErr = nil
+local concentrationSubscribeOk, concentrationSubscribeResult = pcall(
+    Ext.Entity.OnCreateDeferred, "ConcentrationChanged",
+    function(entity, componentType)
+        local processOk, processErr = pcall(function()
+            local comp = entity.ConcentrationChanged
+            if not comp then return end
+            -- Voluntary cancel / spell replace: no announcement.
+            if comp.Interrupted ~= true then return end
+            -- Only the "ended" branch is interesting for loss
+            -- announcements.  A pure "Started" event with no Ended
+            -- means concentration was just initiated -- the caster
+            -- already heard the spell-cast UI.
+            local endedSpellName = GetSpellDisplayName(comp.Ended)
+            if not endedSpellName or endedSpellName == "" then
+                return
+            end
+            -- Owner of the one-frame component is the caster whose
+            -- concentration changed.  Party-only filter keeps enemy
+            -- concentration breaks out of the announcement stream.
+            if not IsPartyEntity(entity) then return end
+            local casterName = GetEntityDisplayName(entity)
+            RelayCombatEvent({
+                event       = "ConcentrationLost",
+                casterName  = casterName,
+                spellName   = endedSpellName,
+            })
+        end)
+        if not processOk then
+            _P("BG3Access: ConcentrationChanged handler error: "
+                .. tostring(processErr))
+        end
+    end)
+if concentrationSubscribeOk then
+    concentrationSubId = concentrationSubscribeResult
+    _P("BG3Access: Concentration relay subscription registered, id="
+        .. tostring(concentrationSubId))
+else
+    concentrationSubErr = concentrationSubscribeResult
+    _P("BG3Access: Concentration relay SUBSCRIPTION FAILED: "
+        .. tostring(concentrationSubErr))
 end
 
 -- ---------------------------------------------------------------------------
@@ -1103,9 +1338,24 @@ local function RelayHitResultEvent(entity)
     local attackerIsParty = IsPartyEntity(attackerHandle)
     local targetIsParty = IsPartyEntity(targetHandle)
 
+    -- Log the target entity's UUID along with the display name.
+    -- Display names are ambiguous for duplicate-named enemies
+    -- ("Intellect Devourer" x3 in a single combat) -- the UUID
+    -- disambiguates which specific instance was hit, which is
+    -- essential for any post-hoc analysis (HP tracking, kill
+    -- attribution, replay correlation against client-side reads).
+    local targetUuidStr = "?"
+    pcall(function()
+        if targetHandle and targetHandle.Uuid
+            and targetHandle.Uuid.EntityUuid then
+            targetUuidStr = tostring(targetHandle.Uuid.EntityUuid)
+        end
+    end)
+
     _P("BG3Access: HitResultEvent fired"
         .. " attacker=" .. attackerName
         .. " target=" .. targetName
+        .. " targetUuid=" .. targetUuidStr
         .. " attackerParty=" .. tostring(attackerIsParty)
         .. " targetParty=" .. tostring(targetIsParty))
 
@@ -1162,18 +1412,56 @@ local function RelayHitResultEvent(entity)
         end
     end
 
-    -- Damage.  Prefer DamageList (per-type breakdown) over flat
-    -- Damage int (which would lose the per-type split we need for
-    -- natural speech).
+    -- Damage extraction: separate the rolled damage (per-type
+    -- breakdown via DamageList) from the actual damage delivered
+    -- (TotalDamageDone, post-resistance / immunity / temp HP).
+    -- Without this split the player hears "Goblin hit Tav for 8
+    -- fire damage" while Tav's HP only drops by 4 because Tav has
+    -- fire resistance -- the announcement misleads the player about
+    -- their actual remaining survivability.
+    --
+    -- HitDesc fields verified against Hit.h:161-203:
+    --   TotalDamageDone        int  -- post-resistance, what HP loses
+    --   OriginalDamageValue    int  -- pre-resistance rolled total
+    --   DamageList             Array<DamagePair>  -- pre-resistance per-type
+    --   Damage.FinalDamage     int  -- another post-resistance signal
+    --                                -- (typically equals TotalDamageDone)
+    --   Damage.Resistances     Array<DamageResistance>  -- per-type
+    --                                                      resistance entries
     local damageList = SafeIndex(hitDesc, "DamageList")
-    local perType, totalDamage = SummarizeDamageList(damageList)
-    if totalDamage == 0 then
-        -- Fall back to TotalDamageDone if DamageList was empty
-        -- (unusual but possible for some hit types).
-        totalDamage = tonumber(SafeIndex(
-            hitDesc, "TotalDamageDone")) or 0
+    local perType, rolledDamage = SummarizeDamageList(damageList)
+    -- Authoritative actual damage: TotalDamageDone is what the
+    -- engine applied to the target this hit.  Fall back to the
+    -- DamageList sum only when TotalDamageDone is missing (unusual).
+    local actualDamage = tonumber(SafeIndex(
+        hitDesc, "TotalDamageDone"))
+    if actualDamage == nil then actualDamage = rolledDamage end
+    local originalDamage = tonumber(SafeIndex(
+        hitDesc, "OriginalDamageValue")) or rolledDamage
+    -- Resistance / immunity detection.  If the engine applied less
+    -- than was rolled, the difference came from resistance, immunity,
+    -- temp HP, or armor absorption -- all observationally equivalent
+    -- to the player ("you did less than you rolled").  Immunity is
+    -- the special case where ALL damage was absorbed.
+    local wasReduced = false
+    local wasImmune = false
+    if rolledDamage > 0 and actualDamage < rolledDamage then
+        wasReduced = true
+        if actualDamage == 0 then wasImmune = true end
     end
-    local damagePhrase = FormatDamageBreakdown(perType, totalDamage)
+    -- Per-type phrase generation: only emit when the breakdown is
+    -- TRUSTWORTHY (rolled total matches actual).  When resistance
+    -- skewed the numbers, the per-type DamageList values overstate
+    -- per-type damage, so prefer a flat "N damage" phrase instead
+    -- of misleading "8 fire" when only 4 fire actually landed.
+    local damagePhrase = ""
+    if not wasReduced then
+        damagePhrase = FormatDamageBreakdown(perType, actualDamage)
+    end
+    -- Use actualDamage as the canonical number all downstream code
+    -- references.  rolledDamage / originalDamage are only carried
+    -- for the resistance announcement.
+    local totalDamage = actualDamage
 
     -- Target HP after the hit.  GetCharacterHitpoints returns a
     -- single table {hp=N, maxHp=M} (or nil), NOT two return values;
@@ -1247,6 +1535,15 @@ local function RelayHitResultEvent(entity)
         disadvantage    = disadvantage,
         damageAmount    = totalDamage,
         damagePhrase    = damagePhrase,
+        -- Resistance / immunity context.  rolledDamage carries the
+        -- pre-resistance total so the client can say "for 4 fire
+        -- damage (resisted from 8)" or "no damage, immune" rather
+        -- than overstating what landed.  wasReduced / wasImmune are
+        -- mutually-exclusive flags (immune implies reduced).
+        rolledDamage    = rolledDamage,
+        originalDamage  = originalDamage,
+        wasReduced      = wasReduced,
+        wasImmune       = wasImmune,
         ac              = ac,
         defenderHp      = targetHp,
         defenderMaxHp   = targetMaxHp,

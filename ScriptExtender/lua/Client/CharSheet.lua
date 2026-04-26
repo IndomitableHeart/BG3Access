@@ -356,44 +356,61 @@ end
 -- ============================================================================
 
 --- FormatAbilityFromAPI: reads ability score and modifier from entity Stats.
+--- Returns a SpeechData with one AddProperty(abilityName, "<score>,
+--- modifier <signed-mod>", "brief") rather than a hand-concatenated
+--- string, so the formatter renders "Strength: 16, modifier +3"
+--- architecturally (label via AddProperty's first arg, not packed
+--- into the value).
 --- @param elemId string  The focused element's ID chain.
 --- @param dcProps table|nil  DataContext properties.
---- @return string|nil  Formatted speech like "Strength: 16, modifier +3".
+--- @return table|nil  SpeechData object, or nil if no data.
 local function FormatAbilityFromAPI(elemId, dcProps)
     local abilityIndexStr = elemId:match("AbilityStat(%d)")
     if not abilityIndexStr then
+        -- Fallback: read rendered TextBlocks.  Labels start with a
+        -- letter, values start with a digit or sign.  Pair them up:
+        -- one AddProperty per label/value match (no string concat).
         local readOk, textBlocks = pcall(Ext.UI.ReadFocusedTextBlocks)
-        if readOk and textBlocks and #textBlocks > 0 then
-            local labels = {}
-            local values = {}
-            for _, text in ipairs(textBlocks) do
-                local cleaned = Helpers.StripMarkupTags(text)
-                if cleaned and cleaned ~= "" then
-                    if cleaned:match("^[%d%+%-]") then
-                        values[#values + 1] = cleaned
-                    else
-                        labels[#labels + 1] = cleaned
-                    end
+        if not readOk or not textBlocks or #textBlocks == 0 then
+            return nil
+        end
+        local labels = {}
+        local values = {}
+        for _, text in ipairs(textBlocks) do
+            local cleaned = Helpers.StripMarkupTags(text)
+            if cleaned and cleaned ~= "" then
+                if cleaned:match("^[%d%+%-]") then
+                    values[#values + 1] = cleaned
+                else
+                    labels[#labels + 1] = cleaned
                 end
             end
-            local resultParts = {}
-            for _, label in ipairs(labels) do
-                resultParts[#resultParts + 1] = label
-            end
-            for _, value in ipairs(values) do
-                resultParts[#resultParts + 1] = value
-            end
-            if #resultParts > 0 then
-                return table.concat(resultParts, ": ")
+        end
+        if #labels == 0 and #values == 0 then return nil end
+        local fallbackSpeech = SpeechData.Create()
+        local pairCount = math.max(#labels, #values)
+        for pairIndex = 1, pairCount do
+            local label = labels[pairIndex]
+            local value = values[pairIndex]
+            if label and value then
+                fallbackSpeech:AddProperty(label, value, "brief")
+            elseif label then
+                -- Standalone label (no matching value) goes as a
+                -- "name" core field so it speaks as a bare word.
+                fallbackSpeech:Add("name", label, "brief")
+            elseif value then
+                -- Standalone value goes as "value" core field.
+                fallbackSpeech:Add("value", value, "brief")
             end
         end
-        return nil
+        return fallbackSpeech
     end
 
     local abilityIndex = tonumber(abilityIndexStr)
     local abilityName = ABILITY_INDEX_TO_NAME[abilityIndex]
     if not abilityName then return nil end
 
+    local score, modifier = nil, nil
     local entity = GetSelectedCharacterEntity()
     if entity then
         local statsOk, statsComponent = pcall(function()
@@ -408,8 +425,6 @@ local function FormatAbilityFromAPI(elemId, dcProps)
                 return statsComponent.AbilityModifiers
             end)
             if abilitiesOk and abilities then
-                local score = nil
-                local modifier = nil
                 local scoreOk, scoreVal = pcall(function()
                     return abilities[luaIndex]
                 end)
@@ -424,29 +439,38 @@ local function FormatAbilityFromAPI(elemId, dcProps)
                         modifier = modVal
                     end
                 end
-                if score and not modifier then
-                    modifier = math.floor((score - 10) / 2)
-                end
-                if score then
-                    local modSign = modifier >= 0 and "+" or ""
-                    return abilityName .. ": " .. tostring(score)
-                        .. ", modifier " .. modSign .. tostring(modifier)
-                end
             end
         end
     end
 
-    if dcProps and dcProps.Value then
-        local score = tonumber(dcProps.Value)
-        if score then
-            local modifier = math.floor((score - 10) / 2)
-            local modSign = modifier >= 0 and "+" or ""
-            return abilityName .. ": " .. tostring(score)
-                .. ", modifier " .. modSign .. tostring(modifier)
-        end
+    -- Fallback to dcProps when the entity API didn't yield a score.
+    if not score and dcProps and dcProps.Value then
+        score = tonumber(dcProps.Value)
+    end
+    if score and not modifier then
+        modifier = math.floor((score - 10) / 2)
     end
 
-    return abilityName
+    local abilitySpeech = SpeechData.Create()
+    if score then
+        -- Build the value as "<score>, modifier <signed-mod>".  The
+        -- "modifier" token here is part of the VALUE (a clarifier on
+        -- the number), not a separate label -- D&D convention reads
+        -- score and its modifier as a single coupled fact about the
+        -- ability ("Strength 16 (+3)").  AddProperty's label arg is
+        -- the abilityName so the formatter renders the full clause
+        -- as "Strength: 16, modifier +3".
+        local modSign = (modifier and modifier >= 0) and "+" or ""
+        local modifierText = modifier
+            and (", modifier " .. modSign .. tostring(modifier))
+            or ""
+        abilitySpeech:AddProperty(abilityName,
+            tostring(score) .. modifierText, "brief")
+    else
+        -- No score available -- speak just the ability name.
+        abilitySpeech:Add("name", abilityName, "brief")
+    end
+    return abilitySpeech
 end
 
 --- FormatStatFromTextBlocks: reads a stat's label and value from rendered
@@ -1516,7 +1540,15 @@ local function CreateCharacterPanelHandler(createPanelHandler)
 
                 if not isEquipped then
                     equipmentSlotEmpty = true
-                    return slotName .. ": Empty", nil, nil
+                    -- Empty slot: speak "<slot>: Empty" via
+                    -- AddProperty so the slot name is the LABEL
+                    -- and "Empty" is the value the formatter
+                    -- renders after the colon.  Avoids packing
+                    -- the label into a value string.
+                    local emptySlotSpeech = SpeechData.Create()
+                    emptySlotSpeech:AddProperty(slotName,
+                        "Empty", "brief")
+                    return emptySlotSpeech
                 end
 
                 equipmentSlotEmpty = false
@@ -1536,10 +1568,14 @@ local function CreateCharacterPanelHandler(createPanelHandler)
             end
 
             -- Ability scores: API-first via entity Stats component.
+            -- FormatAbilityFromAPI now returns a SpeechData object;
+            -- the panel handler factory (WorldUI.lua:1015-1024)
+            -- accepts a SpeechData as the customItemFn first return
+            -- and uses it directly without wrapping.
             if dcType == "ls.VMAbility" then
                 local abilitySpeech = FormatAbilityFromAPI(elemId, dcProps)
                 if abilitySpeech then
-                    return abilitySpeech, nil, nil
+                    return abilitySpeech
                 end
                 return "", nil, nil
             end
@@ -1703,7 +1739,13 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                     local charName = dcProps.Name or dcProps.CharacterName
                         or dcProps.DisplayName
                     if charName and charName ~= "" then
-                        return "Character: " .. charName, nil, nil
+                        -- Character: <name> via AddProperty so the
+                        -- "Character" word is the LABEL the formatter
+                        -- renders, not packed into the value string.
+                        local charSpeech = SpeechData.Create()
+                        charSpeech:AddProperty("Character",
+                            charName, "brief")
+                        return charSpeech
                     end
                 end
                 -- Other ls.Character elements.

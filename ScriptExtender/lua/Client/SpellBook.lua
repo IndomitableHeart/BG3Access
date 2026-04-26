@@ -642,6 +642,63 @@ local function CreateSpellBookHandler(createPanelHandler)
                 end
             end
 
+            -- SpellBook header stat containers (caster classes only).
+            -- Three focusable ContentControls in the right-side header
+            -- per SpellBook_c.xaml:
+            --   line 690 - CastAbilityContainer (spellcasting ability,
+            --              renders short ability name like "WIS")
+            --   line 713 - SpellDCContainer (Spell Save DC numeric value)
+            --   line 723 - SpellAttackContainer (Spell Attack signed bonus)
+            -- The framework's elemName resolver auto-derives a
+            -- human-readable label from the OUTER container's x:Name
+            -- ("CastAbilityContainer" -> "Cast Ability") OR falls back
+            -- to the inner rendered text when no derivable name exists
+            -- (yielding bare "13" / "+5" for the numeric containers).
+            -- Detect each by its observed elemName pattern and return
+            -- a SpeechData with the proper labeled AddProperty so the
+            -- formatter renders "Spell Save DC: 13" architecturally
+            -- (no string concat).  The factory accepts a SpeechData
+            -- return (per WorldUI.lua:1015-1024) and uses it directly.
+            -- SpellBook header stat containers (caster classes only).
+            -- Three focusable ContentControls in the right-side header
+            -- per SpellBook_c.xaml -- match by their literal x:Name:
+            --   line 690 - CastAbilityContainer (spellcasting ability;
+            --              inner Control renders short name like "WIS")
+            --   line 713 - SpellDCContainer (Spell Save DC value)
+            --   line 723 - SpellAttackContainer (Spell Attack bonus)
+            -- focusedElement.elemName carries the raw x:Name as
+            -- authored in the XAML (NOT a derived display label), so
+            -- an exact match against each Container's x:Name is the
+            -- correct identifier.  ReadFocusedTextBlocks pulls the
+            -- inner rendered value (the ability name / DC number /
+            -- bonus) which we attach via AddProperty so the formatter
+            -- emits "Spell Save DC: 13" architecturally.
+            local STAT_LABELS = {
+                CastAbilityContainer = "Spellcasting ability",
+                SpellDCContainer     = "Spell Save DC",
+                SpellAttackContainer = "Spell Attack bonus",
+            }
+            local elemName = focusedElement.elemName or ""
+            local statLabel = STAT_LABELS[elemName]
+            if statLabel then
+                local statValue = nil
+                local readOk, focusedTexts = pcall(
+                    Ext.UI.ReadFocusedTextBlocks)
+                if readOk and focusedTexts and #focusedTexts > 0 then
+                    statValue = Helpers.StripMarkupTags(focusedTexts[1])
+                end
+                local statSpeech = SpeechData.Create()
+                if statValue and statValue ~= "" then
+                    statSpeech:AddProperty(statLabel,
+                        statValue, "brief")
+                else
+                    -- No inner value read: speak just the label so
+                    -- the user at least knows which stat is focused.
+                    statSpeech:Add("name", statLabel, "brief")
+                end
+                return statSpeech
+            end
+
             -- Tooltip-deferred DC types.
             if dcType and TOOLTIP_DEFERRED_DC_TYPES[dcType] then
                 return "", nil, nil
@@ -673,25 +730,81 @@ local function CreateSpellBookHandler(createPanelHandler)
                 local speechData = SpeechData.Create()
                 local seen = {}
 
-                -- Pre-process: extract text from {role, text} entries
-                -- and split concatenated entries like
-                -- "1.5mDisadvantage." into separate texts.
+                -- Pre-process: extract text from {role, text, typeId}
+                -- entries and split concatenated entries like
+                -- "1.5mDisadvantage." into separate texts.  Each
+                -- processedTexts element is now a {text, typeId}
+                -- table so the matcher loop can use typeId to
+                -- disambiguate properties whose values look alike
+                -- (e.g. Jump's two distance values: TypeId="Range"
+                -- for max jump distance vs TypeId="ZoneRadius" for
+                -- the secondary distance, both rendered as "6m" /
+                -- "3m").  When a single entry is split, the typeId
+                -- is dropped from the synthetic halves -- they
+                -- weren't a single semantic property to begin with.
+                -- Pre-process the raw tooltipTexts list:
+                -- 1. Pair consecutive CostTemplateRoot Value+Name
+                --    entries into one synthetic entry whose text
+                --    is "<Value> <Name>" (e.g. "3m Movement
+                --    Speed").  These represent secondary costs
+                --    the action consumes (movement, charges) --
+                --    structurally distinct from the action-type
+                --    cost ("Bonus Action") that uses a single
+                --    Name-only entry.  Tagged with synthetic
+                --    typeId="CostPair" so the matcher can route.
+                -- 2. Split concatenated "1.5mDisadvantage." entries
+                --    where the structured reader collapsed two
+                --    XAML elements into one rendered string.
+                -- 3. Pass everything else through with its
+                --    original typeId preserved.
                 local processedTexts = {}
-                for _, tooltipEntry in ipairs(tooltipTexts) do
+                local entryCount = #tooltipTexts
+                local entryIndex = 1
+                while entryIndex <= entryCount do
+                    local tooltipEntry = tooltipTexts[entryIndex]
                     local entryText = tooltipEntry.text
-                    if entryText then
-                        local range, rest = entryText:match(
-                            "^([%d%.]+m)(.+)$")
-                        if range and rest then
-                            processedTexts[#processedTexts + 1] = range
-                            processedTexts[#processedTexts + 1] = rest
-                        else
-                            processedTexts[#processedTexts + 1] = entryText
+                    if not entryText then
+                        entryIndex = entryIndex + 1
+                        goto nextRawEntry
+                    end
+                    -- CostTemplateRoot Value+Name pair: combine.
+                    if tooltipEntry.parentRole == "CostTemplateRoot"
+                        and tooltipEntry.role == "Value" then
+                        local nextEntry = tooltipTexts[entryIndex + 1]
+                        if nextEntry
+                            and nextEntry.parentRole
+                                == "CostTemplateRoot"
+                            and nextEntry.role == "Name"
+                            and nextEntry.text then
+                            processedTexts[#processedTexts + 1] = {
+                                text = entryText .. " "
+                                    .. nextEntry.text,
+                                typeId = "CostPair",
+                            }
+                            entryIndex = entryIndex + 2
+                            goto nextRawEntry
                         end
                     end
+                    -- Concatenated split: "1.5mDisadvantage." etc.
+                    local range, rest = entryText:match(
+                        "^([%d%.]+m)(.+)$")
+                    if range and rest then
+                        processedTexts[#processedTexts + 1] =
+                            {text = range, typeId = nil}
+                        processedTexts[#processedTexts + 1] =
+                            {text = rest, typeId = nil}
+                    else
+                        processedTexts[#processedTexts + 1] =
+                            {text = entryText,
+                             typeId = tooltipEntry.typeId}
+                    end
+                    entryIndex = entryIndex + 1
+                    ::nextRawEntry::
                 end
 
-                for _, rawText in ipairs(processedTexts) do
+                for _, processedEntry in ipairs(processedTexts) do
+                    local rawText = processedEntry.text
+                    local entryTypeId = processedEntry.typeId
                     if not rawText or rawText == "" then
                         goto nextTT
                     end
@@ -760,20 +873,15 @@ local function CreateSpellBookHandler(createPanelHandler)
                         end
                     end
 
-                    -- Cost.
-                    if cleaned == "Action" then
+                    -- Cost: just the action type as the value.  The
+                    -- "Cost" label already carries the "this is what
+                    -- it costs" meaning, so packing "Costs " into the
+                    -- value duplicates the word.
+                    if cleaned == "Action"
+                        or cleaned == "Bonus Action"
+                        or cleaned == "Reaction" then
                         speechData:AddProperty("Cost",
-                            "Costs Action", "normal")
-                        goto nextTT
-                    end
-                    if cleaned == "Bonus Action" then
-                        speechData:AddProperty("Cost",
-                            "Costs Bonus Action", "normal")
-                        goto nextTT
-                    end
-                    if cleaned == "Reaction" then
-                        speechData:AddProperty("Cost",
-                            "Costs Reaction", "normal")
+                            cleaned, "normal")
                         goto nextTT
                     end
 
@@ -790,53 +898,97 @@ local function CreateSpellBookHandler(createPanelHandler)
                         goto nextTT
                     end
 
-                    -- Duration.
+                    -- Duration: just the turn count as the value.
+                    -- Label = "Duration" carries the "for how long"
+                    -- meaning; packing "Duration " into the value
+                    -- duplicates.
                     if cleaned:match("^%d+ turns?$") then
                         speechData:AddProperty("Duration",
-                            "Duration " .. cleaned, "normal")
+                            cleaned, "normal")
                         goto nextTT
                     end
 
-                    -- Attack type.
-                    if cleaned == "Attack Roll" then
+                    -- Attack type: the value names the mechanism
+                    -- (Attack Roll vs Saving Throw).  These are
+                    -- canonical D&D phrases that don't read as
+                    -- redundant against the "Attack type" label.
+                    if cleaned == "Attack Roll"
+                        or cleaned == "Saving Throw" then
                         speechData:AddProperty("Attack type",
-                            "Attack Roll", "normal")
-                        goto nextTT
-                    end
-                    if cleaned == "Saving Throw" then
-                        speechData:AddProperty("Attack type",
-                            "Saving Throw", "normal")
+                            cleaned, "normal")
                         goto nextTT
                     end
 
-                    -- Save type: "DEX Save", "STR Save", etc.
+                    -- Save type: just the ability abbreviation as
+                    -- the value (CON, DEX, etc.).  Label = "Save
+                    -- type" already conveys "this is the save
+                    -- triggered"; appending " Save" to the value
+                    -- duplicates the word.
                     local saveAbility = cleaned:match(
                         "^(%u+) Save$")
                     if saveAbility then
                         speechData:AddProperty("Save type",
-                            saveAbility .. " Save", "normal")
+                            saveAbility, "normal")
                         goto nextTT
                     end
 
-                    -- Range.
-                    if cleaned == "Melee" then
-                        speechData:AddProperty("Range",
-                            "Melee range", "normal")
+                    -- CostPair: synthetic entry from
+                    -- CostTemplateRoot Value+Name pair (e.g.
+                    -- "3m Movement Speed").  The first token is
+                    -- the cost amount, the rest is the resource
+                    -- name.  Speak as a labeled property whose
+                    -- label IS the resource name and value IS
+                    -- the amount, e.g. "Movement Speed: 3m".
+                    if entryTypeId == "CostPair" then
+                        local costAmount, costName = cleaned:match(
+                            "^(%S+)%s+(.+)$")
+                        if costAmount and costName then
+                            speechData:AddProperty(costName,
+                                costAmount, "normal")
+                        end
                         goto nextTT
                     end
-                    if cleaned:match("^[%d%.]+%s?m$")
-                        or cleaned:match("^[%d%.]+%s?ft$")
-                        or cleaned:match("^[%d%.]+%s?feet$")
-                        or cleaned:match("^%d+ft$") then
-                        speechData:AddProperty("Range",
-                            "Range " .. cleaned, "normal")
-                        goto nextTT
+                    -- Range / radius / zone: the value is a distance
+                    -- ("Melee" or "6m" or "30ft").  Require an
+                    -- explicit typeId to label as a distance --
+                    -- this prevents distance-shaped values that are
+                    -- actually OTHER costs (Jump's "3m" movement
+                    -- cost from CostTemplateRoot) from being
+                    -- mislabeled as "Range".  The CostPair branch
+                    -- above catches those before we reach here.
+                    -- Unknown typeId values fall through to the
+                    -- generic non-empty-role property emitter at
+                    -- the bottom of this matcher.
+                    local distanceLabel = nil
+                    if entryTypeId == "Range" then
+                        distanceLabel = "Range"
+                    elseif entryTypeId == "ZoneRadius" then
+                        distanceLabel = "Zone radius"
+                    elseif entryTypeId == "Radius" then
+                        distanceLabel = "Radius"
+                    end
+                    if distanceLabel then
+                        local isMeleeMode = (cleaned == "Melee")
+                        local isDistance = isMeleeMode
+                            or cleaned:match("^[%d%.]+%s?m$")
+                            or cleaned:match("^[%d%.]+%s?ft$")
+                            or cleaned:match("^[%d%.]+%s?feet$")
+                            or cleaned:match("^%d+ft$")
+                        if isDistance then
+                            speechData:AddProperty(distanceLabel,
+                                cleaned, "normal")
+                            goto nextTT
+                        end
                     end
 
-                    -- Concentration.
+                    -- Concentration: a binary flag.  "Yes" reads
+                    -- naturally with the "Concentration" label
+                    -- ("Concentration: Yes") and avoids the
+                    -- self-referential "Concentration: Concentration"
+                    -- the value used to produce.
                     if cleaned:lower() == "concentration" then
                         speechData:AddProperty("Concentration",
-                            "Concentration", "normal")
+                            "Yes", "normal")
                         goto nextTT
                     end
 

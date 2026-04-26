@@ -53,23 +53,85 @@ local Helpers    = BG3Access.Client.Helpers
 -- presses cancel the pending timer and restart the window, so the
 -- screen reader only speaks the latest target after the user stops
 -- cycling.
-local READ_DEFER_MS = 60
+-- Defer the cursor read after a D-pad press so the binding has time
+-- to propagate the new target through Noesis's INPC/style/trigger
+-- chain to TextBlock.Text (the script-accessible property).  The
+-- visible render updates within one frame (~16ms), but the .Text
+-- property exposed to Lua lags noticeably -- short defers fire
+-- before propagation completes and return the PREVIOUS cycle's text.
+-- Empirical bisect:
+--   60ms  -- always one cycle behind (broken)
+--   120ms -- still one cycle behind in testing (broken)
+--   150ms -- borderline; suspected staleness near end of propagation
+--   180ms -- chosen value, current setting
+--   240ms -- always current (verified, but slow)
+-- If staleness regressions appear, push back toward 200ms.
+local READ_DEFER_MS = 180
 
 -- x:Name uniquely present in TargetInfo_c's template.  Used as the
--- anchor for locating the widget root -- HPBarContainer is the
--- Control hosting the target health bar and exists nowhere else.
-local TARGET_INFO_ANCHOR = "HPBarContainer"
+-- anchor for locating the widget root.
+--
+-- HPBarContainer turned out to be PRESENT IN BOTH the mouse
+-- TargetInfo.xaml AND the controller TargetInfo_c.xaml -- and the
+-- mouse widget can be loaded simultaneously with controller widgets
+-- in Steam Input setups.  FindNameInWidget("HPBarContainer") then
+-- returns whichever widget gets found first across visible NameScopes,
+-- which can be the mouse TargetInfo holding stale or mouse-cursor
+-- data while the actual on-screen nameplate is rendered by
+-- TargetInfo_c.  Symptom: speech reports a different enemy / HP than
+-- what the player sees on screen.
+--
+-- "CycleSelection" is the d-pad cycling button hint inside
+-- TargetInfo_c.xaml's Header grid -- a ContentControl with
+-- Template=ButtonHint.  Verified unique across all 201 _c.xaml /
+-- non-_c.xaml files in MainUI/GUI/Pages -- only TargetInfo_c uses
+-- this name, so the anchor cannot be confused with the mouse widget.
+local TARGET_INFO_ANCHOR = "CycleSelection"
 
--- x:Name uniquely present in CursorText_c's template.  hitChanceText
--- is the TextBlock showing the percentage to hit; no other widget
--- uses that identifier.
-local CURSOR_TEXT_ANCHOR = "hitChanceText"
+-- x:Name uniquely present in CursorText_c's template.
+--
+-- Same bug pattern as the TargetInfo anchor above: hitChanceText
+-- appears in BOTH CursorText.xaml (mouse) and CursorText_c.xaml
+-- (controller).  When both NameScopes are searched, the first match
+-- can return mouse-cursor data that doesn't reflect the controller's
+-- actual cursor target.
+--
+-- "CursorTextRight" is the Grid containing the entire controller
+-- cursor text panel inside CursorText_c.xaml.  Confirmed unique across
+-- all extracted XAML pages -- exists only in CursorText_c.
+local CURSOR_TEXT_ANCHOR = "CursorTextRight"
 
 -- Maximum Parent hops when walking up from an anchor element to the
 -- widget root.  Anchors live 4-6 levels deep in the visual tree; 12
 -- hops provides comfortable margin without risking an infinite loop
 -- if Parent ever returns a cycle.
 local MAX_PARENT_HOPS = 12
+
+-- x:Names of the Border elements wrapping the per-item Advantages /
+-- Disadvantages ItemsControls inside TargetInfo_c (TargetInfo_c.xaml
+-- lines 216 and 254).  Each ItemsControl renders one StackPanel per
+-- VMAdvantage entry containing two TextBlocks: a separator (visible
+-- only after the first item) and a Description bound to
+-- VMAdvantage.Description.  Reading the holders via FindNameInWidget
+-- + ReadElementStructuredTextBlocks is the cleanest way to enumerate
+-- the descriptions: parentRole on the structured reader output is
+-- the TextBlock's IMMEDIATE visual parent (the unnamed inline
+-- StackPanel from the DataTemplate at TargetInfo_c.xaml line 80),
+-- so it can't identify which holder a description belongs to from
+-- a single whole-widget read.  Scoping the read per holder gives us
+-- the answer for free.
+local ADVANTAGES_HOLDER_ANCHOR = "AdvantagesListHolder"
+local DISADVANTAGES_HOLDER_ANCHOR = "DisadvantagesListHolder"
+
+-- Larian translated-string handle for the inter-item separator
+-- TextBlock that AdvantageItemTemplate prepends to every entry after
+-- the first (TargetInfo_c.xaml line 81, also used in
+-- DisadvantagesListHolder via the same template).  We resolve it
+-- lazily on first read and filter exact matches out of the holder's
+-- structured text entries so the separator string doesn't surface
+-- as a phantom advantage / disadvantage description.
+local ITEM_SEPARATOR_HANDLE =
+    "hd64bfe4cgadadg4468g8b0ag70330ffc717c"
 
 -- Role -> label mapping for TargetInfo_c TextBlocks.  Keys are the
 -- x:Name of the TextBlock (role) from the XAML template.  Values are
@@ -183,6 +245,14 @@ local lastTargetName       = nil
 -- ResolveTargetEntity() below to get a live reference each time.
 local lastTargetEntityUuid = nil
 local lastTargetReadAtMs   = 0
+-- Most recent cast-blocking rejection text from the cursor read, or
+-- nil if the cast would proceed.  Set in BuildTargetSpeechData when
+-- a rejection is present, cleared (set to nil) when none -- so the
+-- A-press handler can interrupt-speak the reason if the player tries
+-- to confirm a cast the game will refuse.  Defense in depth on top
+-- of front-loading the rejection in title -- catches cases where the
+-- navigation speech still got missed (interrupted, audio glitch).
+local lastRejectionText    = nil
 
 -- Maximum age for the cached target to still count as "fresh."  If
 -- the user hasn't cycled a target in this window, they've moved on
@@ -254,25 +324,46 @@ local function ResolveTargetEntity()
     return entity
 end
 
---- Is this the local player's combat turn?  Speaking target info
---- on an enemy's turn is wrong -- the player can't cycle targets
---- until their own turn comes up.  We read IsActiveCombatTurn off
---- the local player entity's TurnBased component; no dependency on
---- the Combat module's tracked turn GUID (which can be stale across
---- mid-session reloads or lag between TurnStarted events).
+--- Is ANY locally-controlled party member currently on their combat
+--- turn?  Speaking target info on an enemy's turn is wrong -- the
+--- player can't cycle targets until one of their characters comes
+--- up.
+---
+--- Source of truth is TurnBased.IsActiveCombatTurn on the entities
+--- themselves.  We iterate ALL entities matching the player-component
+--- criteria rather than just the first, because in a multi-character
+--- party the "first" entity (typically Tav) won't be on its turn
+--- when another party member is acting -- and the previous
+--- single-entity check gated d-pad targeting silently for those
+--- members.  Iterating catches the active member regardless of
+--- party position.
+---
+--- We do NOT pre-gate on Combat.IsInCombat().  That tracked flag
+--- starts false after a Lua reload / console reset and only flips
+--- true on the next CombatStarted Osiris event -- so during an
+--- in-progress combat that survived the reload, the flag lies and
+--- silently gates targeting for the entire session.  The
+--- IsActiveCombatTurn flag IS the authoritative combat-state check:
+--- a non-combat character has IsActiveCombatTurn=false by
+--- definition, and any character that has it true is, by definition,
+--- in combat.  Iteration handles the gate without the redundant
+--- (and stale-prone) IsInCombat() prefix.
 local function IsLocalPlayerTurn()
-    local Combat = BG3Access.Client.Combat
-    if not Combat or not Combat.IsInCombat or not Combat.IsInCombat() then
-        return false
+    for _, componentName in ipairs(PLAYER_COMPONENTS) do
+        local queryOk, entities = pcall(
+            Ext.Entity.GetAllEntitiesWithComponent, componentName)
+        if queryOk and entities then
+            for _, entity in ipairs(entities) do
+                local activeOk, isActive = pcall(function()
+                    local turnBased = entity.TurnBased
+                    if not turnBased then return false end
+                    return turnBased.IsActiveCombatTurn == true
+                end)
+                if activeOk and isActive == true then return true end
+            end
+        end
     end
-    local playerEntity = FindLocalPlayerEntity()
-    if not playerEntity then return false end
-    local activeOk, isActive = pcall(function()
-        local turnBased = playerEntity.TurnBased
-        if not turnBased then return false end
-        return turnBased.IsActiveCombatTurn == true
-    end)
-    return activeOk and isActive == true
+    return false
 end
 
 --- Walk up the parent chain from an anchor element and return the
@@ -422,6 +513,74 @@ local function ReadWidgetEntries(widgetLabel, anchorName)
     return entries
 end
 
+--- Resolve the inter-item separator handle once, cache forever.
+--- Loca lookups are cheap but the resolved string never changes
+--- within a session, so a one-time cache lets the per-frame holder
+--- read avoid the lookup overhead entirely.  Returns "" on resolve
+--- failure so equality comparisons fall through (worst case: a
+--- harmless extra phantom entry slips into the list).
+local cachedSeparatorText = nil
+local function GetItemSeparatorText()
+    if cachedSeparatorText ~= nil then return cachedSeparatorText end
+    local resolveOk, resolved = pcall(
+        Ext.Loca.GetTranslatedString, ITEM_SEPARATOR_HANDLE)
+    if resolveOk and type(resolved) == "string" then
+        cachedSeparatorText = resolved
+    else
+        cachedSeparatorText = ""
+    end
+    return cachedSeparatorText
+end
+
+--- Read the per-item description list out of an Advantages or
+--- Disadvantages holder (TargetInfo_c.xaml ItemsControl bound to
+--- HitChanceDesc.Advantages or HitChanceDesc.Disadvantages).
+---
+--- Returns a list of NormalizeText'd description strings, in render
+--- order, with the inter-item separator filtered out.  Returns nil
+--- when the holder is not currently in the visual tree (no advantage
+--- / disadvantage active) or when the read finds nothing speakable.
+---
+--- Why scope-by-holder rather than reading the whole widget once
+--- and grouping by parent: the structured TextBlock reader's
+--- parentRole is the IMMEDIATE visual parent (see
+--- CollectTooltipEntries_Inner in Module.inl).  The Description
+--- TextBlock's immediate parent is the inline StackPanel from the
+--- DataTemplate, which has no x:Name -- so a single whole-widget
+--- read produces entries with role="" and parentRole="" for every
+--- description, indistinguishable from each other and from generic
+--- unlabeled cursor reasons.  Scoping per holder gives us the answer
+--- (this entry is an Advantage vs a Disadvantage) for free.
+local function ReadModifierItemList(anchorName, label)
+    local findOk, anchor = pcall(Ext.UI.FindNameInWidget, anchorName)
+    if not findOk or not anchor then
+        Log.Info("MODIFIER LIST " .. label
+            .. ": holder '" .. anchorName .. "' not found"
+            .. " (no advantage/disadvantage active or holder hidden)")
+        return nil
+    end
+    local readOk, entries = pcall(
+        Ext.UI.ReadElementStructuredTextBlocks, anchor)
+    if not readOk or not entries then
+        Log.Info("MODIFIER LIST " .. label
+            .. ": ReadElementStructuredTextBlocks failed: "
+            .. tostring(entries))
+        return nil
+    end
+    local separatorText = GetItemSeparatorText()
+    local items = {}
+    for _, entry in ipairs(entries) do
+        local rawText = entry.text or ""
+        if IsValidText(rawText) and rawText ~= separatorText then
+            items[#items + 1] = NormalizeText(rawText)
+        end
+    end
+    Log.Info("MODIFIER LIST " .. label .. ": "
+        .. tostring(#items) .. " entries")
+    if #items == 0 then return nil end
+    return items
+end
+
 --- Classify entries into a map of {label = text}.  Iterates the
 --- raw entry list and assigns the first valid text seen for each
 --- mapped role.  Subsequent duplicates are skipped.  The XAML may
@@ -446,8 +605,16 @@ end
 ---   status name (e.g. "Threatened" appears as both statusLabel and
 ---   as an unlabeled Run); skip the echo since we'll speak statuses
 ---   via the entity-side enumeration.
+--- excludeTextSet (optional): set of normalized texts that the
+--- caller has already captured authoritatively elsewhere
+--- (advantage/disadvantage descriptions read out of
+--- AdvantagesListHolder / DisadvantagesListHolder).  Skipped from
+--- the unclassified-reason bucket so the same text doesn't speak
+--- twice.  Compared against NormalizeText'd values to match the
+--- normalization the modifier reader applies.
 local function ClassifyEntries(
-    entries, roleMap, parentRoleMap, captureUnlabeledAsReason)
+    entries, roleMap, parentRoleMap, captureUnlabeledAsReason,
+    excludeTextSet)
     local classified = {}
     if not entries then return classified end
     -- First pass: collect statusLabel texts so we can dedupe their
@@ -481,9 +648,12 @@ local function ClassifyEntries(
                 local isBareNumber = cleaned:match("^%d+$") ~= nil
                 local isSeparator = #cleaned <= 2
                 local isStatusEcho = statusLabelTexts[cleaned] == true
+                local isExcluded = excludeTextSet
+                    and excludeTextSet[cleaned] == true
                 if not isBareNumber
                     and not isSeparator
-                    and not isStatusEcho then
+                    and not isStatusEcho
+                    and not isExcluded then
                     unclassifiedReasons[#unclassifiedReasons + 1] =
                         cleaned
                 end
@@ -604,11 +774,21 @@ local function FormatStatusesPhrase(statuses)
     for _, entry in ipairs(statuses) do
         local name = entry.name or ""
         local statusId = entry.statusId or ""
-        -- Resolved DisplayName means the entry.name differs from
-        -- the raw status id.  When they match, the prototype had no
-        -- resolvable DisplayName -- treat as internal/hidden.
+        -- A status is user-facing only if its DisplayName resolved
+        -- to a real localized string.  Several internal forms
+        -- indicate "no display name":
+        --   1. name == statusId: the resolver fell back to the raw
+        --      status id (INSURFACE, TUT_DUMMY).
+        --   2. name == "" / nil: nothing came back at all.
+        --   3. name starts with "%%%": Larian's placeholder marker
+        --      for missing TranslatedString resolution
+        --      ("%%% EMPTY", "%%% MissingString").  BLOOD_COVERED
+        --      is a common case -- it's a real visual-only status
+        --      (drives blood-splatter VFX on character models)
+        --      with no player-facing name by design.
         local hasResolvedDisplayName = name ~= ""
             and name ~= statusId
+            and name:sub(1, 3) ~= "%%%"
         if hasResolvedDisplayName then
             local turns = LifetimeToTurns(entry.rawLifetime)
             if turns then
@@ -625,21 +805,63 @@ local function FormatStatusesPhrase(statuses)
 end
 
 local function BuildTargetSpeechData(
-    targetInfo, cursorInfo, statuses)
+    targetInfo, cursorInfo, statuses,
+    advantageList, disadvantageList)
     local speechData = SpeechData.Create()
 
-    -- Preview action: "status" fits because the architecture spec
-    -- describes it as transient state info (like "Your turn",
-    -- "Round 3").  "Attack", "Throw", "Move to" are the same kind
-    -- of transient cursor state.
-    if cursorInfo.action then
-        speechData:Add("status", cursorInfo.action, "brief")
+    -- Cast-blocking rejection text (out-of-range, can't target self,
+    -- not enough movement, capability errors, cannot-heal errors).
+    -- These ALL prevent the cast going through, so we put them in the
+    -- "title" core field which:
+    --   1. Speaks FIRST in the phrase, before name/HP/etc, so the
+    --      player gets the cast-validity verdict before any other
+    --      detail (a fast d-pad cycle still leaks the rejection).
+    --   2. Bypasses the verbosity gate (title + sectionLabel are
+    --      always spoken regardless of brief/normal/verbose).  This
+    --      was the actual reason the rejection went silent in
+    --      observed combat: at "brief" verbosity, normal-tier
+    --      additionalDescription got filtered out.
+    -- Save the combined text on the module-local rejection cache so
+    -- the A-press handler can re-announce on confirm (catches the
+    -- case where the navigation speech still got missed).
+    local rejectionParts = {}
+    if cursorInfo.cursorInfo and cursorInfo.cursorInfo ~= "" then
+        rejectionParts[#rejectionParts + 1] = cursorInfo.cursorInfo
     end
+    local capabilityRejection = CombineMessageAndCause(
+        cursorInfo.capabilityError, cursorInfo.capabilityCause)
+    if capabilityRejection then
+        rejectionParts[#rejectionParts + 1] = capabilityRejection
+    end
+    local cannotHealRejection = CombineMessageAndCause(
+        cursorInfo.cannotHealMessage, cursorInfo.cannotHealCause)
+    if cannotHealRejection then
+        rejectionParts[#rejectionParts + 1] = cannotHealRejection
+    end
+    local rejectionText = nil
+    if #rejectionParts > 0 then
+        rejectionText = table.concat(rejectionParts, ". ")
+        speechData:Add("title", rejectionText, "brief")
+    end
+    lastRejectionText = rejectionText
 
-    -- Target identity.  The target name is the focused entity, which
-    -- maps to the core "name" field.
+    -- Target identity.
     if targetInfo.name then
         speechData:Add("name", targetInfo.name, "brief")
+    end
+
+    -- Active statuses go through the "state" core field which sits
+    -- right after "name" in CORE_FIELD_LIST -- so the formatter
+    -- naturally emits "Intellect Devourer. Threatened. <rest>"
+    -- with status ownership unambiguous (these are the TARGET's
+    -- statuses, made clear by adjacency to the target name) and
+    -- without packing two facts into one field's value.
+    -- FormatStatusesPhrase filters to user-facing statuses (those
+    -- whose DisplayName resolved); INSURFACE / tutorial blockers
+    -- with unresolvable display names are dropped.
+    local statusesPhrase = FormatStatusesPhrase(statuses)
+    if statusesPhrase then
+        speechData:Add("state", statusesPhrase, "normal")
     end
 
     -- Level: flexible property so the formatter emits "Level: 3".
@@ -674,12 +896,20 @@ local function BuildTargetSpeechData(
             "Distance", cursorInfo.distance, "brief")
     end
 
-    -- Damage preview.  XAML value often comes through as "4~9"
-    -- (dice range); rewrite to "4 to 9" for TTS pronounceability.
+    -- Damage preview, labeled with the action name when known so
+    -- the user hears "Guiding Bolt damage: 4 to 24" rather than
+    -- the action and damage as two disconnected fragments.  XAML
+    -- value often comes through as "4~9" (dice range); rewrite to
+    -- "4 to 9" for TTS pronounceability.  Falls back to the bare
+    -- "Damage" label when the action name isn't resolved.
     if cursorInfo.damage and cursorInfo.damage ~= "" then
         local damagePhrase = cursorInfo.damage
             :gsub("(%d+)%s*~%s*(%d+)", "%1 to %2")
-        speechData:AddProperty("Damage", damagePhrase, "brief")
+        local damageLabel = "Damage"
+        if cursorInfo.action and cursorInfo.action ~= "" then
+            damageLabel = cursorInfo.action .. " damage"
+        end
+        speechData:AddProperty(damageLabel, damagePhrase, "brief")
     end
 
     -- Attack-of-opportunity / provoke warning.  "Errors" role holds
@@ -727,19 +957,37 @@ local function BuildTargetSpeechData(
             "Surface", cursorInfo.surface, "brief")
     end
 
-    -- Roll modifiers.  XAML collapses both Advantage and Disadvantage
-    -- rows when both are populated (they cancel on the d20), so at
-    -- most one fires.  The TextBlock text is the literal word
-    -- ("Advantage" / "Disadvantage").  AddProperty produces
-    -- "Roll: Disadvantage".
-    local rollValue = nil
+    -- Roll modifier as a single composite phrase.  XAML collapses
+    -- both Advantage and Disadvantage rows when both populate (they
+    -- cancel on the d20), so at most one mode is in play per
+    -- readout.  When source descriptions are available (read out of
+    -- TargetInfo_c.xaml AdvantagesListHolder / DisadvantagesListHolder
+    -- at lines 224 and 259), they're appended as "from X, Y" so the
+    -- whole roll-state fact reads as one natural phrase:
+    --   "Disadvantage from Threatened"
+    --   "Advantage from High Ground, Pack Tactics"
+    --   "Advantage" (when sources aren't currently rendered, e.g.
+    --                ShowDescription false during cursor exploration)
+    -- Empty label so the formatter speaks just the value -- the
+    -- phrase IS the announcement; a "Roll:" prefix would add
+    -- jargon without adding information, and a separate "Sources"
+    -- property would echo the word.
+    local rollMode = nil
+    local rollSources = nil
     if cursorInfo.advantages then
-        rollValue = cursorInfo.advantages
+        rollMode = cursorInfo.advantages
+        rollSources = advantageList
     elseif cursorInfo.disadvantages then
-        rollValue = cursorInfo.disadvantages
+        rollMode = cursorInfo.disadvantages
+        rollSources = disadvantageList
     end
-    if rollValue then
-        speechData:AddProperty("Roll", rollValue, "brief")
+    if rollMode then
+        local rollPhrase = rollMode
+        if rollSources and #rollSources > 0 then
+            rollPhrase = rollPhrase .. " from "
+                .. table.concat(rollSources, ", ")
+        end
+        speechData:AddProperty("Roll", rollPhrase, "brief")
     end
 
     -- Reason context.  BG3 renders these as unlabeled Runs in
@@ -779,20 +1027,10 @@ local function BuildTargetSpeechData(
             "Warning", cursorInfo.highDefense, "normal")
     end
 
-    -- Capability errors (cannot cast here, missing resources) and
-    -- cannot-heal errors.  Message + cause are separate XAML Runs;
-    -- stitch them into one value so the property speaks as a
-    -- single sentence.
-    local capabilityError = CombineMessageAndCause(
-        cursorInfo.capabilityError, cursorInfo.capabilityCause)
-    if capabilityError then
-        speechData:AddProperty("Cannot", capabilityError, "normal")
-    end
-    local cannotHealError = CombineMessageAndCause(
-        cursorInfo.cannotHealMessage, cursorInfo.cannotHealCause)
-    if cannotHealError then
-        speechData:AddProperty("Cannot", cannotHealError, "normal")
-    end
+    -- (Capability errors and cannot-heal errors moved up into the
+    -- "title" core field above so they front-load and bypass the
+    -- verbosity gate.  See the rejectionParts block at the start
+    -- of this function.)
 
     -- Container state for Move To over a chest/barrel.  Verbose
     -- tier: the information is ambient, not central to target
@@ -802,28 +1040,18 @@ local function BuildTargetSpeechData(
             "Container", cursorInfo.container, "verbose")
     end
 
-    -- Extra TextBlocks from CursorTextList ItemsControl (role="txt"):
-    -- attack-of-opportunity warnings, surface messages, etc.
-    -- These are secondary text that elaborates the current task;
-    -- "additionalDescription" is the core field for "also applies"
-    -- kinds of elaboration.
-    if cursorInfo.cursorInfo then
-        speechData:Add(
-            "additionalDescription", cursorInfo.cursorInfo, "normal")
-    end
+    -- (cursorInfo.cursorInfo / capability errors / cannot-heal errors
+    -- moved up into the "title" core field above so they front-load
+    -- and bypass the verbosity gate.  See the rejectionParts block
+    -- at the start of this function.)
 
-    -- Active status effects with turn counts, read from the target
-    -- entity (authoritative) rather than from TargetInfo_c's XAML.
-    -- The widget renders each status badge with a statusLabel
-    -- TextBlock (status name) and a separate unlabeled TextBlock
-    -- (turns-remaining "Duration"), but BFS interleaves across
-    -- multiple badges so positional pairing is unreliable.  Reading
-    -- entity.StatusContainer + entity.StatusLifetime gives us the
-    -- same information the sighted player sees, paired correctly.
-    local statusesPhrase = FormatStatusesPhrase(statuses)
-    if statusesPhrase then
-        speechData:AddProperty("Statuses", statusesPhrase, "normal")
-    end
+    -- Active status effects with turn counts are appended inline to
+    -- the target name (see the "name" core field setup above), so
+    -- no standalone Statuses property fires here.  This makes the
+    -- status ownership unambiguous in speech ("Intellect Devourer,
+    -- Threatened" rather than the trailing "Statuses: Threatened"
+    -- that read confusingly when the attacker also had the same
+    -- status, e.g. mutual Threatened in melee reach).
 
     -- Status effects overflow ("+3 more") -- verbose; not critical
     -- to target choice but useful when tuning full combat state.
@@ -897,6 +1125,31 @@ local function PerformTargetRead()
     local cursorEntries = ReadWidgetEntries(
         "CursorText_c", CURSOR_TEXT_ANCHOR)
 
+    -- Per-source advantage / disadvantage descriptions read out of
+    -- TargetInfo_c's AdvantagesListHolder / DisadvantagesListHolder.
+    -- Done BEFORE classifying the widget entries so we can build an
+    -- exclude set that prevents the same Description texts from
+    -- double-speaking through the unclassified-reason fallback in
+    -- ClassifyEntries.
+    local advantageList = ReadModifierItemList(
+        ADVANTAGES_HOLDER_ANCHOR, "advantages")
+    local disadvantageList = ReadModifierItemList(
+        DISADVANTAGES_HOLDER_ANCHOR, "disadvantages")
+    local advDisadvExcludeSet = nil
+    if advantageList or disadvantageList then
+        advDisadvExcludeSet = {}
+        if advantageList then
+            for _, advantageText in ipairs(advantageList) do
+                advDisadvExcludeSet[advantageText] = true
+            end
+        end
+        if disadvantageList then
+            for _, disadvantageText in ipairs(disadvantageList) do
+                advDisadvExcludeSet[disadvantageText] = true
+            end
+        end
+    end
+
     -- BOTH widgets capture unlabeled Runs as reasonText.  Reason
     -- text (e.g. "Target is too close", "Not enough movement in the
     -- target area", "Can't reach destination") can surface in
@@ -904,12 +1157,16 @@ local function PerformTargetRead()
     -- (txt items / TaskDescription siblings) depending on what the
     -- game decided to render.  ClassifyEntries already filters the
     -- noise (bare-digit Duration badges from NamedStatusTemplate,
-    -- 1-2 char XAML separators, statusLabel echoes).
+    -- 1-2 char XAML separators, statusLabel echoes); we additionally
+    -- pass the advantage/disadvantage texts so the per-source
+    -- properties above own those strings cleanly.
     local targetInfo = ClassifyEntries(
-        targetEntries, TARGET_INFO_ROLES, nil, true)
+        targetEntries, TARGET_INFO_ROLES, nil, true,
+        advDisadvExcludeSet)
     local cursorInfo = ClassifyEntries(
         cursorEntries, CURSOR_TEXT_ROLES,
-        PARENT_ROLE_TO_LABEL, true)
+        PARENT_ROLE_TO_LABEL, true,
+        advDisadvExcludeSet)
 
     -- Resolve target name to an entity handle by scanning the
     -- turn-order pool.  The widget gives us a display name but not
@@ -947,6 +1204,7 @@ local function PerformTargetRead()
             end
         end
     end
+
     -- Record freshness timestamp so the effects view can decide
     -- whether the cached target is still current.  Set even when
     -- entity resolution fails so the "target selected but not
@@ -978,7 +1236,8 @@ local function PerformTargetRead()
     end
 
     local speechData = BuildTargetSpeechData(
-        targetInfo, cursorInfo, entityStatuses)
+        targetInfo, cursorInfo, entityStatuses,
+        advantageList, disadvantageList)
     if not speechData then
         Log.Info("TARGET READ: no speakable data (widgets produced"
             .. " no classifiable entries)")
@@ -1080,6 +1339,20 @@ end
 local function OnButtonInput(event)
     if not event.Pressed then return end
     local buttonName = tostring(event.Button)
+    -- A-press: confirm the cast.  If the most recent target read
+    -- recorded a rejection (out-of-range, can't target self, etc.),
+    -- the game will silently refuse the press -- so we interrupt
+    -- and speak the reason.  Only fires when we KNOW about a
+    -- rejection; valid casts stay silent on A and let the existing
+    -- HitResultEvent path announce the outcome.  Same gate as DPad
+    -- (combat + local turn + no menu/CC) so we don't speak in
+    -- contexts where A means something other than "cast".
+    if buttonName == "ButtonA" then
+        if lastRejectionText and ShouldHandleDPad() then
+            SpeechData.Alert(lastRejectionText, "interrupt")
+        end
+        return
+    end
     if buttonName ~= "DPadLeft" and buttonName ~= "DPadRight" then
         return
     end
@@ -1406,6 +1679,7 @@ BG3Access.Client.TargetSelect = {
         lastTargetName = nil
         lastTargetEntityUuid = nil
         lastTargetReadAtMs = 0
+        lastRejectionText = nil
     end,
 
     --- Clear the cached target only if the UUID matches.  Called

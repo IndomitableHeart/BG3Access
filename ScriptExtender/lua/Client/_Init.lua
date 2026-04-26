@@ -21,5 +21,6 @@ BG3Access.Shared.RequireFiles("Client/", {
 "TargetSelect",
 "Subregion",
 "WorldNav",
+"HUDReader",
 "EventRouter",
 })
