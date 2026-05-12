@@ -43,8 +43,17 @@ local STATUS_PROPS = {
 -- ---------------------------------------------------------------------------
 local function StripMarkupTags(text)
     if not text then return text end
+    -- Replace each tag with a space so adjacent words don't smash
+    -- together (e.g., "an<LSTag>Attack Roll</LSTag>" -> "an Attack Roll").
     local result = text:gsub("<[^>]+>", " ")
+    -- Collapse multiple spaces into one.
     result = result:gsub("%s+", " ")
+    -- Strip whitespace that ended up immediately BEFORE common
+    -- punctuation: when the original was "...<LSTag>X</LSTag>, ..." the
+    -- tag-strip produced "...X , ...", which screen readers verbalize
+    -- with an awkward pause-before-comma.  Removes spaces preceding
+    -- comma, period, semicolon, colon, exclamation, question mark.
+    result = result:gsub("%s+([%.,;:!%?])", "%1")
     return result:match("^%s*(.-)%s*$") or result
 end
 
@@ -493,7 +502,7 @@ end
 -- Extract speech text from a data table.
 -- Priority: dcProps (ViewModel text) > elemText (rendered text).
 -- ---------------------------------------------------------------------------
-local function ExtractTextFromData(data, lastSpokenTab, tabFlushPending)
+local function ExtractTextFromData(data, currentTabContext, tabFlushPending)
     if not data then return nil end
 
     local dcText = FormatDCText(data.dcProps)

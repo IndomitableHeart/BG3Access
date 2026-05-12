@@ -358,6 +358,152 @@ local function GetCharacterHitpoints(characterGuid)
     return nil
 end
 
+-- HP cache fed by Osiris HitpointsChanged.  Robust workaround for the
+-- engine timing race that affects HitResultEvent: the engine commits
+-- direct-hit damage to the HealthComponent BEFORE firing the
+-- HitResultEvent, but commits status-tick / surface-tick damage AFTER
+-- (sometimes 2+ ticks after).  Reading HealthComponent directly in
+-- our event handler -- even with Ext.OnNextTick deferral -- can
+-- therefore return stale HP for tick-style damage, producing the bug
+-- where two back-to-back hits both report the same "X of N remaining"
+-- when the second should be N - first - second.
+--
+-- Strategy: subscribe to HitpointsChanged (Osiris arity 2: character,
+-- newHp) and stamp the latest authoritative HP per entity UUID.  The
+-- HitResultEvent relay then prefers this cached value over the live
+-- component read, falling back to the component only when the entity
+-- hasn't been seen yet (first hit of combat, just-spawned, etc.).
+-- HitpointsChanged fires synchronously with the engine's HP commit,
+-- so by the time our deferred relay runs (~2 ticks after the event),
+-- the cache holds the post-damage value regardless of which damage
+-- pipeline produced it.
+--
+-- maxHp doesn't change on damage (only level up / temp-HP boons), so
+-- we capture it from the entity component when we first cache an
+-- entry and refresh it on subsequent updates.
+local latestHpByUuid = {}
+
+-- HitpointsChanged Osiris arg2 is a PERCENTAGE (0-100), not the
+-- absolute HP value -- verified empirically: cache reads showed
+-- "13.333333969116 of 15 remaining" for an enemy at 2/15 (which is
+-- 100 * 2 / 15 = 13.33%).  We ignore the arg entirely and instead
+-- read the live HealthComponent at the moment the event fires --
+-- the engine has just committed the new value, so the component
+-- holds the authoritative absolute HP.  This sidesteps the
+-- percentage-vs-absolute confusion AND uses the same field the
+-- target select pipeline reads later for consistency.
+Ext.Osiris.RegisterListener("HitpointsChanged", 2, "after",
+    function(characterGuid, _newHpPercent)
+        local uuidStr = tostring(characterGuid)
+        local hitpoints = GetCharacterHitpoints(characterGuid)
+        if hitpoints then
+            latestHpByUuid[uuidStr] = {
+                hp    = hitpoints.hp,
+                maxHp = hitpoints.maxHp,
+            }
+        end
+    end)
+
+--- Resolve an entity reference (UUID string, EntityHandle userdata,
+--- or already-resolved entity table) to a canonical UUID string.
+--- Used to key the HP cache uniformly regardless of which Osiris /
+--- ECS path delivered the reference -- HitpointsChanged supplies a
+--- CHARACTERGUID UUID, HitResultEvent supplies an EntityHandle, and
+--- we need both lookups to hit the same cache slot.
+local function EntityRefToUuid(entityRef)
+    if entityRef == nil then return nil end
+    -- Osiris CHARACTERGUIDs / ITEMGUIDs / etc. come through as
+    -- strings prefixed with the template name, e.g.
+    --   "Elves_Male_High_Player_35219604-4ea5-3c89-fa42-dc5ecf306f8c"
+    --   "S_CRA_Escape_IntDevourer2_a2838af7-698b-8761-2004-d118d80cf848"
+    -- ...while the EntityHandle-resolved path returns the BARE
+    -- UUID ("35219604-...").  We must strip the prefix so both
+    -- paths produce the same canonical UUID and burst-key lookups
+    -- match.  Match the trailing 8-4-4-4-12 hex group as the UUID;
+    -- if no match, fall back to "string contains a dash" as a final
+    -- safety net.
+    if type(entityRef) == "string" then
+        local uuidPart = entityRef:match(
+            "(%x+%-%x+%-%x+%-%x+%-%x+)$")
+        if uuidPart then return uuidPart end
+        if entityRef:find("-") then return entityRef end
+    end
+    local resolveOk, uuid = pcall(function()
+        local entity = Ext.Entity.Get(entityRef)
+        if not entity or not entity.Uuid then return nil end
+        return tostring(entity.Uuid.EntityUuid)
+    end)
+    if resolveOk and uuid then return uuid end
+    return nil
+end
+
+--- Read the cached HP for an entity, falling back to a live component
+--- read when the entity hasn't been seen by HitpointsChanged yet.
+--- Returns the same {hp, maxHp} shape as GetCharacterHitpoints.
+--- Accepts a UUID string OR an EntityHandle -- normalizes through
+--- EntityRefToUuid so both Osiris (UUID) and HitResultEvent
+--- (EntityHandle) callers hit the same cache.
+local function GetCachedOrLiveHitpoints(entityRef)
+    local uuidStr = EntityRefToUuid(entityRef)
+    if uuidStr then
+        local cached = latestHpByUuid[uuidStr]
+        if cached and cached.hp ~= nil and cached.maxHp ~= nil then
+            return { hp = cached.hp, maxHp = cached.maxHp }
+        end
+    end
+    return GetCharacterHitpoints(entityRef)
+end
+
+-- Pending damage bursts (HitResultEvent aggregation).  Defined here,
+-- before the AttackedBy / MissedBy listeners, so those listeners can
+-- check whether a burst is in flight for the same (attacker,
+-- defender) pair and suppress their relay -- otherwise the engine's
+-- followup AttackedBy / MissedBy events would speak alongside the
+-- burst's CombatHit announcement, doubling up.  Filled by
+-- EnqueueDamageBurst (defined later); consumed by FlushDamageBurst
+-- (also later) which clears the entry.
+local pendingDamageBursts = {}
+
+--- Build the burst key for a given (attacker, defender) pair.  The
+--- AttackedBy / MissedBy Osiris listeners receive CHARACTERGUID
+--- strings (UUIDs); EnqueueDamageBurst receives EntityHandles and
+--- resolves them through EntityRefToUuid -- both paths produce the
+--- same canonical UUID string, so the same key composition lookups
+--- the same slot.
+local function ComposeBurstKey(attackerRef, defenderRef)
+    local attackerUuid = EntityRefToUuid(attackerRef)
+    local defenderUuid = EntityRefToUuid(defenderRef)
+    if not attackerUuid or not defenderUuid then return nil end
+    return attackerUuid .. "::" .. defenderUuid
+end
+
+--- Returns true if a HitResultEvent burst is currently pending
+--- (enqueued but not yet flushed) for the given attacker/defender
+--- pair.  AttackedBy and MissedBy use this to suppress their relay
+--- when the burst will emit a coherent CombatHit announcement.
+local function IsBurstPendingForPair(attackerRef, defenderRef)
+    local burstKey = ComposeBurstKey(attackerRef, defenderRef)
+    if not burstKey then return false end
+    return pendingDamageBursts[burstKey] ~= nil
+end
+
+--- Schedule a callback to run after `tickCount` game ticks, chaining
+--- Ext.OnNextTick.  Used by the HitResultEvent relay to wait long
+--- enough for both the synchronous-commit and deferred-commit damage
+--- paths to land in the HitpointsChanged cache before reading.
+local function DeferredAfterTicks(tickCount, callback)
+    local remaining = tickCount
+    local function step()
+        remaining = remaining - 1
+        if remaining <= 0 then
+            callback()
+        else
+            Ext.OnNextTick(step)
+        end
+    end
+    Ext.OnNextTick(step)
+end
+
 --- Check whether a character GUID belongs to a player party member.
 local function IsPartyMember(characterGuid)
     local checkOk, checkResult = pcall(function()
@@ -427,9 +573,22 @@ Ext.Osiris.RegisterListener("TurnStarted", 1, "after",
         })
     end)
 
+-- Server-side combat-active tracking.  Used to gate the enemy-action
+-- declaration relays (UsingSpell* / StartAttack) so we don't announce
+-- every ambient NPC casting Light in a tavern.  Counter rather than
+-- boolean to handle simultaneous combats (rare but possible in BG3
+-- when two encounters trigger overlapping).  Math.max guards against
+-- underflow if a CombatEnded fires without a prior CombatStarted
+-- (e.g., savegame loaded mid-combat).
+local activeCombatCount = 0
+local function IsAnyCombatActive()
+    return activeCombatCount > 0
+end
+
 -- Combat started.
 Ext.Osiris.RegisterListener("CombatStarted", 1, "after",
     function(combatGuid)
+        activeCombatCount = activeCombatCount + 1
         RelayCombatEvent({
             event = "CombatStarted",
             combatGuid = tostring(combatGuid),
@@ -439,6 +598,7 @@ Ext.Osiris.RegisterListener("CombatStarted", 1, "after",
 -- Combat ended.
 Ext.Osiris.RegisterListener("CombatEnded", 1, "after",
     function(combatGuid)
+        activeCombatCount = math.max(0, activeCombatCount - 1)
         RelayCombatEvent({
             event = "CombatEnded",
             combatGuid = tostring(combatGuid),
@@ -509,13 +669,29 @@ Ext.Osiris.RegisterListener("StatusRemoved", 4, "after",
 Ext.Osiris.RegisterListener("AttackedBy", 7, "after",
     function(defender, attackerOwner, attacker2,
              damageType, damageAmount, damageCause, storyActionId)
+        -- Suppress when a HitResultEvent burst is pending for the
+        -- same (attacker, defender) pair.  The engine fires an
+        -- AttackedBy event alongside every HitResultEvent (and
+        -- sometimes again per damage sub-instance).  When a burst
+        -- is in flight, the burst will emit a coherent CombatHit
+        -- announcement at flush time covering all the damage --
+        -- letting AttackedBy speak in the meantime would double up.
+        if IsBurstPendingForPair(attackerOwner, defender) then
+            return
+        end
+
         local defenderIsParty = IsPartyMember(defender)
         local attackerIsParty = IsPartyMember(attackerOwner)
         if not defenderIsParty and not attackerIsParty then return end
 
         local defenderName = GetCharacterName(defender)
         local attackerName = GetCharacterName(attackerOwner)
-        local defenderHp = GetCharacterHitpoints(defender)
+        -- Prefer the HitpointsChanged-fed cache so the HP read is at
+        -- least as fresh as the latest engine commit.  AttackedBy is
+        -- usually deduped against the CombatHit fired for the same
+        -- damage, but the fallback path (when dedup misses) could
+        -- otherwise read pre-commit HP for status / surface ticks.
+        local defenderHp = GetCachedOrLiveHitpoints(defender)
         RelayCombatEvent({
             event = "AttackedBy",
             defenderGuid = tostring(defender),
@@ -538,6 +714,14 @@ Ext.Osiris.RegisterListener("AttackedBy", 7, "after",
 -- (defender, attackerOwner, attacker, storyActionId) -- 4 args.
 Ext.Osiris.RegisterListener("MissedBy", 4, "after",
     function(defender, attackerOwner, attacker, storyActionId)
+        -- Same suppression rationale as AttackedBy: when a
+        -- HitResultEvent burst is pending for this pair, the burst
+        -- will emit the miss announcement at flush time.  Letting
+        -- MissedBy speak in the meantime would double up.
+        if IsBurstPendingForPair(attackerOwner, defender) then
+            return
+        end
+
         local defenderIsParty = IsPartyMember(defender)
         local attackerIsParty = IsPartyMember(attackerOwner)
         if not defenderIsParty and not attackerIsParty then return end
@@ -992,10 +1176,24 @@ end
 -- ---------------------------------------------------------------------------
 local function GetSpellDisplayName(spellId)
     if spellId == nil then return nil end
-    local prototypeOk, prototype = pcall(function()
-        return tostring(spellId.Prototype or "")
-    end)
-    if not prototypeOk or not prototype or prototype == "" then
+    -- Two callers shape this differently:
+    --   * ServerRollStartSpellRequest / SpellCastEvent components pass
+    --     a SpellId object with a .Prototype field.
+    --   * Osiris event listeners (UsingSpell*, CastSpell*, etc.) pass
+    --     spellId as a plain FixedString like "Target_FireBolt".
+    -- Accept both: if it's already a string, use it as the prototype;
+    -- otherwise look up .Prototype on the object.
+    local prototype
+    if type(spellId) == "string" then
+        prototype = spellId
+    else
+        local prototypeOk, prototypeValue = pcall(function()
+            return tostring(spellId.Prototype or "")
+        end)
+        if not prototypeOk then return nil end
+        prototype = prototypeValue
+    end
+    if not prototype or prototype == "" then
         return nil
     end
     local cachedOk, cached = pcall(Ext.Stats.GetCachedSpell, prototype)
@@ -1161,6 +1359,138 @@ else
 end
 
 -- ---------------------------------------------------------------------------
+-- Enemy action declaration relay (UsingSpell* / StartAttack).
+--
+-- HitResultEvent / AttackedBy / MissedBy tell us OUTCOMES (X hit Y for
+-- 5, X missed Y).  Sighted players ALSO see the action being declared
+-- BEFORE resolution: a spell name pops over the caster, the attack
+-- animation starts.  For a blind player tracking what enemies are
+-- doing on their turn, that pre-resolution announcement is the gap.
+--
+-- Filters:
+--   1. IsAnyCombatActive() -- skip ambient NPC casts in towns,
+--      cinematic spells, etc.  Counter is maintained by the
+--      CombatStarted / CombatEnded listeners above.
+--   2. Skip party-controlled casters.  When the player casts Fire
+--      Bolt the radial menu already announced it; an additional
+--      "Tav cast Fire Bolt" here would just repeat it.  Enemy /
+--      NPC casts ARE the gap we're closing.
+--
+-- Spell signature notes (Osiris arities verified against decompiled
+-- D:\extracted packs\Osi):
+--   * UsingSpellOnTarget(caster, target, spellId, _, _, _)        -> arity 6
+--   * UsingSpell(caster, spellId, _, _, _)                          -> arity 5
+--   * StartAttack(_, _, attacker, target)                            -> arity 4
+--     (positions 1+2 are story / template IDs, position 3 is the
+--      actual character per the IsCharacter / PROC_TryStartNPCAttackAD
+--      consumption pattern in story.div.osi)
+--   * UsingSpellOnZoneWithTarget exists with arity 6 but the
+--     argument layout was not unambiguous from the decompile;
+--     intentionally not subscribed yet to avoid mis-naming the spell.
+-- ---------------------------------------------------------------------------
+
+--- Resolve an Osiris-delivered spell prototype string to a
+--- player-facing display name, falling back to the prototype itself
+--- when the lookup fails.  Plain wrapper around GetSpellDisplayName;
+--- the wrapper exists so the listener bodies stay readable.
+local function ResolveSpellNameOrPrototype(spellId)
+    local resolved = GetSpellDisplayName(spellId)
+    if resolved and resolved ~= "" then return resolved end
+    return tostring(spellId or "")
+end
+
+-- Dedup state: BG3's engine fires BOTH UsingSpell AND
+-- UsingSpellOnTarget for a targeted cast (verified empirically:
+-- "Intellect Devourer cast Claws" + "cast Claws on Tav" both fired
+-- on every melee attack).  For untargeted casts (Dash, self-buffs)
+-- only UsingSpell fires.  We want one announcement per cast, with
+-- the target included whenever available.
+--
+-- Strategy: relay UsingSpellOnTarget synchronously (it carries the
+-- richer info), and stamp recentTargetedCastKey with the
+-- caster::spell pair.  Defer UsingSpell relay one tick via
+-- Ext.OnNextTick; in that handler, check whether a targeted version
+-- for the same caster+spell stamped the key during the same frame.
+-- If so, skip -- the targeted relay already announced this cast.
+-- If not, relay as an untargeted cast.
+local recentTargetedCastKey = nil
+local recentTargetedCastTimeMs = 0
+local TARGETED_CAST_DEDUP_WINDOW_MS = 100
+
+-- Spell cast on a specific target (single-target spells: Mind Blast,
+-- Fire Bolt, Vicious Mockery, Knock, etc., AND every melee attack
+-- in BG3 because attacks are spells in the engine).
+Ext.Osiris.RegisterListener("UsingSpellOnTarget", 6, "after",
+    function(caster, target, spellId, _magicType, _spellType, _storyActionId)
+        if not IsAnyCombatActive() then return end
+        if IsPartyMember(caster) then return end
+        recentTargetedCastKey =
+            tostring(caster) .. "::" .. tostring(spellId)
+        recentTargetedCastTimeMs = Ext.Utils.MonotonicTime()
+        local casterName = GetCharacterName(caster)
+        local targetName = GetCharacterName(target)
+        local spellName = ResolveSpellNameOrPrototype(spellId)
+        RelayCombatEvent({
+            event         = "SpellCastDeclared",
+            casterGuid    = tostring(caster),
+            casterName    = casterName,
+            casterIsParty = false,
+            targetGuid    = tostring(target),
+            targetName    = targetName,
+            targetIsParty = IsPartyMember(target),
+            spellName     = spellName,
+        })
+    end)
+
+-- Spell cast with no explicit target (self-buffs, dashes, untargeted
+-- shouts).  Deferred one tick to dedup against UsingSpellOnTarget --
+-- see comment block above.
+Ext.Osiris.RegisterListener("UsingSpell", 5, "after",
+    function(caster, spellId, _magicType, _spellType, _storyActionId)
+        if not IsAnyCombatActive() then return end
+        if IsPartyMember(caster) then return end
+        local capturedCaster = caster
+        local capturedSpellId = spellId
+        Ext.OnNextTick(function()
+            local thisKey = tostring(capturedCaster)
+                .. "::" .. tostring(capturedSpellId)
+            if recentTargetedCastKey == thisKey then
+                local age = Ext.Utils.MonotonicTime()
+                    - recentTargetedCastTimeMs
+                if age <= TARGETED_CAST_DEDUP_WINDOW_MS then
+                    return  -- targeted version already announced
+                end
+            end
+            local casterName = GetCharacterName(capturedCaster)
+            local spellName = ResolveSpellNameOrPrototype(capturedSpellId)
+            RelayCombatEvent({
+                event         = "SpellCastDeclared",
+                casterGuid    = tostring(capturedCaster),
+                casterName    = casterName,
+                casterIsParty = false,
+                spellName     = spellName,
+            })
+        end)
+    end)
+
+-- StartAttack listener intentionally NOT registered.  In BG3 every
+-- action is modelled as a spell in the engine's data layer (Main
+-- Hand Attack, Claws, Shove, Help, etc. all fire UsingSpell* events
+-- with their own spell prototypes).  StartAttack therefore fires
+-- redundantly alongside UsingSpellOnTarget for melee attacks --
+-- producing duplicate announcements -- and its arg layout
+-- (positions 3+4 from the decompile pattern) does not actually
+-- carry the target entity in arg 4 the way an initial reading of
+-- PROC_TryStartNPCAttackAD(_Var3, _Var4) suggested.  Empirically the
+-- defender came back as "Unknown" via GetCharacterName, confirming
+-- arg 4 is some other ID (story action / weapon / template).
+-- Subscribing UsingSpellOnTarget alone gives us the action name
+-- AND a reliable target.
+
+_P("BG3Access: Action declaration relay registered "
+    .. "(UsingSpellOnTarget, UsingSpell)")
+
+-- ---------------------------------------------------------------------------
 -- Combat attack-hit relay (HitResultEvent).
 --
 -- Combat attack rolls (Fire Bolt, melee swings, weapon attacks, spell
@@ -1288,6 +1618,174 @@ local function SummarizeDamageList(damageList)
     return perType, total
 end
 
+--- DiceSizeId enum (Stats.inl:472) -> integer die size.  D100 maps
+--- to 100; Default falls back to nil so the formatter can suppress
+--- the dice phrase for static / non-rolled damage.
+local DICE_SIZE_BY_ENUM_NAME = {
+    D4   = 4,
+    D6   = 6,
+    D8   = 8,
+    D10  = 10,
+    D12  = 12,
+    D20  = 20,
+    D100 = 100,
+}
+
+--- Walk hitDesc.Damage.DamageRolls -- a LegacyRefMap<DamageType,
+--- Array<StatsRoll>> exposed in Hit.h:138 -- and return a flat
+--- array of {damageType, diceCount, diceSize, modifier, naturalRoll,
+--- total, isNegative} entries.  Used by the verbose-tier client
+--- formatter to read out the dice breakdown ("rolled 2 on 1d4 plus 2
+--- for 4 slashing").  Returns an empty array when the map is missing
+--- or empty (e.g. surface ticks, status ticks without a roll).
+---
+--- Field paths verified against Hit.h:
+---   StatsRoll.Roll              -> Roll struct (Hit.h:30)
+---   Roll.Roll                   -> RollDefinition (ExposedTypes.h:66)
+---   RollDefinition.DiceValue    -> DiceSizeId enum
+---   RollDefinition.AmountOfDices -> uint8_t
+---   RollDefinition.DiceAdditionalValue -> int (the static "+N" / "-N")
+---   RollDefinition.DiceNegative -> bool (healing rolls, etc.)
+---   StatsRoll.Result.NaturalRoll -> int (sum of all dice this roll)
+---   StatsRoll.Result.Total       -> int (NaturalRoll + modifier, post-crit)
+--- Decode a single StatsRoll into our flat record format, or nil
+--- if the roll is a placeholder (no dice, no modifier, no natural).
+--- Shared between the DamageRolls path (weapon damage) and the
+--- StatsExpressionResolved.RollParams path (spell damage / modifiers).
+local function DecodeStatsRoll(statsRoll, damageTypeName)
+    if not statsRoll then return nil end
+    local rollDef = SafeIndex(statsRoll, "Roll", "Roll")
+    local rollResult = SafeIndex(statsRoll, "Result")
+    if not rollDef or not rollResult then return nil end
+    local diceCount = tonumber(SafeIndex(
+        rollDef, "AmountOfDices")) or 0
+    local diceSizeName = EnumName("DiceSizeId",
+        SafeIndex(rollDef, "DiceValue"))
+    local diceSize = DICE_SIZE_BY_ENUM_NAME[diceSizeName]
+    local modifier = tonumber(SafeIndex(
+        rollDef, "DiceAdditionalValue")) or 0
+    local naturalRoll = tonumber(SafeIndex(
+        rollResult, "NaturalRoll")) or 0
+    local total = tonumber(SafeIndex(
+        rollResult, "Total")) or 0
+    local isNegative = SafeIndex(rollDef, "DiceNegative") == true
+    -- Skip roll definitions that have neither dice
+    -- nor a modifier -- those are placeholder entries
+    -- the engine sometimes emits for non-rolled damage.
+    if diceCount == 0 and modifier == 0 and naturalRoll == 0 then
+        return nil
+    end
+    return {
+        damageType  = damageTypeName or "Damage",
+        diceCount   = diceCount,
+        diceSize    = diceSize,
+        modifier    = modifier,
+        naturalRoll = naturalRoll,
+        total       = total,
+        isNegative  = isNegative,
+    }
+end
+
+--- Walk a StatsExpressionResolved.RollParams array and append any
+--- non-placeholder StatsRolls into result.  Used by the spell-
+--- damage path: when a spell's damage formula resolves, the dice
+--- it rolled live in StatsExpressionResolved.RollParams (Hit.h:93).
+local function HarvestExpressionRolls(expressionResolved, damageTypeName, result)
+    if not expressionResolved then return end
+    local rollParams = SafeIndex(expressionResolved, "RollParams")
+    if not rollParams then return end
+    local rollCount = 0
+    pcall(function() rollCount = #rollParams end)
+    for rollIndex = 1, rollCount do
+        local decoded = DecodeStatsRoll(rollParams[rollIndex], damageTypeName)
+        if decoded then result[#result + 1] = decoded end
+    end
+end
+
+local function ExtractDamageRolls(hitDesc)
+    local result = {}
+    local statsDamage = SafeIndex(hitDesc, "Damage")
+    if not statsDamage then return result end
+
+    -- Path A: DamageRolls map (weapon damage).
+    -- LegacyRefMap<DamageType, Array<StatsRoll>>: each damage type
+    -- has its own array of rolled instances.
+    local damageRolls = SafeIndex(statsDamage, "DamageRolls")
+    if damageRolls then
+        -- LegacyRefMap iterates with pairs(); guard with pcall in case
+        -- the binding emits a userdata that doesn't support __pairs.
+        local pairsOk, pairsIter = pcall(function()
+            local outerEntries = {}
+            for damageTypeKey, statsRollArray in pairs(damageRolls) do
+                outerEntries[#outerEntries + 1] = {
+                    damageTypeKey = damageTypeKey,
+                    statsRollArray = statsRollArray,
+                }
+            end
+            return outerEntries
+        end)
+        if pairsOk and pairsIter then
+            for _, mapEntry in ipairs(pairsIter) do
+                local typeName = EnumName("DamageType", mapEntry.damageTypeKey)
+                if typeName == "" then typeName = "Damage" end
+                local statsRollArray = mapEntry.statsRollArray
+                local rollCount = 0
+                pcall(function() rollCount = #statsRollArray end)
+                for rollIndex = 1, rollCount do
+                    local decoded = DecodeStatsRoll(
+                        statsRollArray[rollIndex], typeName)
+                    if decoded then
+                        result[#result + 1] = decoded
+                    end
+                end
+            end
+        end
+    end
+
+    -- Path B: ConditionRoll.RollParams (spell-formula damage).
+    -- For spells, DealDamageFunctor.Damage is a StatsExpressionRef
+    -- (Functors.h:379); when the engine resolves the expression
+    -- (e.g. "DealDamage(1d10, Fire)" for Fire Bolt), the rolled
+    -- dice land in StatsDamage.ConditionRoll.RollParams as
+    -- StatsRoll entries (Hit.h:93, ExtIdeHelpers.lua:6499).
+    if #result == 0 then
+        local conditionRoll = SafeIndex(statsDamage, "ConditionRoll")
+        local primaryDamageType = EnumName("DamageType",
+            SafeIndex(hitDesc, "DamageType"))
+        if primaryDamageType == "" then primaryDamageType = "Damage" end
+        HarvestExpressionRolls(conditionRoll, primaryDamageType, result)
+    end
+
+    -- Path C: Modifiers[].Source / Modifiers2[].Source (boost-driven
+    -- contributions: Bless +1d4, Sneak Attack +Nd6, etc., as well
+    -- as some spell paths).  DamageModifierMetadata.Source is a
+    -- variant<int32, RollDefinition, StatsExpressionResolved>;
+    -- only the StatsExpressionResolved arm has rolls.
+    local function harvestModifierArray(modifierArray)
+        if not modifierArray then return end
+        local modCount = 0
+        pcall(function() modCount = #modifierArray end)
+        for modIndex = 1, modCount do
+            local modifier = modifierArray[modIndex]
+            if modifier then
+                local source = SafeIndex(modifier, "Source")
+                if source then
+                    local typeName = EnumName("DamageType",
+                        SafeIndex(modifier, "DamageType"))
+                    if typeName == "" then typeName = "Damage" end
+                    HarvestExpressionRolls(source, typeName, result)
+                end
+            end
+        end
+    end
+    if #result == 0 then
+        harvestModifierArray(SafeIndex(statsDamage, "Modifiers"))
+        harvestModifierArray(SafeIndex(statsDamage, "Modifiers2"))
+    end
+
+    return result
+end
+
 --- Build a compact string describing an attack's damage for the
 --- client formatter, e.g. "9 fire" or "4 fire, 3 piercing".  The
 --- client composes this into the full announcement; we keep it as
@@ -1316,6 +1814,199 @@ local function FormatDamageBreakdown(perType, total)
 end
 
 --- Relay a single HitResultEvent to the client.
+-- ============================================================================
+-- Combat damage burst aggregation
+--
+-- The engine fires a separate HitResultEvent for each damage instance:
+-- the direct hit of an attack, then any followup status / surface ticks
+-- that hit the same target in the same frame.  Example for Fire Bolt:
+--   HitResultEvent #1: cause=Attack, damage=5 fire (Fire Bolt direct)
+--   HitResultEvent #2: cause=StatusTick statusId=BURNING, damage=2 fire
+-- Both fire on tick N, both with attacker=Tav, target=Devourer.
+--
+-- Speaking these as two separate sentences with per-event "X of N
+-- remaining" requires correlating each HitResultEvent to its
+-- corresponding HealthComponent commit, which the engine doesn't
+-- expose.  Reading HealthComponent at deferred time gives the FINAL
+-- HP (post all events) for both, producing identical "3 of 15
+-- remaining" twice.
+--
+-- Better unit of meaning: the *burst*.  Buffer all HitResultEvents
+-- for the same (attacker, defender) pair on the same tick; flush
+-- via Ext.OnNextTick (1 tick later, after every commit has landed).
+-- Flush reads the engine's final HP once -- authoritative -- and
+-- emits a single CombatBurst event:
+--   "Tav, rolled 19 plus 3 total 22, hit Intellect Devourer,
+--    for 5 fire damage plus 2 fire damage from Burning,
+--    3 of 15 remaining"
+--
+-- The pendingDamageBursts table and EntityRefToUuid helper are
+-- declared earlier in the file so AttackedBy / MissedBy can check
+-- IsBurstPendingForPair before relaying.  See those declarations
+-- above.
+-- ============================================================================
+
+local function FlushDamageBurst(burstKey)
+    local burst = pendingDamageBursts[burstKey]
+    pendingDamageBursts[burstKey] = nil
+    if not burst or #burst.events == 0 then return end
+
+    -- Final HP read at flush time.  The engine has committed every
+    -- HP change for every HitResultEvent in this burst by now, so
+    -- the HealthComponent value is authoritative for the burst's
+    -- final state.  No math, no estimation.
+    local hitpoints = GetCharacterHitpoints(burst.defenderHandle)
+    local defenderHp = hitpoints and hitpoints.hp or nil
+    local defenderMaxHp = hitpoints and hitpoints.maxHp or nil
+
+    -- Diagnostic: summarize the burst (cause types + damages + source).
+    -- spellId is non-empty for bonus-damage events (Sneak Attack,
+    -- Smite, Hex, etc.) and for primary spell hits; empty for plain
+    -- weapon attacks.  Logging it helps identify which feature
+    -- triggered an unexpected extra die.
+    local causeSummary = {}
+    for _, ev in ipairs(burst.events) do
+        local entry = ev.causeType
+            .. "(" .. tostring(ev.damageAmount) .. ")"
+        if ev.spellId and ev.spellId ~= "" then
+            entry = entry .. "[" .. ev.spellId .. "]"
+        end
+        causeSummary[#causeSummary + 1] = entry
+    end
+    _P("BG3Access:   DamageBurst attacker=" .. burst.events[1].attackerName
+        .. " defender=" .. burst.events[1].targetName
+        .. " events=[" .. table.concat(causeSummary, ",") .. "]"
+        .. " finalHp=" .. tostring(defenderHp) .. "/"
+        .. tostring(defenderMaxHp))
+
+    -- Emit each event as its own CombatHit -- two short natural
+    -- sentences read better than one cluttered combined sentence,
+    -- and avoid the "X of N remaining" repetition we'd get if every
+    -- event reported HP.  Only the LAST event in the burst includes
+    -- the HP suffix -- that's where the engine's final committed HP
+    -- is meaningful.  Earlier events skip HP entirely (defenderHp=nil
+    -- → client suppresses the suffix).  Net effect for Fire Bolt +
+    -- Burning:
+    --   "Tav, rolled 18 plus 3 total 21, hit Intellect Devourer,
+    --    for 1 fire damage"
+    --   "Burning, dealt 2 fire damage to Intellect Devourer,
+    --    7 of 15 remaining"
+    -- The user hears each engine event reported, no HP repeated,
+    -- final HP shown after the chain settles.
+    -- Bonus-damage detection: when the burst contains multiple
+    -- attack-like events, the second and later ones are damage
+    -- instances piggybacking on the same swing (Sneak Attack,
+    -- Smite, magic-weapon procs, Hex/Hunter's Mark).  Mark them so
+    -- the client can format as "plus N piercing from Sneak Attack"
+    -- rather than re-announcing "Tav, hit Intellect Devourer" for
+    -- every die.  Status/surface ticks (Burning, fire surface) are
+    -- NOT attack-like; those keep their independent announcement
+    -- because they're attributed to the status/surface, not the
+    -- attacker (e.g. "Burning, dealt 2 fire damage").
+    local ATTACK_LIKE_CAUSES = {
+        Attack = true, Offhand = true, AURA = true,
+        InventoryItem = true, WorldItemThrow = true, None = true,
+    }
+    local seenAttackLike = false
+    for _, ev in ipairs(burst.events) do
+        if ATTACK_LIKE_CAUSES[ev.causeType] then
+            if seenAttackLike then
+                ev.isBonusDamage = true
+            else
+                seenAttackLike = true
+            end
+        end
+    end
+
+    local lastIndex = #burst.events
+    for i, ev in ipairs(burst.events) do
+        ev.event = "CombatHit"
+        if i == lastIndex then
+            ev.defenderHp = defenderHp
+            ev.defenderMaxHp = defenderMaxHp
+        else
+            ev.defenderHp = nil
+            ev.defenderMaxHp = nil
+        end
+        RelayCombatEvent(ev)
+    end
+end
+
+-- Burst aggregation timing.  The engine doesn't fire all of a damage
+-- chain's HitResultEvents on the exact same tick: empirically, Fire
+-- Bolt's direct-hit event arrives on tick N, the followup Burning
+-- tick can arrive on tick N+1 or even N+2.  A single-tick flush
+-- window therefore split the chain into two bursts.
+--
+-- We use a "quiet period" rule instead: flush when no new event has
+-- arrived for FLUSH_QUIET_MS milliseconds.  Each new event resets
+-- the quiet timer.  FLUSH_MAX_AGE_MS caps the maximum aggregation
+-- time so persistent damage sources (long-lived fire surface, etc.)
+-- can't extend a burst indefinitely and starve the announcement.
+-- Empirically, BG3 spaces a damage chain's HitResultEvents further
+-- apart than expected: Fire Bolt's direct hit and the followup
+-- Burning tick can be >50ms apart in real frames.  We need a
+-- generous quiet window so they end up in the same burst.  150ms
+-- is well within the perception threshold for combat speech (the
+-- announcement that follows is itself ~1500ms+ of speech) and
+-- catches even slow followup ticks.
+-- Single-shot delay before flushing.  Ext.Timer.WaitFor schedules
+-- one callback after N ms; the engine is free to fire other events
+-- during that interval (in contrast to Ext.OnNextTick polling, which
+-- ran on the main game thread every ~1ms and blocked the engine
+-- from firing queued HitResultEvents until our polling finished --
+-- so Burning's event always landed AFTER the flush no matter the
+-- quiet period).  300ms gives the engine room to fire the followup
+-- ticks (Fire Bolt commits then Burning ticks ~immediately after
+-- when our handler isn't hogging the thread).
+local BURST_WAIT_MS = 300
+
+--- Add an event payload to the per-(attacker, defender) burst buffer.
+--- First call for a new key schedules a single Ext.Timer.WaitFor
+--- flush; later events on the same key just append to the buffer --
+--- the already-scheduled timer fires once and picks up everything
+--- that accumulated.
+local function EnqueueDamageBurst(eventPayload, attackerHandle, defenderHandle)
+    local burstKey = ComposeBurstKey(attackerHandle, defenderHandle)
+    if not burstKey then return end
+
+    local now = Ext.Utils.MonotonicTime()
+    local burst = pendingDamageBursts[burstKey]
+    local burstWasNew = false
+    if not burst then
+        burst = {
+            defenderHandle    = defenderHandle,
+            events            = {},
+            firstEventTimeMs  = now,
+        }
+        pendingDamageBursts[burstKey] = burst
+        burstWasNew = true
+    end
+
+    table.insert(burst.events, eventPayload)
+
+    -- Diagnostic: log when each event arrives relative to the burst's
+    -- first event.  When new=false we successfully aggregated; when
+    -- new=true the burst was already flushed and this event starts a
+    -- fresh one (which means BURST_WAIT_MS was too short).
+    _P("BG3Access:   BurstEnqueue cause=" .. tostring(eventPayload.causeType)
+        .. " damage=" .. tostring(eventPayload.damageAmount)
+        .. " burstKey=" .. burstKey
+        .. " new=" .. tostring(burstWasNew)
+        .. " gapFromFirstMs="
+        .. tostring(now - burst.firstEventTimeMs)
+        .. " events=" .. tostring(#burst.events))
+
+    if burstWasNew then
+        -- One-shot timer.  Crucially does NOT poll on the main thread,
+        -- so the engine can fire its queued HitResultEvents during the
+        -- wait and they land in this burst before the flush.
+        Ext.Timer.WaitFor(BURST_WAIT_MS, function()
+            FlushDamageBurst(burstKey)
+        end)
+    end
+end
+
 local function RelayHitResultEvent(entity)
     local hitResult = entity.HitResultEvent
     if not hitResult then return end
@@ -1458,20 +2149,19 @@ local function RelayHitResultEvent(entity)
     if not wasReduced then
         damagePhrase = FormatDamageBreakdown(perType, actualDamage)
     end
+
+    -- Per-instance dice breakdown for the verbose-tier client
+    -- formatter ("rolled 2 on 1d4 plus 2 for 4 slashing").  Empty
+    -- array for hits without a roll (status ticks, surface ticks,
+    -- pre-rolled snare damage); the client only speaks the dice
+    -- phrase when this array has entries AND the user is at
+    -- verbose verbosity.
+    local damageRolls = ExtractDamageRolls(hitDesc)
+
     -- Use actualDamage as the canonical number all downstream code
     -- references.  rolledDamage / originalDamage are only carried
     -- for the resistance announcement.
     local totalDamage = actualDamage
-
-    -- Target HP after the hit.  GetCharacterHitpoints returns a
-    -- single table {hp=N, maxHp=M} (or nil), NOT two return values;
-    -- destructure here rather than assigning both to the same var.
-    local targetHp, targetMaxHp = nil, nil
-    local hitpoints = GetCharacterHitpoints(targetHandle)
-    if hitpoints then
-        targetHp = hitpoints.hp
-        targetMaxHp = hitpoints.maxHp
-    end
 
     -- Classify the damage source.  HitResultEvent fires once per
     -- damage DELIVERY (not per attack): primary spell hit, surface
@@ -1488,6 +2178,49 @@ local function RelayHitResultEvent(entity)
     local statusId = tostring(SafeIndex(hitDesc, "StatusId") or "")
     if statusId == "nil" then statusId = "" end
 
+    -- SpellId identifies the source for bonus-damage instances:
+    -- weapon attacks fire HitResultEvent with SpellId="" (cause=Attack),
+    -- but features that piggyback on an attack (Sneak Attack, Smite,
+    -- Hex, Hunter's Mark, magic-weapon procs) fire as a separate
+    -- HitResultEvent in the same burst with SpellId set to the
+    -- triggering spell/passive (e.g., "Target_SneakAttack",
+    -- "Target_DivineSmite", "Shout_HuntersMark_Damage").  Resolve to
+    -- a display name via Ext.Stats.GetCachedSpell when available so
+    -- the client can attribute the bonus die: "plus 5 piercing from
+    -- Sneak Attack".  Resolution path mirrors GetSpellDisplayName
+    -- earlier in this file: cached.Description.DisplayName is a
+    -- TranslatedString userdata, .Handle.Handle is the loca key,
+    -- Ext.Loca.GetTranslatedString resolves the key to a string.
+    local spellId = tostring(SafeIndex(hitDesc, "SpellId") or "")
+    if spellId == "nil" then spellId = "" end
+    local spellName = ""
+    if spellId ~= "" then
+        local cachedOk, cached = pcall(Ext.Stats.GetCachedSpell, spellId)
+        if cachedOk and cached and cached.Description then
+            local nameKey = cached.Description.DisplayName
+            if nameKey then
+                local handleOk, handleStr = pcall(function()
+                    return tostring(nameKey.Handle.Handle)
+                end)
+                if handleOk and handleStr and handleStr ~= "" then
+                    local translateOk, translated = pcall(
+                        Ext.Loca.GetTranslatedString, handleStr)
+                    if translateOk and translated and translated ~= "" then
+                        spellName = translated
+                    end
+                end
+            end
+        end
+        if spellName == "" then
+            -- Fallback: humanize the SpellId itself when no loca
+            -- is available (modded spells, missing display names).
+            spellName = spellId:gsub("^Target_", "")
+                              :gsub("^Shout_", "")
+                              :gsub("^Projectile_", "")
+                              :gsub("_", " ")
+        end
+    end
+
     -- Miss detection: HitResultEvent fires for misses too, with
     -- the Miss bit set in EffectFlags (DamageFlags bitmask,
     -- Stats.inl:776-782).  BG3SE bitmasks typically tostring() as
@@ -1503,21 +2236,13 @@ local function RelayHitResultEvent(entity)
     local shouldBeDowned = SafeIndex(hitResult, "ShouldBeDowned") == true
     local ac = tonumber(SafeIndex(hitResult, "AC"))
 
-    _P("BG3Access:   CombatHit"
-        .. " cause=" .. causeType
-        .. " surface=" .. surfaceTypeName
-        .. " status=" .. statusId
-        .. " miss=" .. tostring(isMiss)
-        .. " roll=" .. tostring(naturalRoll)
-        .. " total=" .. tostring(rollTotal)
-        .. " crit=" .. tostring(critical)
-        .. " damage=" .. tostring(totalDamage)
-        .. " damagePhrase='" .. damagePhrase .. "'"
-        .. " targetHp=" .. tostring(targetHp) .. "/" .. tostring(targetMaxHp)
-        .. " lethal=" .. tostring(lethal))
-
-    RelayCombatEvent({
-        event           = "CombatHit",
+    -- Build the event payload and aggregate into a per-(attacker,
+    -- defender) burst.  See EnqueueDamageBurst for the rationale,
+    -- but the short version: cross-event chains (Fire Bolt + Burning)
+    -- need to be combined into a single announcement because the
+    -- engine commits all damage in the chain in a batch before
+    -- firing any HitResultEvent, leaving no per-event HP available.
+    local eventPayload = {
         attackerName    = attackerName,
         targetName      = targetName,
         attackerIsParty = attackerIsParty,
@@ -1525,6 +2250,8 @@ local function RelayHitResultEvent(entity)
         causeType       = causeType,
         surfaceType     = surfaceTypeName,
         statusId        = statusId,
+        spellId         = spellId,
+        spellName       = spellName,
         isMiss          = isMiss,
         naturalRoll     = naturalRoll,
         rollTotal       = rollTotal,
@@ -1535,21 +2262,20 @@ local function RelayHitResultEvent(entity)
         disadvantage    = disadvantage,
         damageAmount    = totalDamage,
         damagePhrase    = damagePhrase,
-        -- Resistance / immunity context.  rolledDamage carries the
-        -- pre-resistance total so the client can say "for 4 fire
-        -- damage (resisted from 8)" or "no damage, immune" rather
-        -- than overstating what landed.  wasReduced / wasImmune are
-        -- mutually-exclusive flags (immune implies reduced).
+        damageRolls     = damageRolls,
+        -- perType: kept for cross-event merging in FlushDamageBurst
+        -- when one swing produces multiple damage instances (weapon
+        -- + Sneak Attack, Smite, etc.).  Not used by the client.
+        perType         = perType,
         rolledDamage    = rolledDamage,
         originalDamage  = originalDamage,
         wasReduced      = wasReduced,
         wasImmune       = wasImmune,
         ac              = ac,
-        defenderHp      = targetHp,
-        defenderMaxHp   = targetMaxHp,
         lethal          = lethal,
         shouldBeDowned  = shouldBeDowned,
-    })
+    }
+    EnqueueDamageBurst(eventPayload, attackerHandle, targetHandle)
 end
 
 local hitSubId = nil
@@ -1685,3 +2411,140 @@ _P("BG3Access: Subregion transition relay registered on '"
     .. SUBREGION_CHANNEL .. "'")
 _P("BG3Access: Subregion prime query registered on '"
     .. SUBREGION_QUERY_CHANNEL .. "'")
+
+-- ============================================================================
+-- Auto-walk relay (Osiris CharacterMoveToPosition / CharacterMoveTo)
+--
+-- Replaces clock-face guidance for routing-list selections.  When the
+-- user A-selects a target in the entity list, the client sends a
+-- payload here.  We invoke the engine's own auto-walk so the character
+-- follows the exact pathfinder route (same one our clock-face was
+-- approximating).  No corner-cutting, no "step in fire because the
+-- bearing pointed through it" -- the engine drives the character
+-- node-by-node along walkable corridors, just like NPCs.
+--
+-- Osiris signatures (verified via D:\extracted packs\Osi\debug.log):
+--   Call CharacterMoveToPosition(CHARACTER, REAL, REAL, REAL,
+--                                STRING, STRING, INTEGER)
+--      character UUID, x, y, z, "Walk"|"Run", arriveEventName, -1
+--   Call CharacterMoveTo(CHARACTER, GUIDSTRING, STRING, STRING,
+--                        INTEGER)
+--      character UUID, target GUID, "Walk"|"Run", arriveEventName, -1
+--
+-- Arrival fires Osiris EntityEvent(character, arriveEventName).
+-- We use a fixed name and listen for it to relay arrival back to
+-- the client for "arrived at X" speech.
+-- ============================================================================
+
+local AUTOWALK_CHANNEL          = "BG3Access_AutoWalk"
+local AUTOWALK_RESULT_CHANNEL   = "BG3Access_AutoWalkResult"
+local AUTOWALK_EVENT_NAME       = "BG3Access_AutoWalkArrived"
+
+--- Relay a single auto-walk lifecycle event to the client.
+local function RelayAutoWalkResult(eventKind, characterUuid, targetName)
+    local payload = {
+        event         = eventKind,           -- "started" / "arrived" / "cancelled" / "failed"
+        characterUuid = characterUuid or "",
+        targetName    = targetName or "",
+    }
+    local jsonOk, jsonStr = pcall(Ext.Json.Stringify, payload)
+    if not jsonOk then return end
+    pcall(Ext.ServerNet.BroadcastMessage,
+        AUTOWALK_RESULT_CHANNEL, jsonStr)
+end
+
+Ext.RegisterNetListener(AUTOWALK_CHANNEL,
+    function(channel, payload, userId)
+        local parseOk, request = pcall(Ext.Json.Parse, payload)
+        if not parseOk or type(request) ~= "table" then
+            _P("BG3Access: AutoWalk bad payload")
+            return
+        end
+
+        local characterUuid = tostring(request.characterUuid or "")
+        if characterUuid == "" then
+            _P("BG3Access: AutoWalk missing characterUuid")
+            return
+        end
+
+        local walkOrRun = request.walkOrRun
+        if walkOrRun ~= "Walk" and walkOrRun ~= "Run" then
+            walkOrRun = "Walk"
+        end
+
+        local targetName = tostring(request.targetName or "")
+        local targetUuid = tostring(request.targetUuid or "")
+        local position   = request.position
+
+        local invokeOk, invokeErr
+        if targetUuid ~= "" then
+            invokeOk, invokeErr = pcall(Osi.CharacterMoveTo,
+                characterUuid, targetUuid,
+                walkOrRun, AUTOWALK_EVENT_NAME, -1)
+            _P("BG3Access: AutoWalk CharacterMoveTo char="
+                .. characterUuid .. " target=" .. targetUuid
+                .. " mode=" .. walkOrRun
+                .. " ok=" .. tostring(invokeOk))
+        elseif type(position) == "table"
+            and tonumber(position.x) and tonumber(position.y)
+            and tonumber(position.z) then
+            invokeOk, invokeErr = pcall(Osi.CharacterMoveToPosition,
+                characterUuid,
+                tonumber(position.x), tonumber(position.y), tonumber(position.z),
+                walkOrRun, AUTOWALK_EVENT_NAME, -1)
+            _P("BG3Access: AutoWalk CharacterMoveToPosition char="
+                .. characterUuid
+                .. string.format(" pos=(%.2f,%.2f,%.2f)",
+                    position.x, position.y, position.z)
+                .. " mode=" .. walkOrRun
+                .. " ok=" .. tostring(invokeOk))
+        else
+            _P("BG3Access: AutoWalk no target or position supplied")
+            return
+        end
+
+        if invokeOk then
+            RelayAutoWalkResult("started", characterUuid, targetName)
+        else
+            _P("BG3Access: AutoWalk Osi call error: " .. tostring(invokeErr))
+            RelayAutoWalkResult("failed", characterUuid, targetName)
+        end
+    end)
+
+-- Track in-flight walks by character UUID -> target name so the
+-- arrival event handler can name the destination on the client.
+local pendingAutoWalkTargets = {}
+
+Ext.RegisterNetListener(AUTOWALK_CHANNEL .. "_TrackTarget",
+    function(channel, payload, userId)
+        local parseOk, request = pcall(Ext.Json.Parse, payload)
+        if not parseOk or type(request) ~= "table" then return end
+        local characterUuid = tostring(request.characterUuid or "")
+        if characterUuid == "" then return end
+        pendingAutoWalkTargets[characterUuid] =
+            tostring(request.targetName or "")
+    end)
+
+-- Listen for the arrival event we instructed the engine to fire.
+-- Osi.RegisterListener pattern (used elsewhere in this file for
+-- combat events).  Engine fires this as EntityEvent(character,
+-- AUTOWALK_EVENT_NAME) when the auto-walk completes.
+local autoWalkArrivalSubOk, autoWalkArrivalErr = pcall(
+    Ext.Osiris.RegisterListener,
+    "EntityEvent", 2, "before", function(characterRef, eventName)
+        if tostring(eventName) ~= AUTOWALK_EVENT_NAME then return end
+        local characterUuid = EntityRefToUuid(characterRef)
+        if not characterUuid then return end
+        local targetName = pendingAutoWalkTargets[characterUuid] or ""
+        pendingAutoWalkTargets[characterUuid] = nil
+        _P("BG3Access: AutoWalk arrived char=" .. characterUuid
+            .. " target=" .. targetName)
+        RelayAutoWalkResult("arrived", characterUuid, targetName)
+    end)
+if not autoWalkArrivalSubOk then
+    _P("BG3Access: AutoWalk arrival listener FAILED: "
+        .. tostring(autoWalkArrivalErr))
+end
+
+_P("BG3Access: AutoWalk relay registered on '"
+    .. AUTOWALK_CHANNEL .. "'")

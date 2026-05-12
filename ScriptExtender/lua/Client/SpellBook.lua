@@ -851,10 +851,10 @@ local function CreateSpellBookHandler(createPanelHandler)
                         "^[%+%-]?%d*d%d+[%+%-]?%d*$") then
                         if cleaned:match("^[%+%-]") then
                             speechData:AddProperty("Bonus dice",
-                                cleaned, "normal")
+                                cleaned, "verbose")
                         else
                             speechData:AddProperty("Dice",
-                                cleaned, "normal")
+                                cleaned, "verbose")
                         end
                         goto nextTT
                     end
@@ -881,20 +881,20 @@ local function CreateSpellBookHandler(createPanelHandler)
                         or cleaned == "Bonus Action"
                         or cleaned == "Reaction" then
                         speechData:AddProperty("Cost",
-                            cleaned, "normal")
+                            cleaned, "verbose")
                         goto nextTT
                     end
 
                     -- Frequency.
                     if cleaned == "Per turn" then
                         speechData:AddProperty("Frequency",
-                            "Once per turn", "normal")
+                            "Once per turn", "verbose")
                         goto nextTT
                     end
                     if cleaned == "Short Rest"
                         or cleaned == "Long Rest" then
                         speechData:AddProperty("Frequency",
-                            "Recharges on " .. cleaned, "normal")
+                            "Recharges on " .. cleaned, "verbose")
                         goto nextTT
                     end
 
@@ -915,7 +915,7 @@ local function CreateSpellBookHandler(createPanelHandler)
                     if cleaned == "Attack Roll"
                         or cleaned == "Saving Throw" then
                         speechData:AddProperty("Attack type",
-                            cleaned, "normal")
+                            cleaned, "verbose")
                         goto nextTT
                     end
 
@@ -928,7 +928,7 @@ local function CreateSpellBookHandler(createPanelHandler)
                         "^(%u+) Save$")
                     if saveAbility then
                         speechData:AddProperty("Save type",
-                            saveAbility, "normal")
+                            saveAbility, "verbose")
                         goto nextTT
                     end
 
@@ -944,7 +944,7 @@ local function CreateSpellBookHandler(createPanelHandler)
                             "^(%S+)%s+(.+)$")
                         if costAmount and costName then
                             speechData:AddProperty(costName,
-                                costAmount, "normal")
+                                costAmount, "verbose")
                         end
                         goto nextTT
                     end
@@ -988,7 +988,7 @@ local function CreateSpellBookHandler(createPanelHandler)
                     -- the value used to produce.
                     if cleaned:lower() == "concentration" then
                         speechData:AddProperty("Concentration",
-                            "Yes", "normal")
+                            "Yes", "verbose")
                         goto nextTT
                     end
 

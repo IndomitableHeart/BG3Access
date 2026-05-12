@@ -156,15 +156,17 @@ local function CreateMenuHandler(config)
     local handlerState = {
         lastSpokenName       = nil,
         lastSpokenFullText   = nil,
-        lastSpokenTab        = nil,
+        currentTabContext        = nil,
         lastSpokenTitle      = nil,
-        lastTooltipSpeech    = nil,   -- tooltip dedup (inline comparison)
-        spokenRoles         = {},    -- set of field names spoken (for tooltip cross-off)
+        spokenRoles         = {},    -- map of field key -> spoken value (for value-aware tooltip cross-off)
         spokenValues         = {},    -- set of normalized values spoken (for carousel dedup)
         tabHintSpoken        = false,
         screenEntryJustSpoke = false,
-        -- Optional: set by onWidgetAdded hooks for body text override.
-        bodyOverride         = nil,
+        -- Screen-entry override SpeechData.  Handlers populate any
+        -- core field on this (title / sectionLabel / description /
+        -- status / count / etc.) from onWidgetAdded.  One mechanism
+        -- replaces the older per-field bodyOverride pattern.
+        screenEntryOverrides = SpeechData.Create(),
         -- Set by HandleWidgetAdded for the current tick.  HandleSnapshot
         -- consumes (and clears) this on the same tick so widget-derived
         -- title/body/namedTexts come from THIS handler's event, not a
@@ -179,19 +181,23 @@ local function CreateMenuHandler(config)
         handlerState.spokenRoles = {}
         handlerState.spokenValues = {}
         -- Core fields (dict of fieldName -> fieldValue).
+        -- Store actual values into spokenRoles for value-aware
+        -- cross-off (per ShouldSkipSpoken in SpeechData.lua).
         if speechData.coreFields then
             for fieldName, fieldValue in pairs(speechData.coreFields) do
-                handlerState.spokenRoles[fieldName] = true
+                handlerState.spokenRoles[fieldName] = fieldValue
                 if fieldValue and fieldValue ~= "" then
                     handlerState.spokenValues[
                         Helpers.NormalizeForCompare(fieldValue)] = true
                 end
             end
         end
-        -- Properties (array of {label, value, tier}).
+        -- Properties (array of {label, value, tier}).  Key encodes
+        -- value so multi-instance labels each have a unique slot.
         if speechData.properties then
             for _, prop in ipairs(speechData.properties) do
-                handlerState.spokenRoles["property:" .. prop.label] = true
+                handlerState.spokenRoles[
+                    "property:" .. prop.label .. ":" .. prop.value] = true
                 if prop.value and prop.value ~= "" then
                     handlerState.spokenValues[
                         Helpers.NormalizeForCompare(prop.value)] = true
@@ -240,7 +246,7 @@ local function CreateMenuHandler(config)
         local isScreenEntry = false
         if snapshot.selectionChanged then
             isScreenEntry = true
-        elseif widgetEvent and not handlerState.lastSpokenTab then
+        elseif widgetEvent and not handlerState.currentTabContext then
             isScreenEntry = true
         elseif snapshot.focusChanged and focusedElement.isTab then
             isScreenEntry = true
@@ -262,7 +268,8 @@ local function CreateMenuHandler(config)
                 and updateText ~= handlerState.lastSpokenFullText then
                 local updateSpeech = SpeechData.Create()
                 updateSpeech:Add("status", updateText, "brief")
-                updateSpeech:Speak(handlerState, false, nil, userInitiated)
+                updateSpeech:Speak(handlerState, false, nil, userInitiated,
+                    "SPEAK [update " .. config.name .. "]")
                 return
             end
         end
@@ -276,16 +283,29 @@ local function CreateMenuHandler(config)
         -- Standalone carousel or value.
         -- =============================================================
         if isCarouselOnly then
-            local carouselValue = snapshot.inlineCarouselValue
-            -- Skip if the handler already spoke this value.
-            -- The handler tracks all spoken text values in spokenValues.
-            if handlerState.spokenValues[
-                Helpers.NormalizeForCompare(carouselValue)] then
+            -- Role-based dedup.  In selector menus (SaveLoad, Options
+            -- tab carousels, etc.) the user d-pads to a new item.
+            -- Both a focus snapshot AND a separate carousel snapshot
+            -- fire from that one press.  The focus path's customItemFn
+            -- already speaks the item's name (and any properties);
+            -- the carousel value IS that same name, just from the
+            -- selector's perspective.  If we spoke a "name" role on
+            -- focus, the carousel's name role is redundant -- skip.
+            --
+            -- This is structural, not a fragile string match: same
+            -- "name" role, same item, suppressed.  Handlers that don't
+            -- emit "name" on focus (or that have no focus path at all
+            -- because focus didn't change -- e.g. a hypothetical pure
+            -- selector with sticky focus) still get a carousel speech.
+            if handlerState.spokenRoles
+                and handlerState.spokenRoles["name"] then
                 return
             end
+            local carouselValue = snapshot.inlineCarouselValue
             local carouselSpeech = SpeechData.Create()
-            carouselSpeech:Add("value", carouselValue, "brief")
-            carouselSpeech:Speak(handlerState, false, nil, userInitiated)
+            carouselSpeech:Add("name", carouselValue, "brief")
+            carouselSpeech:Speak(handlerState, false, nil, userInitiated,
+                "SPEAK [carousel " .. config.name .. "]")
             return
         end
 
@@ -300,7 +320,8 @@ local function CreateMenuHandler(config)
                         or #customValue.properties > 0 then
                         RecordSpokenFields(customValue)
                         customValue:Speak(handlerState, false, nil,
-                            userInitiated)
+                            userInitiated,
+                            "SPEAK [custom-value " .. config.name .. "]")
                     end
                     return
                 end
@@ -315,7 +336,8 @@ local function CreateMenuHandler(config)
                         local valueSpeech = SpeechData.Create()
                         valueSpeech:Add("value", toSpeak, "brief")
                         valueSpeech:Speak(handlerState, false, nil,
-                            userInitiated)
+                            userInitiated,
+                            "SPEAK [value-state " .. config.name .. "]")
                     end
                     return
                 end
@@ -325,7 +347,8 @@ local function CreateMenuHandler(config)
                 and valueText ~= handlerState.lastSpokenFullText then
                 local valueSpeech = SpeechData.Create()
                 valueSpeech:Add("value", valueText, "brief")
-                valueSpeech:Speak(handlerState, false, nil, userInitiated)
+                valueSpeech:Speak(handlerState, false, nil, userInitiated,
+                    "SPEAK [value-dc " .. config.name .. "]")
             end
             return
         end
@@ -347,7 +370,7 @@ local function CreateMenuHandler(config)
             normalTab = tabName and Helpers.NormalizeForCompare(tabName) or ""
 
             -- Dedup: skip if same tab.
-            if tabName and tabName == handlerState.lastSpokenTab then
+            if tabName and tabName == handlerState.currentTabContext then
                 Log.Debug("SKIP screen entry (same tab) ["
                     .. config.name .. "]: " .. tabName)
                 return
@@ -360,7 +383,7 @@ local function CreateMenuHandler(config)
 
             -- Always update, even when nil, so widgetAdded doesn't
             -- re-trigger.  Empty string = "screen entry processed".
-            handlerState.lastSpokenTab = tabName or ""
+            handlerState.currentTabContext = tabName or ""
             handlerState.lastSpokenName = nil
 
             -- Gather data sources.
@@ -387,8 +410,20 @@ local function CreateMenuHandler(config)
             local widgetTitle, widgetBody, widgetActions =
                 Helpers.ExtractFromWidgetData(widgetEvent)
 
-            -- Title.
-            screenTitle = nsTitle or widgetTitle
+            -- Read all screen-entry overrides up front.  Handlers
+            -- populate these via handlerState.screenEntryOverrides
+            -- (a SpeechData) from onWidgetAdded.  One mechanism
+            -- replaces the older per-field bodyOverride pattern.
+            local overrides = handlerState.screenEntryOverrides
+            local overrideCoreFields = (overrides and overrides.coreFields)
+                or {}
+
+            -- Title.  Override takes priority.
+            if overrideCoreFields["title"] then
+                screenTitle = overrideCoreFields["title"]
+            else
+                screenTitle = nsTitle or widgetTitle
+            end
             if screenTitle and normalTab ~= ""
                 and Helpers.NormalizeForCompare(screenTitle) == normalTab then
                 screenTitle = nil
@@ -419,8 +454,11 @@ local function CreateMenuHandler(config)
                 end
             end
 
-            -- Tab name (suppress if title contains it or unresolved handle).
-            if tabName then
+            -- Section label.  Override takes priority.
+            if overrideCoreFields["sectionLabel"] then
+                speechData:Add("sectionLabel",
+                    overrideCoreFields["sectionLabel"], "brief")
+            elseif tabName then
                 local showTabName = true
                 -- Filter unresolved LocaString handles.
                 if tabName:match("^h%x+g") then
@@ -436,17 +474,14 @@ local function CreateMenuHandler(config)
                 end
             end
 
-            -- Body.  bodyOverride (set by onWidgetAdded for controller
-            -- hints, etc.) takes priority over NameScope-extracted body
-            -- parts -- it is an explicit override, not a fallback.
+            -- Body.  Override takes priority over NameScope-extracted
+            -- body parts (an explicit override is authoritative).
             local bodyAssembled = nil
-            if handlerState.bodyOverride then
-                bodyAssembled = handlerState.bodyOverride
-                handlerState.bodyOverride = nil
+            if overrideCoreFields["description"] then
+                bodyAssembled = overrideCoreFields["description"]
             elseif nsBodyParts and #nsBodyParts > 0 then
                 bodyAssembled = table.concat(nsBodyParts, ". ")
-            end
-            if not bodyAssembled and widgetBody then
+            elseif widgetBody then
                 bodyAssembled = widgetBody
             end
             local statusText = Helpers.ExtractStatusText(
@@ -461,12 +496,33 @@ local function CreateMenuHandler(config)
             if widgetActions then
                 speechData:Add("instructionHint", widgetActions, "normal")
             end
+
+            -- Apply any OTHER override core fields beyond title /
+            -- sectionLabel / description, plus any properties.
+            -- Free extensibility -- handlers can add any of the 15
+            -- core fields without touching factory plumbing.
+            if overrides then
+                for fieldName, fieldValue in pairs(overrides.coreFields) do
+                    if fieldName ~= "title"
+                        and fieldName ~= "sectionLabel"
+                        and fieldName ~= "description" then
+                        speechData:Add(fieldName, fieldValue,
+                            overrides.tiers[fieldName])
+                    end
+                end
+                for _, prop in ipairs(overrides.properties) do
+                    speechData:AddProperty(
+                        prop.label, prop.value, prop.tier)
+                end
+                -- One-shot consume.
+                handlerState.screenEntryOverrides = SpeechData.Create()
+            end
         else
             -- Item navigation: dedup check.
             if elemId == handlerState.lastSpokenName
                 and not hasCarousel then
                 local text = Helpers.ExtractTextFromData(
-                    focusedElement, handlerState.lastSpokenTab, false)
+                    focusedElement, handlerState.currentTabContext, false)
                 if not text
                     or text == handlerState.lastSpokenFullText then
                     Log.Debug("DEDUP SKIP [" .. config.name .. "]: "
@@ -532,12 +588,28 @@ local function CreateMenuHandler(config)
                 end
                 RecordSpokenFields(merged)
                 merged:Speak(handlerState, isScreenEntry, nil,
-                    userInitiated)
+                    userInitiated, "SPEAK [merged " .. config.name .. "]")
             else
                 RecordSpokenFields(customSpeechData)
                 customSpeechData:Speak(handlerState, isScreenEntry, nil,
-                    userInitiated)
+                    userInitiated,
+                    "SPEAK [custom " .. config.name .. "]")
             end
+            -- Track which element we just spoke for.  The isCarouselOnly
+            -- path uses this for identity-based dedup: when C++ raises
+            -- BOTH a focus event AND an inline-carousel event for the
+            -- same selection (e.g., save list -- ListBox SelectionChanged
+            -- captures the highlighted item's name as a "carousel value"
+            -- even when the consumer treats the widget as a rich list),
+            -- we'd otherwise get a redundant carousel SPEAK after our
+            -- custom speech.  Existing value-based dedup in the carousel
+            -- path catches the case where the carousel value matches
+            -- something in spokenValues, but custom handlers that
+            -- transform values (e.g. SaveLoad stripping the auto-
+            -- generated "<Level> - <PlayTime>" suffix from the title)
+            -- miss that match.  Identity dedup catches it regardless of
+            -- value transformation.
+            handlerState.lastSpokenName = elemId
             return
         end
 
@@ -548,7 +620,7 @@ local function CreateMenuHandler(config)
         end
         if not splitName or splitName == "" then
             splitName = Helpers.ExtractTextFromData(
-                focusedElement, handlerState.lastSpokenTab, isScreenEntry)
+                focusedElement, handlerState.currentTabContext, isScreenEntry)
             splitValue = nil
             splitDesc = nil
             splitValueDesc = nil
@@ -602,7 +674,8 @@ local function CreateMenuHandler(config)
         speechData:Add("description", itemDesc, "verbose")
 
         RecordSpokenFields(speechData)
-        speechData:Speak(handlerState, isScreenEntry, nil, userInitiated)
+        speechData:Speak(handlerState, isScreenEntry, nil, userInitiated,
+            "SPEAK [generic " .. config.name .. "]")
     end
 
     -- -----------------------------------------------------------------
@@ -626,11 +699,11 @@ local function CreateMenuHandler(config)
     local function ResetState()
         handlerState.lastSpokenName = nil
         handlerState.lastSpokenFullText = nil
-        handlerState.lastSpokenTab = nil
+        handlerState.currentTabContext = nil
         handlerState.lastSpokenTitle = nil
         handlerState.tabHintSpoken = false
         handlerState.screenEntryJustSpoke = false
-        handlerState.bodyOverride = nil
+        handlerState.screenEntryOverrides = SpeechData.Create()
         handlerState.pendingWidgetEvent = nil
         if config.onReset then
             config.onReset(handlerState)
@@ -641,15 +714,15 @@ local function CreateMenuHandler(config)
     --- the same handler (e.g., switching tabs in Options).
     --- Preserves tabHintSpoken so the hint doesn't re-speak.
     local function ResetNavigation()
-        handlerState.lastSpokenTab = nil
+        handlerState.currentTabContext = nil
         handlerState.lastSpokenTitle = nil
         handlerState.lastSpokenName = nil
         handlerState.screenEntryJustSpoke = false
-        -- NOTE: bodyOverride is NOT cleared here.  It is set by
-        -- onWidgetAdded (which fires BEFORE ResetNavigation on
-        -- tab switches) and consumed by HandleSnapshot on the
-        -- same tick.  Clearing it here would wipe the override
-        -- before the snapshot can use it.
+        -- NOTE: screenEntryOverrides is NOT cleared here.  It is set
+        -- by onWidgetAdded (which fires BEFORE ResetNavigation on
+        -- tab switches) and consumed by HandleSnapshot on the same
+        -- tick.  Clearing it here would wipe the overrides before
+        -- the snapshot can use them.
     end
 
     --- ResetHint: reset tabHintSpoken so the hint speaks on next visit.
@@ -670,20 +743,18 @@ local function CreateMenuHandler(config)
         --- already spoke, then speak with inline dedup.
         HandleTooltip = function(structuredData, rawTexts)
             if not structuredData then return end
+            -- FromTooltip's value-aware spokenRoles cross-off
+            -- handles dedup naturally: matching role+value entries
+            -- get skipped, mismatched values get emitted.  If
+            -- nothing changed, the result is empty -> Format
+            -- returns nil -> Speak early-returns silently.  No
+            -- string compare needed.  Menus don't use the
+            -- state-change-interrupt pattern (no equivalent of
+            -- the panel factory's Reactions toggle); always queue.
             local tooltipData = SpeechData.FromTooltip(
                 structuredData, handlerState.spokenRoles)
-            -- No explicit verbosity: Format() falls back to the
-            -- module-global currentVerbosity so RS-Down cycling
-            -- affects menu tooltips the same as other speech.
-            local tooltipSpeech = tooltipData:Format()
-            if not tooltipSpeech or tooltipSpeech == "" then return end
-            if tooltipSpeech == handlerState.lastTooltipSpeech then return end
-            handlerState.lastTooltipSpeech = tooltipSpeech
-            Log.Info("MENU TOOLTIP: " .. tooltipSpeech)
-            Ext.Tolk.Speak(tooltipSpeech, false)
-        end,
-        ResetTooltipDedup = function()
-            handlerState.lastTooltipSpeech = nil
+            tooltipData:Speak(handlerState, false, nil, false,
+                "MENU TOOLTIP")
         end,
     }
 end
@@ -699,7 +770,14 @@ local OptionsHandler = CreateMenuHandler({
         if widgetData.dcType == "gui::DCControllerOptions"
             and widgetData.dcProps then
             SubscribeControllerInput(widgetData.dcProps)
-            handlerState.bodyOverride = "Interactive controller mode: While in this tab, press any button or trigger to hear its function. Press LB twice to return to the previous tab, or press RB twice to move to the next tab in the menu. Press B twice to exit to the main menu."
+            handlerState.screenEntryOverrides:Add(
+                "description",
+                "Interactive controller mode: While in this tab, "
+                .. "press any button or trigger to hear its function. "
+                .. "Press LB twice to return to the previous tab, or "
+                .. "press RB twice to move to the next tab in the menu. "
+                .. "Press B twice to exit to the main menu.",
+                "normal")
             Log.Info("Controller bindings interactive mode activated")
         elseif controllerBindingsData then
             -- Leaving controller tab for a different Options tab.
@@ -779,6 +857,117 @@ local SaveLoadHandler = CreateMenuHandler({
             end
             return headerName
         end
+
+        -- "New save" entry at the top of the Save Game save list.
+        -- Per SaveGame_c.xaml line 176, it's a plain ContentControl
+        -- with Tag="NewSave" wrapping a TextBlock whose text is a
+        -- TranslatedStringConverter binding -- GetProperty("Text")
+        -- returns nil for bound values (BG3SE Lua bridge contract),
+        -- so the factory's generic extraction produces nothing and
+        -- the item stays silent.  Read the rendered TextBlock text
+        -- directly (same trick as the ExpanderButton header above).
+        --
+        -- Detection: elemType is "ContentControl" (the per-save
+        -- ListBoxItems use VMSavegame as dcType -- different code
+        -- path), AND dcType doesn't contain "VMSavegame" (defensive,
+        -- in case a future Larian change reuses ContentControl for
+        -- save items).  ContentControl inherits dcType from its
+        -- parent (gui::DCSavegames) so we can't gate on
+        -- "no dcType" -- inheritance always populates it.
+        if focusedElement.elemType == "ContentControl"
+            and not (focusedElement.dcType
+                and focusedElement.dcType:find("VMSavegame")) then
+            local readOk, focusedTexts = pcall(
+                Ext.UI.ReadFocusedTextBlocks)
+            if readOk and focusedTexts and #focusedTexts > 0 then
+                local cleanText = Helpers.StripMarkupTags(
+                    focusedTexts[1])
+                if cleanText and cleanText ~= ""
+                    and not cleanText:match("^h%x+g") then
+                    return cleanText
+                end
+            end
+        end
+
+        -- Save list item.  The focused list item's DataContext is a
+        -- VMSavegame (per SaveLoad_c.xaml, list-item ItemTemplate
+        -- binds to ls:VMSavegame).  Right-panel detail text (play
+        -- time, level name, timestamp) lives on these VM properties
+        -- but ISN'T part of the list-item's own visible TextBlock --
+        -- the generic pipeline only catches the save's Title.  Read
+        -- the missing fields off dcProps and assemble a speech that
+        -- mirrors what a sighted player sees on the right panel.
+        --
+        -- Property names verified against
+        -- D:\extracted packs\Public\Game\GUI\Library\SaveLoad_c.xaml
+        -- (SaveDetailsTemplate, lines 472-476; right-panel PlayTime
+        -- binding line 503).
+        local dcType = focusedElement.dcType or ""
+        local dcProps = focusedElement.dcProps
+        if dcProps and dcType:find("VMSavegame") then
+            local speechData = SpeechData.Create()
+            -- Title (save name): strip the auto-generated playtime
+            -- suffix when present so every save announces the same way:
+            --   "<Name>. Play time: X. Saved: Y. Difficulty: Z. ..."
+            -- Without the strip, auto-named saves sound different from
+            -- user-named saves (one says "Ravaged Beach - 4h 45m" with
+            -- playtime baked in, the other says "CombatTest" with
+            -- playtime announced separately).  Consistency wins.
+            local title = dcProps.Title
+            local playTime = dcProps.PlayTimeString
+            if title and playTime and playTime ~= "" then
+                local suffix = " - " .. playTime
+                if #title > #suffix
+                    and title:sub(-#suffix) == suffix then
+                    title = title:sub(1, -#suffix - 1)
+                end
+            end
+            if title and title ~= "" then
+                speechData:Add("name", title, "brief")
+            end
+            if playTime and playTime ~= "" then
+                speechData:AddProperty("Play time", playTime, "brief")
+            end
+            -- TimeString (date/time stamp like "25/4/2026 18:47")
+            -- -- useful for "which save is most recent" without
+            -- having to compare names.
+            local timeString = dcProps.TimeString
+            if timeString and timeString ~= "" then
+                speechData:AddProperty("Saved", timeString, "normal")
+            end
+            -- Difficulty + Honour mode.  Difficulty is the displayed
+            -- string ("Balanced", "Tactician", etc.); IsHonourMode
+            -- overrides the label per the XAML DataTrigger at lines
+            -- 521-524.
+            local isHonour = dcProps.IsHonourMode
+            local difficulty = dcProps.Difficulty
+            if isHonour == true or isHonour == "true" then
+                speechData:AddProperty("Difficulty",
+                    "Honour mode", "brief")
+            elseif difficulty and difficulty ~= "" then
+                speechData:AddProperty("Difficulty",
+                    difficulty, "brief")
+            end
+            -- LevelName.Str (e.g., "Wilderness").  Sub-object access:
+            -- dcProps.LevelName might be a table { Str = "..." } or
+            -- a direct string depending on how the bridge marshals it.
+            local levelName = nil
+            if type(dcProps.LevelName) == "table" then
+                levelName = dcProps.LevelName.Str
+            elseif type(dcProps.LevelName) == "string" then
+                levelName = dcProps.LevelName
+            end
+            if levelName and levelName ~= "" then
+                speechData:AddProperty("Region", levelName, "normal")
+            end
+            -- Return the SpeechData object so the framework speaks it
+            -- (and handles screen-entry merging if applicable).  Per
+            -- the customItemFn return convention at line 489-490:
+            -- nil = fall through, string = override name only, table
+            -- with .coreFields = full SpeechData, framework speaks.
+            return speechData
+        end
+
         return nil
     end,
     hintFn = function(screenTitle, handlerState)
@@ -844,7 +1033,7 @@ local DifficultyHandler = CreateMenuHandler({
     -- for custom mode.
     onWidgetAdded = function(widgetData, handlerState)
         handlerState.tabHintSpoken = false
-        handlerState.lastSpokenTab = nil
+        handlerState.currentTabContext = nil
     end,
 })
 
@@ -894,146 +1083,244 @@ local MainMenuHandler = CreateMenuHandler({
 })
 
 -- ============================================================================
--- DC type routing table
+-- Handler registration
 -- ============================================================================
-
-local DC_TYPE_HANDLERS = {
-    ["gui::DCOptions"]           = OptionsHandler,
-    ["gui::DCOptionsBase"]       = OptionsHandler,
-    ["gui::DCControllerOptions"] = OptionsHandler,
-    ["gui::DCInterfaceOptions"]  = OptionsHandler,
-    ["gui::DCLobbyBrowser"]      = MultiplayerHandler,
-    ["gui::DCCharacterAssign"]   = MultiplayerHandler,
-    ["gui::DCSavegames"]         = SaveLoadHandler,
-    -- Per-item save VM: each individual save under a campaign expander
-    -- focuses with this DC.  Mapping it to SaveLoad keeps the staleness
-    -- check (focused-DC path) passing while the user navigates the
-    -- save list -- otherwise transient empty widgetDCTypes / empty
-    -- widgetEvents ticks make the staleness check think the SaveLoad
-    -- widget vanished, falling back to MainMenu mid-session.
-    ["ls.VMSavegame"]            = SaveLoadHandler,
-    -- Campaign expander's DC.  Same rationale: focusing the expander
-    -- shouldn't drop SaveLoad just because the cache is briefly empty.
-    ["ls.VMPlaythroughHolder"]   = SaveLoadHandler,
-    ["gui::DCGameMenu"]          = PauseMenuHandler,
-    ["gui::DCNewGameSettings"]   = DifficultyHandler,
-    ["gui::VMPreset"]            = DifficultyHandler,
-    ["gui::DCModBrowser"]        = ModManagerHandler,
-    ["gui::DCMainMenu"]          = MainMenuHandler,
-    ["gui::DCDMSettings"]        = DifficultyHandler,
+--
+-- Each menu / screen registers ONCE here with one openWhen criterion
+-- table.  The criterion has up to three OPTIONAL signal sources that
+-- the dispatcher checks:
+--
+--   widgetNames - set of UIWidget x:Names that identify "my widget."
+--                 The most stable signal: x:Names don't change during a
+--                 session and only leave the visible widgetNames array
+--                 when the widget actually unloads (Loaded/Unloaded
+--                 events).  Use this when the widget has a known x:Name.
+--
+--   dcTypes     - set of DC type strings that count as "my content."
+--                 Matched against widgetDCTypes (outer widget DCs) AND
+--                 against focusedElement.dcType (per-item ViewModels).
+--                 Use this when (a) the widget has no x:Name in its
+--                 XAML (KeybindingOptions is the example) and (b) for
+--                 per-item VMs that only ever appear on focused elements
+--                 (ls.VMSavegame on a save row, gui::VMPreset on a
+--                 difficulty preset card).
+--
+--   isOpen      - function(snapshot) returning bool.  For permanent
+--                 overlays where "loaded != open" needs custom logic
+--                 (Notification_c with Type != "None", etc.).
+--
+-- The handler is open if ANY non-empty source returns true.  Sources
+-- are independent -- not a fallback ladder.  Each handler picks
+-- whichever sources are stable for its case; PauseMenu uses
+-- widgetNames only (because its DC collides with shortcutsMenu),
+-- KeybindingOptions needs dcTypes (because no x:Name), Notifications
+-- will use isOpen (because the widget is permanent).
+--
+-- Adding a new menu: one entry here, fill in the signal sources that
+-- are stable for its case.  No edits to dispatcher logic.
+local registeredHandlers = {
+    {
+        name    = "Options",
+        handler = OptionsHandler,
+        openWhen = {
+            -- Six of seven Options sub-screens (GameOptions, Audio,
+            -- Video, Controller, Interface, Accessibility) all have
+            -- x:Name="Options_c" in their XAML.  Different widgets,
+            -- shared name, all map to OptionsHandler -- fine.
+            widgetNames = { ["Options_c"] = true },
+            -- KeybindingOptions_c.xaml has NO x:Name on its UIWidget
+            -- root, so widgetNames matching can't catch it.  dcTypes
+            -- is the only signal for that one screen, plus catches
+            -- DC swaps on the named widgets.
+            dcTypes = {
+                ["gui::DCOptions"]           = true,
+                ["gui::DCOptionsBase"]       = true,
+                ["gui::DCControllerOptions"] = true,
+                ["gui::DCInterfaceOptions"]  = true,
+            },
+        },
+    },
+    {
+        name    = "Multiplayer",
+        handler = MultiplayerHandler,
+        openWhen = {
+            widgetNames = {
+                ["LobbyBrowser_c"]    = true,
+                ["CharacterAssign_c"] = true,
+            },
+            dcTypes = {
+                ["gui::DCLobbyBrowser"]    = true,
+                ["gui::DCCharacterAssign"] = true,
+            },
+        },
+    },
+    {
+        name    = "SaveLoad",
+        handler = SaveLoadHandler,
+        openWhen = {
+            -- Outer UIWidget x:Names: stable across DC rebinds.  The
+            -- widget DC can swap to the active campaign / save's VM
+            -- mid-navigation, dropping gui::DCSavegames from the cache;
+            -- the x:Name stays put.  Both names so one handler covers
+            -- Save Game and Load Game.
+            widgetNames = {
+                ["LoadGame_c"] = true,
+                ["SaveGame_c"] = true,
+            },
+            dcTypes = {
+                ["gui::DCSavegames"]       = true,
+                -- Per-save and campaign-expander VMs.  Only appear as
+                -- focused element DCs while navigating inside the
+                -- list -- never as widget DCs.
+                ["ls.VMSavegame"]          = true,
+                ["ls.VMPlaythroughHolder"] = true,
+            },
+        },
+    },
+    {
+        name    = "ShortcutsMenu",
+        handler = ShortcutsMenuHandler,
+        openWhen = {
+            -- INTENTIONALLY widgetNames-only.  shortcutsMenu shares
+            -- gui::DCGameMenu with PauseMenu; if we matched on dcTypes
+            -- the two handlers would mask each other's close detection.
+            widgetNames = { ["shortcutsMenu"] = true },
+        },
+    },
+    {
+        -- PauseMenu comes AFTER ShortcutsMenu in this list because
+        -- both have gui::DCGameMenu and the dispatcher's pickup pass
+        -- iterates in registration order.  When both widgets are
+        -- visible (RT held during pause menu), ShortcutsMenu wins as
+        -- the topmost interaction surface.
+        name    = "PauseMenu",
+        handler = PauseMenuHandler,
+        openWhen = {
+            -- Same rationale as ShortcutsMenu: shared DC type, name-
+            -- only.  Closing one does not keep the other alive.
+            widgetNames = { ["GameMenu_c"] = true },
+        },
+    },
+    {
+        name    = "Difficulty",
+        handler = DifficultyHandler,
+        openWhen = {
+            -- Outer UIWidget x:Name from NewGameSettings_c.xaml.
+            -- DataContext rebinds to gui::VMPreset on selection
+            -- change, so the widget DC string isn't stable.
+            widgetNames = { ["DMSettings"] = true },
+            dcTypes = {
+                ["gui::DCDMSettings"]      = true,
+                ["gui::DCNewGameSettings"] = true,
+                -- Per-preset VM, only appears as focused element DC.
+                ["gui::VMPreset"]          = true,
+            },
+        },
+    },
+    {
+        name    = "ModManager",
+        handler = ModManagerHandler,
+        openWhen = {
+            -- TODO: confirm widget x:Name when the file is located.
+            dcTypes = { ["gui::DCModBrowser"] = true },
+        },
+    },
+    {
+        name    = "MainMenu",
+        handler = MainMenuHandler,
+        openWhen = {
+            widgetNames = { ["MainMenu_c"] = true },
+            dcTypes     = { ["gui::DCMainMenu"] = true },
+        },
+    },
 }
 
--- Widget name overrides: when a widget name matches, use this handler
--- instead of the DC type lookup.  Needed when multiple menus share a
--- DC type (e.g. shortcutsMenu and pause menu both use gui::DCGameMenu).
-local WIDGET_NAME_HANDLERS = {
-    ["shortcutsMenu"] = ShortcutsMenuHandler,
-}
+-- ============================================================================
+-- Dispatcher
+-- ============================================================================
+--
+-- Routing logic lives in Client/Dispatcher.lua.  Menus.lua provides the
+-- registration list (above) and a small amount of Menus-specific glue:
+--   - Skip the next snapshot when a dialog overlay just spoke (so the
+--     underlying menu doesn't immediately interrupt the dialog speech).
+--   - Suspend GPS when a menu activates (Nav.SuspendForMenu).
+--   - Filter MessageBox dialog overlays out of HandleWidgetAdded so they
+--     don't switch the active handler -- they're handled separately by
+--     HandleDialogOverlay below.
 
--- Default handler for unknown DC types (simple button menus).
-local defaultHandler = MainMenuHandler
-
--- Currently active handler (set by widget events, used by snapshot routing).
-local activeHandler = nil
--- Widget name that activated the current handler (for stale handler detection).
-local activeHandlerWidgetName = nil
-
--- Set true when a dialog overlay just spoke on this tick.
--- Suppresses the active handler's snapshot processing so the dialog
--- speech isn't immediately interrupted by the underlying menu.
+local Dispatcher = BG3Access.Client.Dispatcher
 local dialogOverlayJustSpoke = false
 
--- ============================================================================
--- Routing
--- ============================================================================
+local menusDispatcher = Dispatcher.Create({
+    name = "Menus",
+    handlers = registeredHandlers,
+    onActivate = function(entry)
+        -- Suspend GPS for the duration of the menu.  Fires only on
+        -- real handler transitions, so widget rebuilds (which keep
+        -- the same registration entry active) don't re-suspend.
+        local Nav = BG3Access.Client.WorldNav
+        if Nav and Nav.SuspendForMenu then
+            Nav.SuspendForMenu()
+        end
+    end,
+    skipWhen = function(snapshot)
+        -- One-tick suppression after a dialog overlay spoke.  Consume
+        -- the flag here -- the next call resumes normal dispatch.
+        if snapshot ~= nil and dialogOverlayJustSpoke then
+            dialogOverlayJustSpoke = false
+            return true
+        end
+        return false
+    end,
+})
 
---- ResolveHandler: look up the handler for a DC type string.
---- @param dcType string  The DataContext type from a widget or focused element.
---- @return table  The handler instance, or defaultHandler if not found.
-local function ResolveHandler(dcType)
-    if not dcType then return defaultHandler end
-    return DC_TYPE_HANDLERS[dcType] or defaultHandler
-end
-
---- IsDialogOverlay: returns true for DC types that are dialog/popup overlays
---- (e.g. confirmation dialogs).  These should speak their content but NOT
---- switch the active handler, since the underlying menu is still present.
+--- IsDialogOverlay: returns true for DC types that are dialog/popup
+--- overlays (e.g. confirmation MessageBox).  These speak their content
+--- on arrival but do NOT switch the active handler -- the underlying
+--- menu is still up and owns input.
 local function IsDialogOverlay(dcType)
     if not dcType then return false end
     return dcType:find("MessageBox") ~= nil
 end
 
---- IsMenuDCType: returns true if the given DC type is explicitly handled
---- by the Menus module (used by EventRouter to decide whether to switch
---- routing from WorldUI back to Menus).  Generic types like "ls.Widget"
---- return false -- they should NOT cause a routing switch.
+--- IsMenuDCType: thin wrapper exposing the dispatcher's check for use
+--- by EventRouter when deciding whether to flip routing from WorldUI
+--- back to Menus.  Generic / unhandled DC types return false.
 local function IsMenuDCType(dcType)
-    if not dcType then return false end
-    return DC_TYPE_HANDLERS[dcType] ~= nil
+    return menusDispatcher:IsRegisteredDCType(dcType)
 end
 
---- HandleWidgetAdded: called by the Manager once per widget event
---- that routes to Menus (non-CC, non-cutscene).  Updates the active
---- handler and calls its hook.
---- @param widgetData table  The widget event data (one entry from
----                          snapshot.widgetEvents).
+--- IsMenuWidgetName: returns true if any registered handler claims
+--- this widget x:Name in its openWhen.widgetNames set.  Companion to
+--- IsMenuDCType for handlers that identify by name-only (PauseMenu,
+--- ShortcutsMenu -- both share gui::DCGameMenu so DC alone can't
+--- distinguish them; widget name is the canonical signal).
+--- EventRouter consults this to route widget events whose DC isn't
+--- in any handler's dcTypes set but whose x:Name IS registered.
+local function IsMenuWidgetName(widgetName)
+    if not widgetName or widgetName == "" then return false end
+    for _, entry in ipairs(registeredHandlers) do
+        local criterion = entry.openWhen
+        if criterion and criterion.widgetNames
+            and criterion.widgetNames[widgetName] then
+            return true
+        end
+    end
+    return false
+end
+
+--- HandleWidgetAdded: forwards widget events to the dispatcher AFTER
+--- filtering out MessageBox dialog overlays.  Dialog overlays speak
+--- via HandleDialogOverlay (below) and must not switch the active
+--- handler since the underlying menu is still up.
 local function HandleWidgetAdded(widgetData)
     if not widgetData or not widgetData.dcType then return end
-
-    -- Dialog overlays (confirmation popups like MessageBox) should NOT
-    -- switch the active handler.  Skip them entirely here; they are
-    -- spoken by HandleDialogOverlay when the snapshot context confirms
-    -- they are genuine modal dialogs (not pre-loaded widgets).
     if IsDialogOverlay(widgetData.dcType) then
         Log.Info("Skipping dialog overlay in handler routing: "
             .. widgetData.dcType)
         return
     end
-
-    -- Widget name override (e.g. shortcutsMenu vs pause menu both
-    -- share gui::DCGameMenu but need different handlers).  Checked
-    -- per-event, so elemName is accurate for this specific widget.
-    local newHandler = nil
-    local isExplicitMatch = false
-    local resolvedWidgetName = nil
-
-    if widgetData.elemName and WIDGET_NAME_HANDLERS[widgetData.elemName] then
-        newHandler = WIDGET_NAME_HANDLERS[widgetData.elemName]
-        resolvedWidgetName = widgetData.elemName
-        isExplicitMatch = true
-    end
-
-    -- Fall back to DC type routing.
-    if not newHandler then
-        newHandler = ResolveHandler(widgetData.dcType)
-        isExplicitMatch = DC_TYPE_HANDLERS[widgetData.dcType] ~= nil
-    end
-
-    -- Don't let the default handler (MainMenu) overwrite a handler
-    -- that was explicitly matched by widget name or DC type.
-    -- The initial widget scan fires HandleWidgetAdded for every visible
-    -- widget, and generic ls.Widget entries would clobber the real handler.
-    -- Stale handler cleanup is handled in RouteSnapshot instead.
-    if not isExplicitMatch and activeHandler
-        and activeHandler ~= defaultHandler then
-        return
-    end
-
-    if newHandler ~= activeHandler then
-        -- Deactivating old handler: full reset so it's clean on return
-        -- (hint re-speaks, controller input unsubscribes, etc.).
-        if activeHandler then
-            activeHandler.ResetState()
-        end
-        activeHandler = newHandler
-        activeHandlerWidgetName = resolvedWidgetName or widgetData.elemName
-        Log.Info("Active handler: " .. activeHandler.name
-            .. " (dc=" .. widgetData.dcType
-            .. (resolvedWidgetName
-                and " widget=" .. resolvedWidgetName or "") .. ")")
-    end
-
-    activeHandler.HandleWidgetAdded(widgetData)
+    menusDispatcher:HandleWidgetAdded(widgetData)
 end
 
 --- HandleDialogOverlay: called by EventRouter when a dialog overlay
@@ -1110,222 +1397,41 @@ local function HandleDialogOverlay(snapshot, widgetData)
     return false
 end
 
---- HandleWidgetRootChanged: called by the Manager when the widget root
---- changes.  Resets navigation state on the active handler.
+--- HandleWidgetRootChanged: forwards to dispatcher.
 local function HandleWidgetRootChanged()
-    if activeHandler then
-        activeHandler.ResetNavigation()
-    end
+    menusDispatcher:HandleWidgetRootChanged()
 end
 
---- RouteSnapshot: called by the Manager for all non-CC, non-cutscene,
---- non-radial snapshots.  Dispatches to the active handler.
+--- RouteSnapshot: forwards to dispatcher.
 --- @param snapshot table  The full TickSnapshot from C++.
 local function RouteSnapshot(snapshot)
-    -- Dialog overlay just spoke on this tick -- suppress the handler
-    -- so it doesn't immediately interrupt the dialog speech.
-    if dialogOverlayJustSpoke then
-        dialogOverlayJustSpoke = false
-        return
-    end
-
-    -- Clear stale handler: if the handler's widget is no longer
-    -- present in widgetDCTypes (cached scan, refreshes when the widget
-    -- set changes), the menu closed -- reset.  Runs on EVERY snapshot
-    -- including focus/selection ticks; the previous "idle ticks only"
-    -- gate let stale handlers grab focus events from world entities
-    -- (e.g. ShortcutsMenu would speak "Tav" when the user closed
-    -- shortcuts and focus naturally moved to a party member).
-    --
-    -- widgetDCTypes is authoritative: it reflects ALL currently
-    -- visible widget DC types, not just ones that fired callbacks
-    -- this tick.  In-menu navigation does not change the widget set,
-    -- so the cached value still contains the menu's DC type and the
-    -- handler stays alive.  When the menu closes, the widget set
-    -- changes and the cache refreshes without the menu's DC type.
-    if activeHandlerWidgetName and activeHandler
-        and activeHandler ~= defaultHandler then
-        local widgetStillPresent = false
-        -- Direct callback this tick = widget present.
-        if snapshot.visualTextWidgetName
-            and snapshot.visualTextWidgetName == activeHandlerWidgetName then
-            widgetStillPresent = true
-        end
-        if not widgetStillPresent and snapshot.widgetEvents then
-            for _, widgetEvent in ipairs(snapshot.widgetEvents) do
-                if widgetEvent.elemName == activeHandlerWidgetName then
-                    widgetStillPresent = true
-                    break
-                end
-            end
-        end
-        -- Identity check via the C++ widgetNames parallel array.
-        -- TickSnapshot.widgetNames carries the x:Name of every visible
-        -- widget on this tick (parallel to widgetAddrs / widgetDCTypes).
-        -- This is the AUTHORITATIVE per-tick liveness signal: if our
-        -- handler's widget name is in the array, the widget is still
-        -- on screen this tick, regardless of whether widgetEvents
-        -- fired or focused-DC happens to map to the handler.  Without
-        -- this, ticks that have no widget add/remove events AND a
-        -- focused element whose DC type isn't in DC_TYPE_HANDLERS
-        -- (e.g. focus on a ContentPresenter wrapping a VMTickBoxSetting
-        -- inside Options) wrongly declare the widget gone.
-        if not widgetStillPresent and snapshot.widgetNames then
-            for _, widgetName in ipairs(snapshot.widgetNames) do
-                if widgetName == activeHandlerWidgetName then
-                    widgetStillPresent = true
-                    break
-                end
-            end
-        end
-        -- Focused element's DC type maps to this handler = focus is
-        -- demonstrably inside the menu's DC scope, so the widget is
-        -- alive regardless of what widgetDCTypes / widgetEvents say.
-        -- Without this check, ticks that have no widgetEvents and an
-        -- empty / stale widgetDCTypes cache (e.g. d-pad nav between
-        -- buttons in the pause menu when the cached widget set is
-        -- temporarily empty) would falsely declare the handler stale
-        -- and route the next focus event to the default fallback.
-        if not widgetStillPresent
-            and snapshot.focusedElement
-            and snapshot.focusedElement.dcType
-            and DC_TYPE_HANDLERS[snapshot.focusedElement.dcType]
-                == activeHandler then
-            widgetStillPresent = true
-        end
-        -- Handler's DC type still in widgetDCTypes = widget visible.
-        if not widgetStillPresent and snapshot.widgetDCTypes then
-            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-                if DC_TYPE_HANDLERS[widgetDCType] == activeHandler then
-                    widgetStillPresent = true
-                    break
-                end
-            end
-        end
-        -- Widget-name handlers (e.g. ShortcutsMenuHandler) share a DC
-        -- type with another handler (gui::DCGameMenu -> PauseMenuHandler).
-        -- For these, also consider present if ANY registered menu DC
-        -- type is in widgetDCTypes -- the underlying widget is loaded.
-        -- This is permissive: it would keep the handler alive if a
-        -- DIFFERENT menu was open under the same DC type, but the
-        -- common case (only one menu of a given DC type at a time)
-        -- works correctly.
-        if not widgetStillPresent and snapshot.widgetDCTypes then
-            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-                if DC_TYPE_HANDLERS[widgetDCType] then
-                    widgetStillPresent = true
-                    break
-                end
-            end
-        end
-        if not widgetStillPresent then
-            Log.Info("Clearing stale handler: " .. activeHandler.name
-                .. " (widget " .. activeHandlerWidgetName .. " gone)")
-            activeHandler.ResetState()
-            activeHandler = nil
-            activeHandlerWidgetName = nil
-            -- Menu closed -- return to avoid the fallback handler
-            -- speaking elements that belong to the world (party
-            -- members, HUD widgets) instead of the menu.
-            return
-        end
-    end
-
-    -- Route by visual text source widget name when the widget scan
-    -- didn't trigger a separate widgetAdded event.  C++ tags visual
-    -- texts with the source widget name so we can route correctly
-    -- (e.g. "shortcutsMenu" shares gui::DCGameMenu with pause menu).
-    if snapshot.visualTextWidgetName
-        and WIDGET_NAME_HANDLERS[snapshot.visualTextWidgetName] then
-        local newHandler = WIDGET_NAME_HANDLERS[snapshot.visualTextWidgetName]
-        if newHandler ~= activeHandler then
-            if activeHandler then activeHandler.ResetState() end
-            activeHandler = newHandler
-            activeHandlerWidgetName = snapshot.visualTextWidgetName
-            Log.Info("Active handler: " .. activeHandler.name
-                .. " (widget=" .. snapshot.visualTextWidgetName .. ")")
-        end
-    end
-
-    -- Fall back to the focused element's DC type if no handler is
-    -- active yet.  Covers the case where a widgetAdded event fired
-    -- earlier (so handler should be PauseMenu / Options / etc.) but
-    -- the staleness check cleared it on a tick where the cache was
-    -- temporarily incoherent.  The focused element's dcType is a
-    -- direct, reliable signal: focus is provably inside that DC's
-    -- widget right now.  Without this check, a stale-clear would
-    -- fall through to the MainMenu default and read pause-menu
-    -- buttons as if they were main-menu items.
-    if not activeHandler
-        and snapshot.focusedElement
-        and snapshot.focusedElement.dcType
-        and DC_TYPE_HANDLERS[snapshot.focusedElement.dcType] then
-        activeHandler = DC_TYPE_HANDLERS[
-            snapshot.focusedElement.dcType]
-        -- We don't know the original widget x:Name (no widget event
-        -- fired on this tick) -- the staleness check uses widget
-        -- name as one of several signals, so leaving it nil just
-        -- means that one signal is unavailable.  The focused-DC
-        -- check (added in the staleness scan above) keeps the
-        -- handler alive without it.
-        activeHandlerWidgetName = nil
-        Log.Info("Active handler (recovered from focused DC): "
-            .. activeHandler.name .. " dc="
-            .. snapshot.focusedElement.dcType)
-    end
-
-    -- If no handler is active yet (no widgetAdded event has fired),
-    -- use the default handler (MainMenu -- simple button navigation).
-    if not activeHandler then
-        activeHandler = defaultHandler
-        Log.Info("Active handler (default): " .. activeHandler.name)
-    end
-
-    activeHandler.HandleSnapshot(snapshot)
+    menusDispatcher:RouteSnapshot(snapshot)
 end
 
---- ResetAllHandlers: called by the Manager on GameStateChanged.
---- Resets all handler state and clears the active handler.
+--- ResetAllHandlers: forwards to dispatcher.
 local function ResetAllHandlers()
-    OptionsHandler.ResetState()
-    MultiplayerHandler.ResetState()
-    SaveLoadHandler.ResetState()
-    PauseMenuHandler.ResetState()
-    ShortcutsMenuHandler.ResetState()
-    DifficultyHandler.ResetState()
-    ModManagerHandler.ResetState()
-    MainMenuHandler.ResetState()
-    activeHandler = nil
-    activeHandlerWidgetName = nil
+    menusDispatcher:Reset()
 end
 
---- GetActiveHandler: returns the currently active handler (for diagnostics).
---- @return table|nil  The active handler instance, or nil.
+--- GetActiveHandler: returns the currently active handler instance.
 local function GetActiveHandler()
-    return activeHandler
+    return menusDispatcher:GetActiveHandler()
 end
 
---- GetActiveHandlerWidgetName: returns the widget name that activated the
---- current handler.  Used by EventRouter to match widget removal events.
---- @return string|nil  The widget element name, or nil.
+--- GetActiveHandlerWidgetName: returns one of the active handler's
+--- registered widget x:Names, or nil.  Used by EventRouter for
+--- widget-removal matching.
 local function GetActiveHandlerWidgetName()
-    return activeHandlerWidgetName
+    return menusDispatcher:GetActiveHandlerWidgetName()
 end
 
 --- DispatchTooltip: routes structured tooltip data to the active
---- menu handler.  Resets dedup on navigation.
---- @param structuredTooltipData table|nil  Array of {role, text} from C++.
---- @param snapshot table  The full TickSnapshot (for change flags).
+--- menu handler if it exposes a HandleTooltip method.
 local function DispatchTooltip(structuredTooltipData, snapshot)
-    if snapshot.focusChanged or snapshot.selectionChanged then
-        if activeHandler and activeHandler.ResetTooltipDedup then
-            activeHandler.ResetTooltipDedup()
-        end
-    end
     if not structuredTooltipData then return end
-    if activeHandler and activeHandler.HandleTooltip then
-        activeHandler.HandleTooltip(
-            structuredTooltipData, structuredTooltipData)
+    local handler = menusDispatcher:GetActiveHandler()
+    if handler and handler.HandleTooltip then
+        handler.HandleTooltip(structuredTooltipData, structuredTooltipData)
     end
 end
 
@@ -1340,6 +1446,7 @@ BG3Access.Client.Menus = {
     HandleWidgetRootChanged = HandleWidgetRootChanged,
     IsDialogOverlay         = IsDialogOverlay,
     IsMenuDCType            = IsMenuDCType,
+    IsMenuWidgetName        = IsMenuWidgetName,
     ResetAllHandlers        = ResetAllHandlers,
     GetActiveHandler        = GetActiveHandler,
     GetActiveHandlerWidgetName = GetActiveHandlerWidgetName,

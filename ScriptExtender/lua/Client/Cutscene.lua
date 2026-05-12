@@ -431,18 +431,19 @@ local function HandleGameStateForAD(fromState, toState)
             Log.Info("AD: Scheduling " .. adFile
                 .. " in " .. AD_START_DELAY_MS .. "ms"
                 .. " (path=" .. fullPath .. ")")
-            Ext.Timer.WaitFor(AD_START_DELAY_MS, function()
-                Log.Info("AD: Timer fired, playing " .. adFile)
-                local playSuccess, playResult = pcall(
-                    Ext.Audio.PlayFile, fullPath)
-                if playSuccess then
-                    Log.Info("AD: PlayFile returned "
-                        .. tostring(playResult))
-                else
-                    Log.Warning("AD: PlayFile error: "
-                        .. tostring(playResult))
-                end
-            end)
+            BG3Access.Client.Scheduler.RunAfterMs(AD_START_DELAY_MS,
+                function()
+                    Log.Info("AD: Timer fired, playing " .. adFile)
+                    local playSuccess, playResult = pcall(
+                        Ext.Audio.PlayFile, fullPath)
+                    if playSuccess then
+                        Log.Info("AD: PlayFile returned "
+                            .. tostring(playResult))
+                    else
+                        Log.Warning("AD: PlayFile error: "
+                            .. tostring(playResult))
+                    end
+                end)
         end
     end
 

@@ -128,13 +128,61 @@ local PROPERTY_ORDER = {
     ["Reaction"]          = 132,
     ["Level"]             = 140,
     ["Class"]             = 142,
+    -- "Status" used by TargetSelect.lua for the target's combat
+    -- statuses (Threatened, Burning, etc.).  Sits between Level and
+    -- HP so the speech reads "Devourer. Level: 1. Status: Threatened.
+    -- HP: 9/15." -- mirroring the screen's nameplate-grouping order.
+    ["Status"]            = 143,
     ["HP"]                = 145,
     ["Resource"]          = 148,
     ["Round"]             = 149,
     ["Gold"]              = 150,
     ["Weight"]            = 155,
     ["Info"]              = 180,
+    -- Italic flavor text Larian renders at the bottom of tooltips
+    -- (legendary item quotes, some passive features).  Lowest of the
+    -- listed priorities so it speaks last among properties, just
+    -- before the description field.  Verbose tier in handlers'
+    -- AddProperty calls so it only speaks at the deepest verbosity.
+    ["Lore"]              = 200,
 }
+
+-- Pattern-based priority fallback for dynamically-built labels that
+-- can't be enumerated in PROPERTY_ORDER (e.g. action-prefixed hit
+-- chance like "Fire Bolt hit chance" or "Main Hand Attack hit
+-- chance").  Checked AFTER exact match in PROPERTY_ORDER and AFTER
+-- per-instance overrides, before falling to math.huge.  Patterns are
+-- Lua patterns; first match wins.
+local PROPERTY_ORDER_PATTERNS = {
+    -- Action-prefixed hit chance.  Sits at 150 so it speaks just
+    -- after HP (145) and before the target-context Damage override
+    -- (155 set by TargetSelect.lua).
+    {pattern = " hit chance$", priority = 150},
+}
+
+--- Resolve the sort priority for a property label.
+--- @param label string  The property's label (or empty string).
+--- @param instanceOverrides table|nil  Optional {[label]=priority}
+---     map set by the caller via SpeechData.priorityOverrides.
+---     Wins over PROPERTY_ORDER and patterns.
+--- @return number  Priority (lower = spoken earlier; math.huge if
+---     unmapped, in which case insertion order resolves ties).
+local function LookupPropertyPriority(label, instanceOverrides)
+    if instanceOverrides and instanceOverrides[label] then
+        return instanceOverrides[label]
+    end
+    if PROPERTY_ORDER[label] then
+        return PROPERTY_ORDER[label]
+    end
+    if label and label ~= "" then
+        for _, entry in ipairs(PROPERTY_ORDER_PATTERNS) do
+            if label:find(entry.pattern) then
+                return entry.priority
+            end
+        end
+    end
+    return math.huge
+end
 
 -- Verbosity tier ranks.  Lower = more essential.
 local TIER_RANK = {brief = 1, normal = 2, verbose = 3}
@@ -287,6 +335,100 @@ local function RemoveProperties(self, predicate)
     self.properties = kept
 end
 
+--- Clear a core field and its associated tier.  Companion to
+--- RemoveProperty for the 15 core fields (title, sectionLabel,
+--- name, controlType, ...).  Used by handlers that need to drop
+--- a field FromTooltip set but the handler considers redundant
+--- in its specific context (e.g. VMAbility formatter dropping
+--- the AbilityModifiersLabel sectionLabel because the synthesized
+--- Breakdown property already conveys the same context).
+--- @param self table  The SpeechData object.
+--- @param fieldName string  Core field name (must be in CORE_FIELD_SET).
+local function RemoveCoreField(self, fieldName)
+    if not CORE_FIELD_SET[fieldName] then
+        if Log then
+            Log.Warn("SpeechData: RemoveCoreField on unknown core field '"
+                .. tostring(fieldName) .. "'")
+        end
+        return
+    end
+    self.coreFields[fieldName] = nil
+    self.tiers[fieldName] = nil
+end
+
+--- Build the spokenRoles map key for a property.  Properties are
+--- keyed by "property:<label>:<NORMALIZED value>" so multiple entries
+--- sharing a label (e.g. PropertyText emitting Melee + Light + Finesse
+--- all with label "Property") each get their own slot, AND so
+--- formatting variations of the same value (trailing whitespace, casing)
+--- collapse to one slot.
+local function PropertyKey(label, value)
+    return "property:" .. label .. ":" .. NormalizeForCompare(value)
+end
+
+--- Cross-off rule for tooltip role lookup.  See FromTooltip's
+--- header docstring for the full key-scheme description.  Returns
+--- true when an incoming entry should be suppressed.
+---
+--- Comparison is normalization-based (NormalizeForCompare strips
+--- whitespace/punctuation/case) so trailing-period and casing
+--- mismatches between the row's stored text and the tooltip's
+--- rendered text don't defeat the cross-off.
+local function ShouldSkipSpoken(spoken, key, entryText)
+    if not spoken then return false end
+    local prevValue = spoken[key]
+    if prevValue == nil then return false end
+    if prevValue == true then return true end  -- wildcard
+    if type(prevValue) ~= "string" then return false end
+    return NormalizeForCompare(prevValue) == NormalizeForCompare(entryText)
+end
+
+--- Populate a spokenRoles map with this SpeechData's field keys
+--- and values.  Mirrors the recording done inside Speak() so callers
+--- that bypass Speak (rare) can still feed the cross-off mechanism.
+---
+--- Keys written:
+---   <fieldName>             for each populated core field.
+---   property:<label>        for each property.
+---
+--- Values written: NormalizeForCompare-normalized rendered text.
+--- ShouldSkipSpoken normalizes the incoming entryText too at compare
+--- time, so trailing-whitespace / casing / punctuation differences
+--- between sources (API row text vs XAML rendering) don't break the
+--- cross-off.  Pre-mark with the literal `true` for wildcard skip
+--- regardless of value.
+---
+--- @param self table  The SpeechData object.
+--- @param spokenRoles table  Map to populate (key -> normalized value
+---     for core fields, or `true` for property keys / wildcards).
+local function PopulateSpokenRoles(self, spokenRoles)
+    for fieldName, fieldValue in pairs(self.coreFields) do
+        spokenRoles[fieldName] = NormalizeForCompare(fieldValue)
+    end
+    for _, prop in ipairs(self.properties) do
+        spokenRoles[PropertyKey(prop.label, prop.value)] = true
+    end
+end
+
+--- Reassign property tiers via a predicate.  Predicate receives
+--- {label, value, tier} and returns either a new tier string ("brief",
+--- "normal", "verbose") or nil to leave the tier unchanged.  Used by
+--- handlers that need to apply a context-specific tier policy after
+--- FromTooltip's universal-map classification (e.g. radial fallback
+--- demoting non-damage properties to verbose so brief/normal stay
+--- terse, while keeping the universal map's tier values intact for
+--- panel use).
+--- @param self table  The SpeechData object.
+--- @param predicate function  Function(prop) -> string|nil.
+local function RetierProperties(self, predicate)
+    for _, prop in ipairs(self.properties) do
+        local newTier = predicate(prop)
+        if newTier then
+            prop.tier = newTier
+        end
+    end
+end
+
 --- Rename all properties with label `fromLabel` to `toLabel`.
 --- Used by handlers that need DC-type-specific relabeling of a
 --- generic FromTooltip label (e.g. "Property" -> "Breakdown" for
@@ -353,36 +495,52 @@ local function Delta(self, previous)
     return result
 end
 
---- Diff: return a new SpeechData with only fields whose normalized
---- values do NOT exactly match any value in `other`.  Used for
---- tooltip dedup: skip any text the handler already spoke.
+--- Diff: return a new SpeechData with only fields/properties that
+--- aren't suppressed by `other`.  Uses the SAME scoped-key cross-off
+--- as ShouldSkipSpoken (no flat value-set), so cross-field collisions
+--- can't occur (e.g. an item's Count="10" no longer accidentally
+--- suppresses a tooltip's Damage="10").
+---
+--- For each field in self, look up by (scoped) key in other:
+---   - Core field key = field name.  Suppress if other's same field
+---     has a normalized value matching self's.
+---   - Property key = "property:label:NormalizedValue" (PropertyKey).
+---     Suppress if other has the same (label, normalized-value) pair.
+---
+--- Mirrors how Speak's accumulate populates handlerState.spokenRoles
+--- after every speech.  One rule, no parallel cross-off paths.
+---
 --- @param self table  The tooltip SpeechData.
---- @param other table|nil  The handler's SpeechData.
+--- @param other table|nil  The handler's SpeechData (or any prior
+---     SpeechData to dedup against).
 --- @return table  New SpeechData with unmatched fields only.
 local function Diff(self, other)
     if not other then return self end
 
-    -- Build a set of normalized values from `other` for O(1) lookup.
-    local otherValues = {}
+    -- Build the same kind of map Speak's auto-accumulate produces:
+    -- core fields keyed by name -> normalized value, properties keyed
+    -- by PropertyKey -> true.
+    local scopedMap = {}
     if other.coreFields then
-        for _, otherValue in pairs(other.coreFields) do
-            otherValues[NormalizeForCompare(otherValue)] = true
+        for fieldName, fieldValue in pairs(other.coreFields) do
+            scopedMap[fieldName] = NormalizeForCompare(fieldValue)
         end
     end
     if other.properties then
         for _, prop in ipairs(other.properties) do
-            otherValues[NormalizeForCompare(prop.value)] = true
+            scopedMap[PropertyKey(prop.label, prop.value)] = true
         end
     end
 
     local result = Create()
     for fieldName, fieldValue in pairs(self.coreFields) do
-        if not otherValues[NormalizeForCompare(fieldValue)] then
+        if not ShouldSkipSpoken(scopedMap, fieldName, fieldValue) then
             result:Add(fieldName, fieldValue, self.tiers[fieldName])
         end
     end
     for _, prop in ipairs(self.properties) do
-        if not otherValues[NormalizeForCompare(prop.value)] then
+        if not ShouldSkipSpoken(scopedMap,
+            PropertyKey(prop.label, prop.value), prop.value) then
             result:AddProperty(prop.label, prop.value, prop.tier)
         end
     end
@@ -434,7 +592,8 @@ local function Format(self, verbosity)
             for insertIndex, prop in ipairs(self.properties) do
                 sortedProps[#sortedProps + 1] = {
                     prop = prop,
-                    priority = PROPERTY_ORDER[prop.label] or math.huge,
+                    priority = LookupPropertyPriority(
+                        prop.label, self.priorityOverrides),
                     insertIndex = insertIndex,
                 }
             end
@@ -472,17 +631,88 @@ local function Format(self, verbosity)
     return StripMarkupTags(table.concat(parts, ". "))
 end
 
---- Speak: format and speak with interrupt logic.  Records which
---- roles were populated on handlerState for tooltip cross-off.
+--- SpeakDelta: speak only what changed vs a prior SpeechData,
+--- but record the FULL self into handlerState.  Used by handlers
+--- that re-speak the same focused element repeatedly as its
+--- properties update (e.g. an alchemy expander whose IsChecked
+--- toggles, an INPC-driven slider value): the user wants to hear
+--- only the delta ("expanded" or "+5") rather than the entire
+--- entity restated, but the next delta computation needs the
+--- full current state as the baseline.
+---
+--- Differs from Speak() in that the spoken text is the delta
+--- but the recorded handlerState.spokenRoles + lastSpokenFullText
+--- reflect the FULL self.  This way tooltip cross-off references
+--- "everything currently true about this focus", and the next
+--- delta call diffs against the right baseline.
+---
+--- @param self table  The SpeechData object (full current state).
+--- @param handlerState table  Handler's isolated state.
+--- @param previousSpeechData table|nil  Prior SpeechData to diff
+---     against (typically handlerState.previousSpeechData).
+--- @param isScreenEntry boolean  Whether this is a screen entry.
+--- @param verbosity string|nil  Verbosity level.
+--- @param userInitiated boolean|nil  True when user navigated.
+--- @param logTag string|nil  Log prefix (default "DELTA SPEAK").
+local function SpeakDelta(self, handlerState, previousSpeechData,
+                          isScreenEntry, verbosity, userInitiated,
+                          logTag)
+    local delta = self:Delta(previousSpeechData)
+    local deltaAssembled = delta:Format(verbosity)
+
+    -- Always record the full state (lastSpokenFullText + spokenRoles)
+    -- regardless of whether the delta produced spoken output.  The
+    -- next delta needs this as its baseline; tooltip cross-off needs
+    -- the full set of currently-spoken roles.
+    local fullAssembled = self:Format(verbosity)
+    if fullAssembled and fullAssembled ~= "" then
+        handlerState.lastSpokenFullText = fullAssembled
+    end
+    if not handlerState.spokenRoles then
+        handlerState.spokenRoles = {}
+    end
+    for fieldName, fieldValue in pairs(self.coreFields) do
+        handlerState.spokenRoles[fieldName] = NormalizeForCompare(fieldValue)
+    end
+    for _, prop in ipairs(self.properties) do
+        handlerState.spokenRoles[
+            PropertyKey(prop.label, prop.value)] = true
+    end
+
+    if not deltaAssembled or deltaAssembled == "" then return end
+
+    local interrupt = isScreenEntry or (userInitiated == true)
+    Log.Info((logTag or "DELTA SPEAK")
+        .. (interrupt and "" or " (append)")
+        .. ": " .. deltaAssembled)
+    Ext.Tolk.Speak(deltaAssembled, interrupt)
+end
+
+--- Speak: format and speak with interrupt logic.  Accumulates
+--- spoken role keys onto handlerState.spokenRoles for tooltip
+--- cross-off.  Callers control reset by clearing
+--- handlerState.spokenRoles at focus / selection boundaries
+--- (via the panel factory's RecordSpokenRoles or by direct
+--- assignment); within one focus, every Speak / tooltip Speak
+--- adds to the set so the cross-off correctly suppresses fields
+--- across multiple speech events on the same focus.
 --- @param self table  The SpeechData object.
 --- @param handlerState table  Handler's isolated state.
 --- @param isScreenEntry boolean  Whether this is a screen entry.
 --- @param verbosity string|nil  Verbosity level (default "verbose").
 --- @param userInitiated boolean|nil  True when user navigated.
+--- @param logTag string|nil  Log prefix (default "SPEAK").  Allows
+---     callers like the radial path to keep their distinct log
+---     prefix ("RADIAL [HotBar]", "TOOLTIP (radial fallback)") for
+---     debugging while still going through the architectural Speak.
+--- Returns the assembled text on emit, or nil if nothing was
+--- spoken (empty SpeechData / cross-off skipped everything).
+--- Callers can use the return value to gate state-change
+--- detection ("did a tooltip actually speak on this focus").
 local function Speak(self, handlerState, isScreenEntry, verbosity,
-                     userInitiated)
+                     userInitiated, logTag)
     local assembled = self:Format(verbosity)
-    if not assembled or assembled == "" then return end
+    if not assembled or assembled == "" then return nil end
 
     -- Interrupt on user-initiated events or screen entries.
     -- System events (widget scans, post-settle) append.
@@ -497,20 +727,30 @@ local function Speak(self, handlerState, isScreenEntry, verbosity,
         interrupt = false
     end
 
-    Log.Info("SPEAK"
+    Log.Info((logTag or "SPEAK")
         .. (interrupt and "" or " (append)")
         .. ": " .. assembled)
     Ext.Tolk.Speak(assembled, interrupt)
     handlerState.lastSpokenFullText = assembled
 
-    -- Record which roles were populated for cross-off dedup.
-    handlerState.spokenRoles = {}
-    for fieldName, _ in pairs(self.coreFields) do
-        handlerState.spokenRoles[fieldName] = true
+    -- Accumulate spoken role keys + values.  Caller is responsible
+    -- for resetting handlerState.spokenRoles at context boundaries
+    -- (focus / selection change, screen entry).  Within one focus,
+    -- multiple Speaks (initial focus speech + each progressive-
+    -- load tooltip wave) build up the map so subsequent FromTooltip
+    -- calls do value-aware cross-off (skip on match, emit on
+    -- state change -- see ShouldSkipSpoken).
+    if not handlerState.spokenRoles then
+        handlerState.spokenRoles = {}
+    end
+    for fieldName, fieldValue in pairs(self.coreFields) do
+        handlerState.spokenRoles[fieldName] = NormalizeForCompare(fieldValue)
     end
     for _, prop in ipairs(self.properties) do
-        handlerState.spokenRoles["property:" .. prop.label] = true
+        handlerState.spokenRoles[
+            PropertyKey(prop.label, prop.value)] = true
     end
+    return assembled
 end
 
 -- ============================================================================
@@ -530,11 +770,15 @@ Create = function()
         HasField = HasField,
         RemoveProperty = RemoveProperty,
         RemoveProperties = RemoveProperties,
+        RemoveCoreField = RemoveCoreField,
+        RetierProperties = RetierProperties,
         RelabelProperty = RelabelProperty,
+        PopulateSpokenRoles = PopulateSpokenRoles,
         Delta = Delta,
         Diff = Diff,
         Format = Format,
         Speak = Speak,
+        SpeakDelta = SpeakDelta,
     }
 end
 
@@ -608,10 +852,13 @@ local TOOLTIP_ROLE_MAP = {
     -- SubTitleContainer is the item subtype shown under the title
     -- (e.g. "Light Armour").  Map to a "Category" property so it
     -- doesn't collide with the flavor description from ContentText.
+    -- Tier "normal" (not "brief"): the slot navigation already
+    -- announced item identity (e.g. "Off Hand: Studded Shield"),
+    -- so the category is meaningful detail, not bare-bones info.
     SubTitleContainer  = {field = "property", label = "Category",
-                          tier = "brief"},
+                          tier = "normal"},
     subtitleText       = {field = "property", label = "Category",
-                          tier = "brief"},
+                          tier = "normal"},
 
     -- Description variants (additional templates).
     ExtraDescription   = {field = "description", tier = "verbose"},
@@ -621,15 +868,39 @@ local TOOLTIP_ROLE_MAP = {
     -- Generic tooltip body role (XP bar, Class, Race, Background
     -- tooltips put their body text under this role).
     tooltipContent     = {field = "description", tier = "verbose"},
+    -- Character sheet ProficiencyGroup expander headers (Simple
+    -- Weapons / Martial Weapons / Armours).  XAML
+    -- PreloadedCharacterPanel_c.xaml:1541 -- a TextBlock whose
+    -- bound text changes per group via DataTriggers.  Pure
+    -- explanatory body text ("Most people can use simple Weapons
+    -- with Proficiency...") -- belongs in description, not as a
+    -- property labeled with the raw XAML name.
+    ProficiencyGroupTooltip = {field = "description",
+                          tier = "verbose"},
 
     -- Value field.
     SkillValue         = {field = "value",       tier = "brief"},
 
     -- Property entries (formatted as "label: value").
+    --
+    -- DamageLabel / SpellDamageText: XAML renders the value with the
+    -- type word baked in ("1 to 4 Damage" or "1d4 Damage").  Strip
+    -- the trailing word so "Damage: 1 to 4 Damage" doesn't double
+    -- the noun.  Same transform damageDisplayText already uses.
     DamageLabel        = {field = "property", label = "Damage",
-                          tier = "normal"},
+                          tier = "normal",
+                          transform = function(text)
+                              return (text:gsub(
+                                  "%s+[Dd]amage$", "")
+                                  :gsub("%s+[Hh]ealing$", ""))
+                          end},
     SpellDamageText    = {field = "property", label = "Damage",
-                          tier = "normal"},
+                          tier = "normal",
+                          transform = function(text)
+                              return (text:gsub(
+                                  "%s+[Dd]amage$", "")
+                                  :gsub("%s+[Hh]ealing$", ""))
+                          end},
     DiceValue          = {field = "property", label = "Dice",
                           tier = "normal"},
     DamageType         = {field = "property", label = "Damage type",
@@ -643,20 +914,23 @@ local TOOLTIP_ROLE_MAP = {
                               return (text:gsub(
                                   "^Equipped by%s+", ""))
                           end},
-    -- Weight and Gold are factual bookkeeping (not flavor text), so
-    -- they belong at tier "normal" -- present in brief/normal/verbose
-    -- minus brief.  Brief drops them for the most terse readout;
-    -- normal keeps them because "what does it weigh / cost" is a
-    -- practical item fact, not prose padding.
+    -- Weight and Gold are factual bookkeeping that the user typically
+    -- only wants when they're explicitly evaluating an item (compare
+    -- view, merchant decisions).  At normal tier, equipment-slot
+    -- navigation should be terse -- "what is this and what does it
+    -- do" -- not "what does it weigh".  Verbose tier exposes both.
     weightText         = {field = "property", label = "Weight",
-                          tier = "normal"},
+                          tier = "verbose"},
     GoldContainer      = {field = "property", label = "Gold",
-                          tier = "normal"},
+                          tier = "verbose"},
     -- ArmorText carries the AC value; the label "Armour Class" is
     -- duplicated in the separate armorDisplay TextBlock which
-    -- equipment handlers should drop after FromTooltip.
+    -- equipment handlers should drop after FromTooltip.  Tier
+    -- "normal" -- AC is meaningful detail (the headline armor stat),
+    -- equivalent to the Damage prose for weapons.  Brief tier stays
+    -- terse with just identifying info ("Equipped by: X").
     ArmorText          = {field = "property", label = "Armour Class",
-                          tier = "brief"},
+                          tier = "normal"},
     -- DamageRange: the calculated min-max for attack or heal effects.
     -- Value embeds the context word (e.g. "4 to 10 Healing" or
     -- "4 to 9 Damage"), so we use a neutral "Amount" label.  Handlers
@@ -866,13 +1140,54 @@ function SpeechDataModule.CleanTooltipText(rawText)
     return cleaned
 end
 
+--- ShouldSkipSpoken: cross-off rule for FromTooltip.  Returns true
+--- when an incoming tooltip entry should be suppressed because it
+--- matches what was already spoken on this focus.
+---
+--- Two key schemes for spokenRoles:
+---
+---   Core fields (key = "<fieldName>", e.g. "name", "description"):
+---     - Stored value is the spoken text.  Value comparison handles
+---       state changes correctly: same value = skip, different value
+---       = emit (e.g. Reactions toggle: state = "Will not trigger"
+---       on wave 1, "Trigger automatically" on wave 2 -> values
+---       differ -> emit).
+---     - The literal `true` is a wildcard sentinel: skip any value
+---       for this role (used by handlers that announce a role via
+---       a non-canonical format, e.g. VMAbility row says "STR" via
+---       AddProperty while the tooltip's Title -> name carries
+---       "Strength").
+---
+---   Properties (key = "property:<label>:<value>"):
+---     - Stored value is `true`.  Match is presence-based because
+---       the value is already encoded in the key.
+---     - This handles multi-instance properties correctly:
+---       PropertyText XAML emits multiple entries with label
+---       "Property" and different values (Melee, DEX Save, Attack
+---       Roll).  With a value-suffixed key, each (label, value)
+---       pair has its own slot -> wave 2's same pairs match and
+---       skip; new pairs emit.
+---
+--- This is the architectural dedup rule.  Speak / PopulateSpokenRoles
+--- record into the map; FromTooltip consults it.  No string compares
+--- of full assembled output, no parallel diff stashes -- one map,
+--- one rule.
+---
+--- Implementation lives near the top of this file (above the
+--- Speak family), not here, so that Speak / SpeakDelta /
+--- PopulateSpokenRoles can capture them in their lexical scope.
+--- Lua local functions are only visible to code defined after
+--- them, so forward references would otherwise read as global
+--- nil lookups.
+
 --- FromTooltip: build a SpeechData from structured tooltip data using
 --- the universal role mapping.  Handles junk filtering, markup
 --- stripping, and optional cross-off against already-spoken roles.
 ---
 --- @param structuredData table  Array of {role, text, fontSize?} from C++.
---- @param spokenRoles table|nil  Handler's spokenRoles set.  When
----     provided, fields whose core role was already spoken are left nil.
+--- @param spokenRoles table|nil  Handler's spokenRoles map (see
+---     ShouldSkipSpoken).  When provided, fields whose role+value
+---     match (or are wildcard-marked) are left nil.
 --- @return table  SpeechData object with fields populated.
 function SpeechDataModule.FromTooltip(structuredData, spokenRoles)
     local result = Create()
@@ -895,21 +1210,29 @@ function SpeechDataModule.FromTooltip(structuredData, spokenRoles)
                 entryText = mapping.transform(entryText)
             end
             if mapping.field == "property" then
-                -- Property: skip if this label was already spoken.
-                if not spoken["property:" .. mapping.label] then
+                -- Property key includes value; same (label, value)
+                -- pair is presence-skipped.  Multi-instance labels
+                -- (PropertyText -> "Property: Melee", "Property:
+                -- Light", etc.) each get their own slot.
+                if not ShouldSkipSpoken(spoken,
+                    PropertyKey(mapping.label, entryText),
+                    entryText) then
                     result:AddProperty(mapping.label, entryText,
                         mapping.tier)
                 end
             else
-                -- Core field: skip if this role was already spoken.
-                if not spoken[mapping.field] then
+                -- Core field: value-comparison cross-off (state
+                -- changes emit, identical values skip).
+                if not ShouldSkipSpoken(spoken,
+                    mapping.field, entryText) then
                     result:Add(mapping.field, entryText, mapping.tier)
                 end
             end
         elseif role ~= "" then
             -- Unknown but named role: keep as property.
             -- The role IS a meaningful XAML name we haven't mapped yet.
-            if not spoken["property:" .. role] then
+            if not ShouldSkipSpoken(spoken,
+                PropertyKey(role, entryText), entryText) then
                 result:AddProperty(role, entryText, "normal")
             end
         end
@@ -1221,20 +1544,30 @@ function SpeechDataModule.CollapseProperties(
     end
     local excludeLower = excludeValue and excludeValue:lower() or nil
     local collectedValues = {}
+    local foundAnySourceEntry = false
     for _, prop in ipairs(speechData.properties) do
         if prop.label == sourceLabel then
+            foundAnySourceEntry = true
             if not (excludeLower
                 and prop.value:lower() == excludeLower) then
                 collectedValues[#collectedValues + 1] = prop.value
             end
         end
     end
-    if #collectedValues == 0 then return end
+    -- Nothing to do if the source label never appeared.  When it
+    -- did appear but every value was excluded (e.g. only entry was
+    -- "Property: Mace" on an item titled "Mace"), we still need to
+    -- strip the source entries -- otherwise the duplicate-of-title
+    -- leaks through as "Property: Mace" because the early return
+    -- skipped the RemoveProperties call.
+    if not foundAnySourceEntry then return end
     speechData:RemoveProperties(function(prop)
         return prop.label == sourceLabel
     end)
-    speechData:AddProperty(targetLabel,
-        table.concat(collectedValues, ", "), tier or "normal")
+    if #collectedValues > 0 then
+        speechData:AddProperty(targetLabel,
+            table.concat(collectedValues, ", "), tier or "normal")
+    end
 end
 
 function SpeechDataModule.SetHintsEnabled(enabled)

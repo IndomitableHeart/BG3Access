@@ -69,6 +69,46 @@ local suppressNextWidgetScan = false
 local currentGameState = "Unknown"
 
 -- ---------------------------------------------------------------------------
+-- ResolveActiveTooltipDispatcher: picks the right per-context tooltip
+-- dispatch function based on priority.  Conceptually there's ONE active
+-- handler at any moment for a tooltip event; this helper centralizes the
+-- decision so the snapshot handler can collapse to a single dispatch
+-- call instead of duplicating an if/elif/else.  Each per-context
+-- DispatchTooltip function (CC, WorldUI, Menus) retains its own
+-- legitimately context-specific work (CC caches lastTooltipData, WorldUI
+-- handles dedup-reset / tooltip-close / compare-view / radial fallback /
+-- inspect cache, Menus is trivial) -- the choice of WHICH function to
+-- call lives here.
+--
+-- Priority order:
+--   1. CC (CharCreation owns its tooltip dispatch when ccState says CC
+--      is open -- highest priority because CC's own widget handlers
+--      shouldn't see tooltip data).
+--   2. WorldUI when EITHER routeToWorld is true OR a radial menu (RT
+--      shortcuts / RB action) is open.  The radial carve-out matters
+--      because radial slot tooltips need WorldUI's radial-fallback
+--      path even when a Menus handler (e.g. ShortcutsMenu under
+--      gui::DCGameMenu) is active for the parent widget.
+--   3. Menus (default fallback for pre-game / pause-menu contexts).
+--
+-- Returns the dispatch function or nil if no module exposes one (which
+-- would be a load-order bug -- modules are loaded before EventRouter).
+-- ---------------------------------------------------------------------------
+local function ResolveActiveTooltipDispatcher(routeToWorld)
+    if CC.IsInCC and CC.IsInCC() then
+        return CC.DispatchTooltip
+    end
+    local World = BG3Access.Client.WorldUI
+    local inRadial = World and World.IsRadialOpen
+        and World.IsRadialOpen() or false
+    if (routeToWorld or inRadial)
+        and World and World.DispatchTooltip then
+        return World.DispatchTooltip
+    end
+    return Menus.DispatchTooltip
+end
+
+-- ---------------------------------------------------------------------------
 -- HandleTickSnapshot: thin router.
 --
 -- Iterates snapshot.widgetEvents (one entry per new/changed widget this
@@ -78,6 +118,9 @@ local currentGameState = "Unknown"
 -- handler kinds activated; menu wins over world if both appeared.
 -- ---------------------------------------------------------------------------
 local function HandleTickSnapshot(snapshot)
+    Log.Debug("[BG3A_BC] phase=lua_snapshot_begin events="
+        .. tostring(snapshot.widgetEvents and #snapshot.widgetEvents or 0)
+        .. " removed=" .. tostring(snapshot.widgetRemoved or false))
     local widgetEvents = snapshot.widgetEvents or {}
     local hasWidgetEvents = #widgetEvents > 0
     -- Track whether a menu handler activated this tick.  Used to gate
@@ -124,16 +167,38 @@ local function HandleTickSnapshot(snapshot)
                             and not textValue:match("^%d+%%?$")
                             and not spokenLoadingTips[textValue] then
                             spokenLoadingTips[textValue] = true
-                            local tipSpeech = SpeechData.Create()
-                            tipSpeech:Add("description", textValue, "normal")
                             Log.Info("LOADING TIP: " .. textValue)
-                            Ext.Tolk.Speak(tipSpeech:Format(), false)
+                            -- One-off announcement, no field structure --
+                            -- Alert is the correct primitive per the
+                            -- speech architecture (CLAUDE.md).  "queue"
+                            -- so multiple buffered tips speak in order
+                            -- and a tip in flight isn't killed by the
+                            -- next one arriving.  Direct Ext.Tolk.Speak
+                            -- bypassed dedup tracking and didn't route
+                            -- through the architecture.
+                            SpeechData.Alert(textValue, "queue")
                         end
                     end
                 end
             end
         end
     end
+
+    -- =================================================================
+    -- HUD notification popups (Notification_c): recipe unlocks, spell
+    -- learns, item pickups, region announcements, journal/quest
+    -- updates.  Permanent widget with a Style.TemplateSwitcher driven
+    -- by Notification.Type; no focus, no Loaded event for activation.
+    -- The Notifications module BFS-reads its visible TextBlocks per
+    -- tick (cheap when idle -- inner ContentControl is collapsed,
+    -- BFS bails on IsVisibleDP filter).  See Notifications.lua for
+    -- the full architecture note.
+    -- =================================================================
+    -- Notifications now drives itself off Ext.Events.Tick (see
+    -- Notifications.lua) rather than snapshot dispatch -- snapshot
+    -- dispatch is gated on change flags and won't fire during stable
+    -- gameplay, but notification popups can appear without any of
+    -- those flags being set.  No call here.
 
     local focusedElement = snapshot.focusedElement
 
@@ -248,13 +313,39 @@ local function HandleTickSnapshot(snapshot)
     if not suppressSnapshots and snapshot.widgetAdded and hasWidgetEvents then
         -- Skip widget scan noise after menu close (e.g., PartyLine_c
         -- re-discovered when returning to world from shortcuts/radials).
-        -- Clear widgetAdded so downstream discovery (RoutePanelSnapshot)
-        -- also ignores this scan.
+        -- Filter the events: drop world/HUD re-discovery events but
+        -- KEEP menu events.  Without this filter, the user closing a
+        -- menu and immediately reopening one (e.g., Esc → close pause
+        -- menu → Esc → reopen pause menu) lands the reopen's widget
+        -- event in the suppressed tick, dropping the activation and
+        -- producing silence.  Menu events arriving here are
+        -- legitimate user opens; only world re-discovery is noise.
         if suppressNextWidgetScan then
             suppressNextWidgetScan = false
-            snapshot.widgetAdded = false
-            Log.Debug("WIDGET EVENT suppressed (menu close re-scan)")
-        else
+            local filteredEvents = {}
+            for _, widgetEvent in ipairs(widgetEvents) do
+                local dcType = widgetEvent.dcType or ""
+                local elemName = widgetEvent.elemName or ""
+                local isMenuEvent = Menus.IsMenuDCType(dcType)
+                    or (Menus.IsMenuWidgetName
+                        and Menus.IsMenuWidgetName(elemName))
+                if isMenuEvent then
+                    filteredEvents[#filteredEvents + 1] = widgetEvent
+                end
+            end
+            if #filteredEvents == 0 then
+                snapshot.widgetAdded = false
+                Log.Debug("WIDGET EVENT suppressed (menu close re-scan)")
+            else
+                widgetEvents = filteredEvents
+                Log.Debug("WIDGET EVENT partial suppression "
+                    .. "(menu close re-scan): kept "
+                    .. #filteredEvents .. " menu events, dropped "
+                    .. "world re-discovery noise")
+            end
+        end
+
+        if snapshot.widgetAdded then
             local World = BG3Access.Client.WorldUI
 
             -- Reset dialog state once per tick when no cutscene event
@@ -297,6 +388,20 @@ local function HandleTickSnapshot(snapshot)
                             -- handled menu DC types.  Generic types
                             -- (ls.Widget, ls.DCPartyLine) must NOT
                             -- reset WorldUI routing.
+                            Menus.HandleWidgetAdded(widgetEvent)
+                            menuActivated = true
+                        elseif Menus.IsMenuWidgetName
+                            and Menus.IsMenuWidgetName(
+                                widgetEvent.elemName) then
+                            -- Menu-side widget-name routing: handlers
+                            -- that identify by widget x:Name only
+                            -- (PauseMenu = "GameMenu_c", ShortcutsMenu
+                            -- = "shortcutsMenu" -- both share DC
+                            -- gui::DCGameMenu so the DC alone can't
+                            -- distinguish them).  Without this branch,
+                            -- their widgetAdded events fall through to
+                            -- the "generic noise" else and never
+                            -- activate.
                             Menus.HandleWidgetAdded(widgetEvent)
                             menuActivated = true
                         elseif World and World.IsWorldWidgetName
@@ -352,7 +457,7 @@ local function HandleTickSnapshot(snapshot)
             if dialogOverlaySpoke and routeToWorld then
                 worldDialogOverlayJustSpoke = true
             end
-        end  -- suppressNextWidgetScan else
+        end  -- end of "if snapshot.widgetAdded then" block
     end
 
     -- =================================================================
@@ -363,8 +468,9 @@ local function HandleTickSnapshot(snapshot)
     -- Hub-and-spoke: the hub passes raw structured tooltip data
     -- (array of {role, text} tables) to the active handler.
     -- Each handler builds its own SpeechData from the roles it
-    -- cares about via customTooltipFn.  Three-way dispatch:
-    -- CC, WorldUI, or Menus.
+    -- cares about via customTooltipFn.  Single dispatch point;
+    -- ResolveActiveTooltipDispatcher picks the right per-context
+    -- function based on priority (see helper above).
     -- =================================================================
     if not suppressSnapshots then
         if snapshot.tooltipChanged
@@ -379,39 +485,51 @@ local function HandleTickSnapshot(snapshot)
                 structuredTooltipData = snapshot.tooltipTexts
             end
 
-            -- Dispatch to active context (handler decides speech).
-            local isCC = CC.IsInCC and CC.IsInCC()
-            if isCC then
-                if CC.DispatchTooltip then
-                    CC.DispatchTooltip(structuredTooltipData, snapshot)
-                end
-            elseif routeToWorld then
-                local World = BG3Access.Client.WorldUI
-                if World and World.DispatchTooltip then
-                    World.DispatchTooltip(structuredTooltipData, snapshot)
-                end
-            else
-                if Menus.DispatchTooltip then
-                    Menus.DispatchTooltip(structuredTooltipData, snapshot)
-                end
+            local dispatch = ResolveActiveTooltipDispatcher(routeToWorld)
+            if dispatch then
+                dispatch(structuredTooltipData, snapshot)
             end
         end
     end
 
-    -- Update UI focus flag: true whenever the snapshot carries a
-    -- focused element.  This is how IsUIActive knows whether the
-    -- player is in the world (no focus) or in some UI (focused).
-    -- When focus is lost (transition from true to false), silence
-    -- any in-progress speech -- the user just closed a menu/panel.
+    -- Update UI focus flag.  Event-driven: only update when the
+    -- snapshot actually carries focus information.  Snapshots fire
+    -- per-event (widget add/remove, INPC notification, tooltip
+    -- change, etc.); only focus-bearing snapshots have an
+    -- authoritative focusedElement field.  Widget-add snapshots
+    -- (e.g. cutscene widget refresh) come through with focusedElement
+    -- = nil even when the user is genuinely focused on something --
+    -- if we recompute snapshotHasUIFocus from those, it flickers
+    -- false and gates RS off mid-navigation.
+    --
+    -- Authoritative signals (in order of priority):
+    --   1. snapshot.focusChanged = true: focus state genuinely
+    --      changed this snapshot.  Update from focusedElement
+    --      (if non-nil = gained, if nil = lost).
+    --   2. focusedElement present (non-nil) on any snapshot: even
+    --      without focusChanged, that's evidence focus is still
+    --      where we thought.  Update if changed.
+    --   3. Otherwise: keep prior value.  The snapshot doesn't
+    --      provide focus info.
     local hadUIFocus = snapshotHasUIFocus
-    snapshotHasUIFocus = (focusedElement ~= nil
+    if snapshot.focusChanged then
+        snapshotHasUIFocus = (focusedElement ~= nil
+            and focusedElement.elemType ~= nil
+            and focusedElement.elemType ~= "")
+    elseif focusedElement ~= nil
         and focusedElement.elemType ~= nil
-        and focusedElement.elemType ~= "")
+        and focusedElement.elemType ~= "" then
+        snapshotHasUIFocus = true
+    end
+    -- Note: when focusedElement is nil and focusChanged is false,
+    -- snapshotHasUIFocus is unchanged (preserved across the snapshot).
+
     if hadUIFocus and not snapshotHasUIFocus then
-        -- Only silence when no handler is active.  Focus can
-        -- temporarily drop between ticks during menu transitions
-        -- (widget scan ticks have no focusedElement).  If a handler
-        -- is still active, the menu/panel is still open.
+        -- Focus genuinely transitioned true -> false (focusChanged
+        -- fired with no focusedElement).  Silence in-progress speech
+        -- only when no handler is active -- a panel/menu/CC handler
+        -- being active means the UI is still open even if focus
+        -- briefly dropped during a transition.
         local World = BG3Access.Client.WorldUI
         local hasActiveHandler = Menus.GetActiveHandler()
             or (World and World.GetActivePanelHandler
@@ -449,6 +567,36 @@ local function HandleTickSnapshot(snapshot)
             -- widget name (otherwise we'd false-match on shared types).
             if not activeWidgetName then
                 handlerMatched = true
+            end
+        end
+
+        -- Fallback: snapshot.removedWidgetData is a single field (per
+        -- the C++ TickSnapshot design -- not a vector like
+        -- widgetEvents).  Multi-widget menus close several widgets
+        -- simultaneously and C++ can only report ONE of them.  If the
+        -- reported one wasn't the active handler's specifically-
+        -- registered widget x:Name, the explicit match above fails --
+        -- yet the active handler's widget IS gone from the live set.
+        -- Use the SAME widgetRemoved event as our trigger but check
+        -- allWidgetNames to authoritatively detect a missing widget.
+        -- Still event-driven (only fires when SOMETHING was removed),
+        -- not a per-tick poll.
+        if not handlerMatched and activeHandler and activeWidgetName
+            and snapshot.allWidgetNames then
+            local stillPresent = false
+            for _, liveWidgetName in ipairs(snapshot.allWidgetNames) do
+                if liveWidgetName == activeWidgetName then
+                    stillPresent = true
+                    break
+                end
+            end
+            if not stillPresent then
+                handlerMatched = true
+                Log.Info("Widget removal liveness fallback: "
+                    .. "removedWidgetData reported '" .. removedName
+                    .. "' but active handler's widget '"
+                    .. activeWidgetName
+                    .. "' is also gone from allWidgetNames")
             end
         end
 
@@ -567,7 +715,9 @@ local function HandleTickSnapshot(snapshot)
             World.ClearRadialFocus()
         end
         if routeToWorld then
-            if World then World.HandlePanelWidgetRootChanged() end
+            if World then
+                World.HandlePanelWidgetRootChanged(widgetRootId)
+            end
         else
             Menus.HandleWidgetRootChanged()
         end
@@ -681,11 +831,25 @@ local function HandleTickSnapshot(snapshot)
             end
         else
             Menus.RouteSnapshot(snapshot)
+            -- Recovery: if Menus.RouteSnapshot finishes with no
+            -- active handler, the menu we were routed for has
+            -- closed (staleness check cleared it OR the in-game
+            -- gate skipped the MainMenu default).  Flip routing
+            -- back to world so the next snapshot reaches WorldUI
+            -- and ShouldHandleDPad in TargetSelect stops gating
+            -- on a phantom menu.  Without this, a closed RT
+            -- shortcuts radial / pause menu / etc. could leave
+            -- routing stuck on Menus for the rest of the session.
+            if Menus.GetActiveHandler and not Menus.GetActiveHandler() then
+                routeToWorld = true
+                Log.Info("Routing back to WorldUI (Menus has no active handler)")
+            end
         end
     end
 
     -- Tooltip events are processed BEFORE the focusedElement guard
     -- (above) so tooltip-only snapshots aren't dropped.
+    Log.Debug("[BG3A_BC] phase=lua_snapshot_end")
 end
 
 -- ---------------------------------------------------------------------------
@@ -899,44 +1063,6 @@ local function GetRSDirection()
     return RS_DIRECTION_LEFT
 end
 
---- Find the active handler with BuildDetailList support.
---- Priority: CC > TargetSelect (combat effects view) > WorldUI > Menus.
----
---- TargetSelect takes priority over WorldUI/Menus when the user has
---- a currently-cycled combat target, so RS-Left during target
---- select opens the effects view (statuses on the targeted
---- character) rather than, e.g., the hotbar's detail view.
-local function FindActiveDetailHandler()
-    if CC.IsInCC and CC.IsInCC() then
-        local ccHandler = CC.GetActiveHandler
-            and CC.GetActiveHandler()
-        if ccHandler and ccHandler.BuildDetailList then
-            return ccHandler
-        end
-    end
-    local TargetSelect = BG3Access.Client.TargetSelect
-    if TargetSelect and TargetSelect.GetActiveDetailHandler then
-        local effectsHandler = TargetSelect.GetActiveDetailHandler()
-        if effectsHandler and effectsHandler.BuildDetailList then
-            return effectsHandler
-        end
-    end
-    local World = BG3Access.Client.WorldUI
-    if World and World.GetActivePanelHandler then
-        local panelHandler = World.GetActivePanelHandler()
-        if panelHandler and panelHandler.BuildDetailList then
-            return panelHandler
-        end
-    end
-    if Menus and Menus.GetActiveHandler then
-        local menuHandler = Menus.GetActiveHandler()
-        if menuHandler and menuHandler.BuildDetailList then
-            return menuHandler
-        end
-    end
-    return nil
-end
-
 --- IsUIActiveForRS: checks whether UI is consuming RS input.
 ---
 --- Previously gated on `routeToWorld`, but that flag is about which
@@ -960,11 +1086,57 @@ end
 --- main menu / load sequence / transitions where stick input
 --- should NEVER trigger GPS / HUD reader / combat turn-order.
 --- We track `currentGameState` via GameStateChanged.
+--- Sanity check: snapshotHasUIFocus alone is unreliable because
+--- Noesis doesn't cleanly reset focus when overlays close.  After
+--- Container / Examine / context-menu closes, the engine's
+--- focusedElement can still point at a stale HUD element, so the
+--- flag stays true forever and RS gets gated indefinitely.
+---
+--- Cross-verify: only trust snapshotHasUIFocus when a REAL
+--- handler is also active.  PartyLine doesn't count (sticky HUD
+--- handler activated by snapshot lone-discovery).  CC / inspect
+--- have their own explicit flags handled above.
+local function HasRealUIHandlerActive()
+    if Menus and Menus.GetActiveHandler
+        and Menus.GetActiveHandler() then
+        return true
+    end
+    local World = BG3Access.Client.WorldUI
+    if World and World.GetActivePanelHandler then
+        local panel = World.GetActivePanelHandler()
+        if panel and panel.name and panel.name ~= "PartyLine" then
+            return true
+        end
+    end
+    return false
+end
+
 local function IsUIActiveForRS()
     if currentGameState ~= "Running" then return true end
     if CC.IsInCC and CC.IsInCC() then return true end
     if inspectWidgetActive then return true end
-    return snapshotHasUIFocus
+    -- Handlers are the sole truth source for "is UI active".  If a
+    -- panel/menu handler is set, we're in UI; if not, the user is in
+    -- the world.
+    --
+    -- Previous design ORed in snapshotHasUIFocus as a "sanity check"
+    -- backup, but Noesis leaves stale focus state behind constantly
+    -- (after fast travel, after context menu close, after character
+    -- sheet close, after Tutorial dismiss, etc.) -- the engine's
+    -- focused-element pointer continues pointing at a hidden HUD
+    -- element with non-empty elemType, so snapshotHasUIFocus stays
+    -- stuck `true` and gated RS off in the free world indefinitely.
+    -- The "sanity check" caused more bugs than it prevented.
+    --
+    -- The remaining concern (an untracked UI not gating because no
+    -- handler was registered for it) is bounded: every UI we
+    -- currently see has a handler, and a missing handler shows up as
+    -- "weird RS behavior in this menu" not "RS dead in world", which
+    -- is recoverable and obvious in testing.  Per-handler stuck-
+    -- active issues (Map after fast travel) are tracked separately
+    -- and need fixes at their source, not by gating RS at a global
+    -- level.
+    return HasRealUIHandlerActive()
 end
 
 --- Diagnostic: explains WHY IsUIActiveForRS returned true on a given
@@ -978,13 +1150,109 @@ local function DescribeRSGateReason()
     end
     if CC.IsInCC and CC.IsInCC() then return "CC active" end
     if inspectWidgetActive then return "inspect panel active" end
-    if snapshotHasUIFocus then return "UI focused" end
+    if HasRealUIHandlerActive() then
+        local Menus = BG3Access.Client.Menus
+        local World = BG3Access.Client.WorldUI
+        local menuHandler = Menus and Menus.GetActiveHandler
+            and Menus.GetActiveHandler()
+        local panelHandler = World and World.GetActivePanelHandler
+            and World.GetActivePanelHandler()
+        local active = (menuHandler and menuHandler.name)
+            or (panelHandler and panelHandler.name)
+            or "unknown handler"
+        return "handler active: " .. active
+    end
     return "unknown"
 end
 
+--- Find the active handler with BuildDetailList support.
+--- Priority: CC > TargetSelect (combat effects view) > WorldUI > Menus.
+---
+--- TargetSelect takes priority over WorldUI/Menus when the user has
+--- a currently-cycled combat target, so RS-Left during target
+--- select opens the effects view (statuses on the targeted
+--- character) rather than, e.g., the hotbar's detail view.
+---
+--- WorldUI/Menus paths are gated on IsUIActiveForRS: panel handlers
+--- like PartyLineHandler stay set as activePanelHandler permanently
+--- (PartyLine_c is the always-visible HUD portrait row, never
+--- removed), so without the gate, free-world RS-Left would route
+--- to PartyLine's detail view and silently swallow the GPS toggle.
+--- CC and TargetSelect already imply UI/target focus, so they
+--- don't need the gate.
+local function FindActiveDetailHandler()
+    if CC.IsInCC and CC.IsInCC() then
+        local ccHandler = CC.GetActiveHandler
+            and CC.GetActiveHandler()
+        if ccHandler and ccHandler.BuildDetailList then
+            return ccHandler
+        end
+    end
+    local TargetSelect = BG3Access.Client.TargetSelect
+    if TargetSelect and TargetSelect.GetActiveDetailHandler then
+        local effectsHandler = TargetSelect.GetActiveDetailHandler()
+        if effectsHandler and effectsHandler.BuildDetailList then
+            return effectsHandler
+        end
+    end
+    -- Radial: when open, the radial owns RS Left detail view because
+    -- Inspect (RS press) is unreliable for bottom-half radial slots
+    -- (4-8 o'clock).  The user holds LS down to keep those slots
+    -- focused, but Inspect's vertical card-stack navigation reads
+    -- the held LS direction and steps through the cards before they
+    -- finish reading.  Detail view's d-pad navigation is independent
+    -- of LS direction, so it works for every slot regardless of
+    -- which direction the user is holding.  Checked BEFORE the panel
+    -- handler branch so a stale activePanelHandler from a recently
+    -- closed panel doesn't shadow the radial when the user opens it
+    -- via the shortcuts menu.
+    local World = BG3Access.Client.WorldUI
+    if World and World.GetRadialDetailHandler then
+        local radialHandler = World.GetRadialDetailHandler()
+        if radialHandler and radialHandler.BuildDetailList then
+            return radialHandler
+        end
+    end
+    if IsUIActiveForRS() then
+        if World and World.GetActivePanelHandler then
+            local panelHandler = World.GetActivePanelHandler()
+            -- PartyLine excluded: PartyLine_c (always-visible HUD
+            -- portrait row) gets activated as activePanelHandler via
+            -- the snapshot lone-discovery branch when no other panel
+            -- is open, which would route RS-Left into a detail-view
+            -- toggle that has no useful content (HUD doesn't have a
+            -- "currently focused" character) and silently swallows
+            -- the GPS toggle the user actually pressed RS-Left for.
+            -- The LT-opened expanded party panel (PartyLineActive_c)
+            -- shares the same handler instance, but the user is
+            -- already navigating that panel directly and doesn't
+            -- need a separate detail view layered on top.
+            if panelHandler and panelHandler.name ~= "PartyLine"
+                and panelHandler.BuildDetailList then
+                return panelHandler
+            end
+        end
+        if Menus and Menus.GetActiveHandler then
+            local menuHandler = Menus.GetActiveHandler()
+            if menuHandler and menuHandler.BuildDetailList then
+                return menuHandler
+            end
+        end
+    end
+    return nil
+end
+
 local function HandleRSDirection(direction)
-    local Nav = BG3Access.Client.WorldNav
-    if not Nav or not Nav.HasPlayerEntity() then return end
+    -- No top-level WorldNav dependency.  RS handling fans out to
+    -- branches that have nothing to do with navigation: detail view,
+    -- compare view, verbosity cycle, HUD reader.  Only the
+    -- GPS-toggle FALLBACK in the RS-Left branch actually needs
+    -- WorldNav -- it's looked up inline there, not gated globally.
+    -- The previous top-level Nav gate broke RS in any context where
+    -- WorldNav happened to be unloaded or where its HasPlayerEntity
+    -- probe missed the controllable character (character sheet was
+    -- one such case).  Branches that need a module check it
+    -- themselves.
 
     -- RS Left: detail view toggle or GPS cycle.
     if direction == RS_DIRECTION_LEFT then
@@ -1036,8 +1304,23 @@ local function HandleRSDirection(direction)
             end
             return
         end
-        if Nav.IsEntityListOpen() then return end
-        Nav.CycleGPSMode()
+        -- GPS toggle: needs WorldNav.  Look it up here, not at the
+        -- top of HandleRSDirection -- this branch is the only one
+        -- that actually requires the navigation module.
+        --
+        -- NOTE: do NOT guard on Nav.IsEntityListOpen here.  The cycle
+        -- is Off -> Exploration -> Routing -> Off, and Routing has the
+        -- list open by definition.  A list-open guard turns RS-Left
+        -- into a one-way door once the user reaches Routing -- the
+        -- only escape becomes pressing B (closes list, reverts to
+        -- Exploration), defeating the "RS-Left to turn GPS off" muscle
+        -- memory that holds in every other state.  ClearGPSState (run
+        -- by EnterOffMode) sets entityListOpen=false, so the
+        -- Routing -> Off transition closes the list as part of the
+        -- mode change -- no separate close needed.
+        local Nav = BG3Access.Client.WorldNav
+        if not Nav then return end
+        if Nav.CycleGPSMode then Nav.CycleGPSMode() end
         return
     end
 

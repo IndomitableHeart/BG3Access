@@ -32,14 +32,47 @@ local SpeechData = BG3Access.Client.SpeechData
 -- cheaper trade than a load-order dependency).
 -- ---------------------------------------------------------------------------
 
-local PLAYER_COMPONENTS = {"ClientControl", "IsPlayer", "PlayerController"}
+-- Component shorthands verified from bg3se-SR source.  See the
+-- WorldNav.lua copy of this list for the full rationale on each name.
+-- Short version: IsPlayer / PlayerController aren't registered enum
+-- labels (pcall errors); ClientControl / PartyMember / Player are
+-- the actual ExtComponentType shorthands we can query.
+local PLAYER_COMPONENTS = {"ClientControl", "PartyMember", "Player"}
+
+--- Returns true when the entity is alive (Hp > 0) or has no Health
+--- component.  Used to filter dead candidates out of GetPlayerEntity.
+--- Mirrors WorldNav.lua's IsEntityAlive (intentionally duplicated --
+--- see the GetPlayerEntity comment in WorldNav.lua for the full
+--- rationale on the post-KO ClientControl-lingers-on-corpse failure
+--- mode this filter exists to handle).
+local function IsEntityAlive(entity)
+    if not entity then return false end
+    local ok, alive = pcall(function()
+        local health = entity.Health
+        if not health then return true end
+        local hp = tonumber(health.Hp) or 0
+        return hp > 0
+    end)
+    if not ok then return false end
+    return alive
+end
 
 local function GetPlayerEntity()
+    -- Filter out dead candidates.  When the previously-active party
+    -- member dies in combat (Shadowheart KO'd while Tav was active),
+    -- BG3 leaves ClientControl / IsPlayer / PlayerController on the
+    -- corpse for at least several frames after combat ends.  Without
+    -- this filter, we'd return the corpse and read HP 0/10 here even
+    -- though the HUD widget shows the live character's name.
     for _, componentName in ipairs(PLAYER_COMPONENTS) do
-        local ok, players = pcall(
+        local ok, candidates = pcall(
             Ext.Entity.GetAllEntitiesWithComponent, componentName)
-        if ok and players and #players > 0 then
-            return players[1]
+        if ok and candidates then
+            for _, candidate in ipairs(candidates) do
+                if IsEntityAlive(candidate) then
+                    return candidate
+                end
+            end
         end
     end
     return nil

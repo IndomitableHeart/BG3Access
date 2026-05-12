@@ -452,23 +452,27 @@ local function FormatAbilityFromAPI(elemId, dcProps)
     end
 
     local abilitySpeech = SpeechData.Create()
+    -- Always set the canonical "name" core field with the ability
+    -- name.  This is what makes cross-source dedup work: when the
+    -- tooltip arrives, its Title role also maps to the "name" core
+    -- field with the same ability name, and the value-aware
+    -- spokenRoles cross-off naturally suppresses it.  No wildcard
+    -- pre-mark needed.
+    abilitySpeech:Add("name", abilityName, "brief")
     if score then
-        -- Build the value as "<score>, modifier <signed-mod>".  The
-        -- "modifier" token here is part of the VALUE (a clarifier on
-        -- the number), not a separate label -- D&D convention reads
-        -- score and its modifier as a single coupled fact about the
-        -- ability ("Strength 16 (+3)").  AddProperty's label arg is
-        -- the abilityName so the formatter renders the full clause
-        -- as "Strength: 16, modifier +3".
-        local modSign = (modifier and modifier >= 0) and "+" or ""
-        local modifierText = modifier
-            and (", modifier " .. modSign .. tostring(modifier))
-            or ""
-        abilitySpeech:AddProperty(abilityName,
-            tostring(score) .. modifierText, "brief")
-    else
-        -- No score available -- speak just the ability name.
-        abilitySpeech:Add("name", abilityName, "brief")
+        -- Score and modifier as separate canonical fields.  Format
+        -- renders core fields with ". " separator -- output reads
+        -- "Strength. 13. Modifier +1." when score+modifier are
+        -- present, "Strength. 13." when modifier is unknown.
+        -- A screen reader at default punctuation level treats
+        -- ". " and ": " identically (both are a brief pause), so
+        -- this sounds the same as the prior "Strength: 13" form.
+        abilitySpeech:Add("value", tostring(score), "brief")
+        if modifier then
+            local modSign = modifier >= 0 and "+" or ""
+            abilitySpeech:AddProperty("Modifier",
+                modSign .. tostring(modifier), "normal")
+        end
     end
     return abilitySpeech
 end
@@ -1274,8 +1278,19 @@ local function FormatItemTooltip(tooltipTexts, spokenRoles)
 
     -- Combine Range + dice-notation Damage + Damage type into a
     -- single prose Damage phrase that mirrors the sighted tooltip
-    -- hierarchy ("4~9 Damage" as headline, 1d6+3 Piercing as detail):
+    -- hierarchy ("4~9 Damage" as headline, 1d6+3 Piercing as detail).
+    --
+    -- Verbosity-aware: at verbose tier we emit the full
     --   "Damage: 4 to 9, 1d6+3, type piercing"
+    -- but at normal/brief the dice notation is detail-level and
+    -- gets dropped:
+    --   "Damage: 4 to 9, type piercing"
+    --
+    -- Exception: if there's NO Range value (spell/potion damage --
+    -- the dice IS the only quantitative info), include the dice
+    -- regardless of tier so the user still hears "Damage: 1d6,
+    -- type acid" instead of just "Damage: type acid".
+    --
     -- Must run BEFORE the potion dice-relabel below, otherwise the
     -- relabel consumes the Damage property this combining needs.
     local rangeValue = nil
@@ -1290,15 +1305,23 @@ local function FormatItemTooltip(tooltipTexts, spokenRoles)
             damageTypeValue = prop.value
         end
     end
-    -- Only combine when we have at least two parts -- a bare Damage
-    -- entry with no Range and no type is a potion (handled below).
-    local weaponPartCount = (rangeValue and 1 or 0)
-        + (damageValue and 1 or 0)
+
+    local includeDice = (SpeechData.GetVerbosity() == "verbose")
+        or (rangeValue == nil)
+
+    -- Only combine when we'd produce >= 2 parts.  Without dice on a
+    -- weapon at normal tier this still triggers (Range + type),
+    -- but a bare Damage-dice-only entry with no Range and no type
+    -- is a potion (handled below by the orphan-dice relabel).
+    local proseEligibleCount = (rangeValue and 1 or 0)
+        + ((includeDice and damageValue) and 1 or 0)
         + (damageTypeValue and 1 or 0)
-    if weaponPartCount >= 2 then
+    if proseEligibleCount >= 2 then
         local parts = {}
         if rangeValue     then parts[#parts + 1] = rangeValue end
-        if damageValue    then parts[#parts + 1] = damageValue end
+        if includeDice and damageValue then
+            parts[#parts + 1] = damageValue
+        end
         if damageTypeValue then
             parts[#parts + 1] = "type " .. damageTypeValue:lower()
         end
@@ -1383,12 +1406,67 @@ end
 --- Ability tooltips use the same paired Value+Description breakdown
 --- as stat tooltips (e.g. Base 15, +2 from Class), with a real
 --- description as the FIRST Description entry before any Value.
+---
+--- VMAbility post-processing (no-op for VMSkill /
+--- VMEquipmentProficiency since they don't emit these roles):
+---   1. Drop the "Your Ability Points come from" header
+---      (AbilityModifiersLabel -> sectionLabel).  XAML
+---      visibility-gates it on CalculationParameters.Count >= 1,
+---      which 1:1 mirrors whether a Breakdown property will be
+---      synthesized -- the header is redundant scaffolding.
+---   2. Drop the parenthesized "(13)" TitleValue property.  The
+---      row's customItemFn already announced "STR: 13", so the
+---      score is already in the audio stream; the dispatcher pre-
+---      marks "name" in spokenRoles for VMAbility (see
+---      CharSheet.lua dispatch) so the tooltip's TitleName ->
+---      name field is suppressed.  TitleValue isn't mapped to a
+---      core field (no TOOLTIP_ROLE_MAP entry) so it falls through
+---      as an unknown-role property and we drop it explicitly.
+---   3. Strip the redundant "Saving throws:" / "Modifier:" labels
+---      (the values already encode the context word -- "+1 to
+---      Saving Throws", "+1 to Strength Checks") and reorder so
+---      the section reads: Breakdown -> saves bare -> modifier
+---      bare.
 local function FormatVMAbilityTooltip(tooltipTexts, spokenRoles)
     local speechData = SpeechData.FromTooltip(tooltipTexts, spokenRoles)
-    speechData:RelabelProperty("Property", "Effect")
+
+    -- (2) Drop the parenthesized score property (see header comment).
     speechData:RemoveProperty("TitleValue")
+
+    speechData:RelabelProperty("Property", "Effect")
+
+    -- (3) Strip "Saving throws:" and "Modifier:" labels by
+    -- removing then re-adding with empty label (bare render per
+    -- SpeechData.lua:494-503).  Empty label loses PROPERTY_ORDER
+    -- slot, so insertion order rules among bare entries: re-add
+    -- saving-throws first, modifier second.  Breakdown stays at
+    -- priority 100 and sorts before both regardless.
+    local savingThrowsValue = nil
+    local modifierValue = nil
+    for _, prop in ipairs(speechData.properties) do
+        if prop.label == "Saving throws" then
+            savingThrowsValue = prop.value
+        elseif prop.label == "Modifier" then
+            modifierValue = prop.value
+        end
+    end
+    speechData:RemoveProperty("Saving throws")
+    speechData:RemoveProperty("Modifier")
+    if savingThrowsValue then
+        speechData:AddProperty("", savingThrowsValue, "normal")
+    end
+    if modifierValue then
+        speechData:AddProperty("", modifierValue, "normal")
+    end
+
+    -- (1) Drop AbilityModifiersLabel header.  Only set on
+    -- VMAbility tooltips (see TOOLTIP_ROLE_MAP), so this is safe
+    -- in the shared formatter.
+    speechData:RemoveCoreField("sectionLabel")
+
     SpeechData.ParseValueDescriptionBreakdown(
         speechData, tooltipTexts)
+
     return speechData
 end
 
@@ -1559,12 +1637,21 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                         or dcProps.Item.Text)
                 end
                 equipmentTooltipShouldAppend = true
-                local immediateText = slotName
+                -- Return SpeechData with slot as sectionLabel and
+                -- item as name -- two separate core fields, not a
+                -- concatenated string.  Speak's auto-accumulate
+                -- records both into spokenRoles with their literal
+                -- values, so the tooltip's Title role text matches
+                -- spokenRoles["name"] via value-aware cross-off and
+                -- gets correctly skipped without needing a wildcard
+                -- pre-mark.
+                local equipSpeech = SpeechData.Create()
+                equipSpeech:Add("sectionLabel", slotName, "brief")
                 if equipmentItemName and equipmentItemName ~= ""
                     and equipmentItemName ~= slotName then
-                    immediateText = slotName .. ": " .. equipmentItemName
+                    equipSpeech:Add("name", equipmentItemName, "brief")
                 end
-                return immediateText, nil, nil
+                return equipSpeech
             end
 
             -- Ability scores: API-first via entity Stats component.
@@ -1791,18 +1878,15 @@ local function CreateCharacterPanelHandler(createPanelHandler)
             end
 
             -- Dispatch by DC type; TOOLTIP_DEFERRED_DC_TYPES share
-            -- the generic formatter.  For equipment slots, the
-            -- handler spoke "slot: item" as plain text (not via
-            -- SpeechData) so spokenRoles wasn't populated -- pre-
-            -- mark "name" so the tooltip doesn't repeat the item
-            -- name we just said.
-            local spokenRoles
-            if focusedDCType == "ls.VMEquipmentSlot" then
-                spokenRoles = {name = true}
-            else
-                spokenRoles = handlerState
-                    and handlerState.spokenRoles or nil
-            end
+            -- the generic formatter.  spokenRoles cross-off comes
+            -- from handlerState (auto-populated by Speak when the
+            -- row's customItemFn returned a SpeechData with proper
+            -- core fields / properties).  All identity-bearing row
+            -- handlers use canonical core fields (Add("name", ...))
+            -- so the tooltip's Title -> name role naturally
+            -- matches and cross-off skips it.  No wildcard pre-marks.
+            local spokenRoles = handlerState
+                and handlerState.spokenRoles or nil
             local formatter = TOOLTIP_FORMATTERS[focusedDCType]
             if not formatter and TOOLTIP_DEFERRED_DC_TYPES[focusedDCType]
                 then formatter = FormatGenericTooltip end

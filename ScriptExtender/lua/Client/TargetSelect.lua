@@ -44,32 +44,21 @@ local Helpers    = BG3Access.Client.Helpers
 -- Constants
 -- ---------------------------------------------------------------------------
 
--- Milliseconds to wait between the D-pad press and the widget read.
--- BG3 processes controller input on the game thread, updates the
--- target pointer, fires INPC, and Noesis re-renders the TextBlocks
--- that display the target name/HP/hit-chance.  A 60ms window is
--- enough for a single frame at 30fps and several frames at 60fps
--- while still feeling immediate to the user.  Subsequent rapid
--- presses cancel the pending timer and restart the window, so the
--- screen reader only speaks the latest target after the user stops
--- cycling.
--- Defer the cursor read after a D-pad press so the binding has time
--- to propagate the new target through Noesis's INPC/style/trigger
--- chain to TextBlock.Text (the script-accessible property).  The
--- visible render updates within one frame (~16ms), but the .Text
--- property exposed to Lua lags noticeably -- short defers fire
--- before propagation completes and return the PREVIOUS cycle's text.
--- Empirical bisect:
---   60ms  -- always one cycle behind (broken)
---   120ms -- still one cycle behind in testing (broken)
---   150ms -- borderline; suspected staleness near end of propagation
---   180ms -- chosen value, current setting
---   240ms -- always current (verified, but slow)
--- If staleness regressions appear, push back toward 200ms.
-local READ_DEFER_MS = 180
+-- Hard ceiling on how long a single press can wait for the engine
+-- to process before we give up and speak whatever we have.  No fixed
+-- timer drives the read -- the per-frame Ext.Events.Tick handler
+-- triggers on the actual frame the camera target changes.  This
+-- timeout is just defensive: if the engine never advances the camera
+-- (target despawned, focus lost, weird state), we still speak after
+-- this budget rather than block forever.  Sized for the cursor-info
+-- worst case: stage 1 (~120ms) -> stage 2 (~320ms) -> stage 3 (~360ms)
+-- + 250ms stability window = ~610ms expected fire.  Add headroom.
+local READ_MAX_TOTAL_MS = 900
 
 -- x:Name uniquely present in TargetInfo_c's template.  Used as the
--- anchor for locating the widget root.
+-- anchor for locating the widget root, then ReadDCPath reads through
+-- the widget root's DataContext (the root Widget VM, which exposes
+-- CurrentPlayer / Data / Layout).
 --
 -- HPBarContainer turned out to be PRESENT IN BOTH the mouse
 -- TargetInfo.xaml AND the controller TargetInfo_c.xaml -- and the
@@ -107,116 +96,70 @@ local CURSOR_TEXT_ANCHOR = "CursorTextRight"
 -- if Parent ever returns a cycle.
 local MAX_PARENT_HOPS = 12
 
--- x:Names of the Border elements wrapping the per-item Advantages /
--- Disadvantages ItemsControls inside TargetInfo_c (TargetInfo_c.xaml
--- lines 216 and 254).  Each ItemsControl renders one StackPanel per
--- VMAdvantage entry containing two TextBlocks: a separator (visible
--- only after the first item) and a Description bound to
--- VMAdvantage.Description.  Reading the holders via FindNameInWidget
--- + ReadElementStructuredTextBlocks is the cleanest way to enumerate
--- the descriptions: parentRole on the structured reader output is
--- the TextBlock's IMMEDIATE visual parent (the unnamed inline
--- StackPanel from the DataTemplate at TargetInfo_c.xaml line 80),
--- so it can't identify which holder a description belongs to from
--- a single whole-widget read.  Scoping the read per holder gives us
--- the answer for free.
-local ADVANTAGES_HOLDER_ANCHOR = "AdvantagesListHolder"
-local DISADVANTAGES_HOLDER_ANCHOR = "DisadvantagesListHolder"
-
--- Larian translated-string handle for the inter-item separator
--- TextBlock that AdvantageItemTemplate prepends to every entry after
--- the first (TargetInfo_c.xaml line 81, also used in
--- DisadvantagesListHolder via the same template).  We resolve it
--- lazily on first read and filter exact matches out of the holder's
--- structured text entries so the separator string doesn't surface
--- as a phantom advantage / disadvantage description.
-local ITEM_SEPARATOR_HANDLE =
-    "hd64bfe4cgadadg4468g8b0ag70330ffc717c"
-
--- Role -> label mapping for TargetInfo_c TextBlocks.  Keys are the
--- x:Name of the TextBlock (role) from the XAML template.  Values are
--- the user-facing label used in the structured speech output.
+-- Larian TranslatedString handles referenced by the cursor / target
+-- XAML templates for trigger-driven Run text.  Resolved lazily once
+-- per session via Ext.Loca.GetTranslatedString.  Hardcoded here
+-- because the corresponding Run is set via DataTrigger on the VM's
+-- enum value -- the VM does not expose the resolved string.
 --
--- Name            -- target name (bound to CurrentRegularOrCombatTurnTarget.Name)
--- LevelText       -- "Lv. N" (only shown when target is a Character)
--- HealthText      -- current HP number (from TargetHealthBarTemplate)
--- HealthMaxText   -- "/N" max HP (leading slash included by XAML)
--- OverflowText    -- "+N" when more status effects exist than fit inline
-local TARGET_INFO_ROLES = {
-    Name          = "name",
-    LevelText     = "level",
-    HealthText    = "hpCurrent",
-    HealthMaxText = "hpMax",
-    OverflowText  = "extraStatuses",
+-- Source-of-truth in CursorText_c.xaml / TargetInfo_c.xaml.
+local LOCA_HANDLES = {
+    -- Cause prefix: ParameterizedTranslatedString that wraps a Cause
+    -- string for capability-error messages and cannot-heal messages.
+    -- Format: "{0}: <Cause>" (locale-dependent).
+    capabilityCausePrefix       = "hb19f530dgfeb2g4d13g8d64ga8216f364f67",
+    -- Capability error messages keyed by VMCapabilityModifier.Type.
+    -- See CursorText_c.xaml DataTriggers under the CapabilityError
+    -- DataTemplate (lines 150-178).
+    capabilityMovementBlocked   = "h7760a99cg8a58g4555gb0f1g0e3e2b872f66",
+    capabilityMovementImpeded   = "h987efa83g0f3bg416dga3dfg7a588084af78",
+    capabilityMovementHalved    = "h709568ceg6653g4caag90afg57b5be47ca55",
+    capabilityCostMultiplier    = "hd5796d9fg7f28g4f61g9287g688eccd1b538",
+    capabilityCostDouble        = "hb8b5ca34g224eg4ed0g8029g170746bef0f4",
+    -- Cannot-heal error message (CursorText_c.xaml line 241).
+    targetCantBeHealed          = "h392eef12g97b6g47c8g858egd305c12f7dfd",
+    -- Attack-of-opportunity warning (CursorText_c.xaml line 225).
+    attackOfOpportunity         = "ha622b8f7gecf0g44c8gb8abgca896b1c48ef",
+    -- High-defense warning (CursorText_c.xaml line 99).
+    highDefense                 = "hd135c195g1887g4ee4g85b8g586666685815",
+    -- Throw / improvised-weapon overrides for TaskDescription (used
+    -- when SelectedCharacter.PlayerCharacterProperties.CurrentSpellTask
+    -- ActionId is "Throw" or "ImprovisedWeapon").
+    throwAction                 = "he2954eb6g6074g4b0ag90e9g8f14cc2ee21c",
+    throwActionNoTarget         = "h521c4991ge535g48dcg842dg26eb11b13c46",
+    -- Ping target (when CurrentPlayer.IsRequestingPing == true).
+    pingAction                  = "hfe7d4028g2faag4431g974ag7cbf0c3ef163",
 }
 
--- Role -> label mapping for CursorText_c TextBlocks.  Same
--- convention as TARGET_INFO_ROLES.  Many of these TextBlocks carry
--- no text unless the underlying ActiveTask condition fires (e.g.
--- ConcentrationWarningText is blank unless the player is holding
--- concentration), so we look up role-by-role and skip empties.
-local CURSOR_TEXT_ROLES = {
-    hitChanceText                  = "hitChance",
-    distance                       = "distance",
-    TaskDescription                = "action",
-    ConcentrationWarningText       = "concentration",
-    highDefText                    = "highDefense",
-    ContainerInfo                  = "container",
-    UpcastInfo                     = "upcast",
-    CapabilityError                = "capabilityError",
-    Message                        = "capabilityError",
-    Cause                          = "capabilityCause",
-    TargetCantBeHealedErrorMessage = "cannotHealMessage",
-    TargetCantBeHealedErrorCause   = "cannotHealCause",
-    -- CursorTextList VMText items (AoO warning, surface message,
-    -- "Not enough movement", etc.).  XAML template's TextBlock has
-    -- x:Name="txt" so role comes through as "txt".
-    txt                            = "cursorInfo",
-    -- Damage-preview block under DamagesProperty StackPanel.  XAML
-    -- has a "Damage:" label TextBlock and a values TextBlock.  We
-    -- skip the label (redundant with the AddProperty label) and
-    -- keep only the values ("4~9" which FromTooltip would have
-    -- normalized to "4 to 9" -- we do that ourselves below).
-    DamagesPropertyTextValues      = "damage",
-    -- Attack-of-opportunity / provoke warning fires under an
-    -- "Errors" container per the observed log.
-    Errors                         = "actionWarning",
-    -- Cooldown / recharge info ("Short Rest", "Long Rest", "Turn")
-    -- for limited-use actions.
-    CooldownText                   = "cooldown",
-    -- Applied condition block.  "Applies: Gaping Wounds for 2
-    -- Turn(s)" is split across four TextBlocks (Index / Name /
-    -- Value / Type).  We pick up the name; the value/type pair is
-    -- assembled into a phrase in the speech builder.
-    TurnsConditionName             = "appliesName",
-    TurnsValue                     = "appliesTurns",
-    TurnsType                      = "appliesTurnsUnit",
-    -- SurfaceInfo: name of the surface the cursor target is standing
-    -- in or moving onto ("Blood", "Fire", "Ice", "Web", "Grease",
-    -- "Water", etc.).  This is the user-facing equivalent of the
-    -- engine-only INSURFACE status (which has no DisplayName and is
-    -- filtered out of the entity status enumeration).  Sighted
-    -- players see the surface name on the cursor panel; we surface
-    -- it as a property in the speech so the blind player gets the
-    -- same hazard awareness.
-    SurfaceInfo                    = "surface",
-}
+local resolvedLocaCache = {}
+local function ResolveHandle(handleKey)
+    if resolvedLocaCache[handleKey] ~= nil then
+        return resolvedLocaCache[handleKey]
+    end
+    local handle = LOCA_HANDLES[handleKey]
+    if not handle then
+        resolvedLocaCache[handleKey] = ""
+        return ""
+    end
+    local lookupOk, resolved = pcall(
+        Ext.Loca.GetTranslatedString, handle)
+    if lookupOk and type(resolved) == "string" then
+        resolvedLocaCache[handleKey] = resolved
+    else
+        resolvedLocaCache[handleKey] = ""
+    end
+    return resolvedLocaCache[handleKey]
+end
 
--- Parent role -> label for TextBlocks that carry no x:Name.  Some
--- CursorText_c TextBlocks are bound inside template containers (e.g.
--- AdvantagesList StackPanel) and ReadElementStructuredTextBlocks
--- promotes the parent's x:Name into the role field.
-local PARENT_ROLE_TO_LABEL = {
-    AdvantagesList    = "advantages",
-    DisadvantagesList = "disadvantages",
-}
+-- Bool string returned by ReadDCPath / ReadTypePropertyAsString in
+-- C++ (ConvertRawValueToString_Inner) for Boolean TypeProperties.
+-- Used for ShowDescription / AoOWarning / TargetCanBeHealed gates.
+local BOOL_TRUE  = "On"
 
 -- ---------------------------------------------------------------------------
 -- State
 -- ---------------------------------------------------------------------------
 
-local deferredReadPending = false
-local deferredReadCancelKey = 0   -- monotonic; invalidates stale timers
 local buttonSubscription   = nil
 local lastSpokenAtMs       = 0
 
@@ -338,17 +281,30 @@ end
 --- members.  Iterating catches the active member regardless of
 --- party position.
 ---
+--- Three legitimate "allow d-pad targeting" states:
+---   1. In combat, local player's turn  -> a party member has
+---      IsActiveCombatTurn=true.
+---   2. Out of combat entirely         -> NO entity has
+---      IsActiveCombatTurn=true (no one's in a turn-based action,
+---      so the engine isn't waiting on anyone's input gate).
+---   3. (Implicit) In combat, party turn just ended but enemy turn
+---      hasn't fully begun yet -- handled by case 2 because there
+---      is briefly no IsActiveCombatTurn-true entity.
+---
+--- The one state we GATE is "in combat, an enemy has the active
+--- turn" -- a non-party entity has IsActiveCombatTurn=true.  The
+--- player can't act, and reading their cursor target would just
+--- echo whatever the AI's about to attack.
+---
 --- We do NOT pre-gate on Combat.IsInCombat().  That tracked flag
 --- starts false after a Lua reload / console reset and only flips
 --- true on the next CombatStarted Osiris event -- so during an
 --- in-progress combat that survived the reload, the flag lies and
---- silently gates targeting for the entire session.  The
---- IsActiveCombatTurn flag IS the authoritative combat-state check:
---- a non-combat character has IsActiveCombatTurn=false by
---- definition, and any character that has it true is, by definition,
---- in combat.  Iteration handles the gate without the redundant
---- (and stale-prone) IsInCombat() prefix.
+--- silently gates targeting for the entire session.  Walking the
+--- ECS for IsActiveCombatTurn is authoritative.
 local function IsLocalPlayerTurn()
+    -- First sweep: is ANY party member's turn active?  If yes, that
+    -- IS the local player's turn, allow.
     for _, componentName in ipairs(PLAYER_COMPONENTS) do
         local queryOk, entities = pcall(
             Ext.Entity.GetAllEntitiesWithComponent, componentName)
@@ -363,7 +319,27 @@ local function IsLocalPlayerTurn()
             end
         end
     end
-    return false
+    -- Second sweep: scan ALL TurnBased entities for any with
+    -- IsActiveCombatTurn=true.  If we find one (and the first sweep
+    -- already proved it isn't a party member), an enemy currently
+    -- holds the turn -- gate.  If we find none, we're out of combat
+    -- entirely -- allow.
+    local turnBasedOk, turnBasedEntities = pcall(
+        Ext.Entity.GetAllEntitiesWithComponent, "TurnBased")
+    if turnBasedOk and turnBasedEntities then
+        for _, entity in ipairs(turnBasedEntities) do
+            local activeOk, isActive = pcall(function()
+                local turnBased = entity.TurnBased
+                if not turnBased then return false end
+                return turnBased.IsActiveCombatTurn == true
+            end)
+            if activeOk and isActive == true then
+                return false  -- enemy has the turn, gate
+            end
+        end
+    end
+    -- No active combat turn anywhere -> out of combat -> allow.
+    return true
 end
 
 --- Walk up the parent chain from an anchor element and return the
@@ -371,9 +347,9 @@ end
 --- below it if we cannot reach the widget itself).
 ---
 --- We MUST stop before leaving the widget: the application Canvas
---- holds every HUD widget in the game, and passing it to
---- ReadElementStructuredTextBlocks would return every TextBlock on
---- screen.  Two stop conditions:
+--- holds every HUD widget in the game, and reading its DataContext
+--- would mix together state that does not belong to either the
+--- TargetInfo_c or CursorText_c widget.  Two stop conditions:
 ---   1. Element type name is "UIWidget" (reached the widget element).
 ---   2. Parent's type name is "Canvas" (parent is the app root, so
 ---      the current element IS the widget).
@@ -440,19 +416,18 @@ local function IsValidText(text)
     return true
 end
 
---- Collect all TextBlock entries from a widget.  Returns an array of
---- {role, text, parentRole} tables, or nil on failure.
+--- Locate the widget root for a given widget anchor.  Returns nil
+--- when the widget is not currently loaded / visible (the anchor
+--- x:Name does not resolve through any active NameScope).
 ---
---- Logs each step at Info level so the log shows exactly where the
---- read pipeline breaks when target speech goes silent:
----   1. Did FindNameInWidget locate the anchor?
----   2. Did GetWidgetRoot produce a widget ancestor?
----   3. How many TextBlock entries did the structured reader produce?
----   4. What roles and texts did those entries carry?
-local function ReadWidgetEntries(widgetLabel, anchorName)
+--- The same x:Name anchors as the previous TextBlock-read pipeline
+--- are still used here -- they remain unique across CursorText.xaml
+--- vs CursorText_c.xaml etc., so the widget-resolution logic is
+--- identical; only the text-extraction step that follows it changed.
+local function ResolveWidgetRoot(widgetLabel, anchorName)
     local findOk, anchor = pcall(Ext.UI.FindNameInWidget, anchorName)
     if not findOk or not anchor then
-        Log.Info("TARGET READ " .. widgetLabel
+        Log.Debug("TARGET READ " .. widgetLabel
             .. ": anchor '" .. anchorName .. "' NOT FOUND"
             .. " (findOk=" .. tostring(findOk) .. ")")
         return nil
@@ -460,211 +435,600 @@ local function ReadWidgetEntries(widgetLabel, anchorName)
 
     local widgetRoot = GetWidgetRoot(anchor)
     if not widgetRoot then
-        Log.Info("TARGET READ " .. widgetLabel
+        Log.Debug("TARGET READ " .. widgetLabel
             .. ": GetWidgetRoot returned nil for anchor '"
             .. anchorName .. "'")
         return nil
     end
 
-    Log.Info("TARGET READ " .. widgetLabel
-        .. ": anchor '" .. anchorName .. "' found"
-        .. ", widget root type=" .. SafeTypeName(widgetRoot))
+    Log.Debug("TARGET READ " .. widgetLabel
+        .. ": widget root type=" .. SafeTypeName(widgetRoot)
+        .. ", anchor=" .. tostring(anchor)
+        .. ", widgetRoot=" .. tostring(widgetRoot))
+    return widgetRoot
+end
 
-    local readOk, entries = pcall(
-        Ext.UI.ReadElementStructuredTextBlocks, widgetRoot)
+--- ReadDCPath wrapper that pcall-guards the C++ call and logs on
+--- error.  Returns the C++ result (string / table / nil) on success;
+--- nil on failure.  All read paths in this module funnel through
+--- here so any C++ fault gets logged uniformly.
+local function ReadPath(widgetRoot, path)
+    if not widgetRoot or not path then return nil end
+    local readOk, result = pcall(Ext.UI.ReadDCPath, widgetRoot, path)
     if not readOk then
-        Log.Info("TARGET READ " .. widgetLabel
-            .. ": ReadElementStructuredTextBlocks FAILED: "
-            .. tostring(entries))
+        Log.Debug("TARGET READ ReadDCPath('" .. path
+            .. "') FAILED: " .. tostring(result))
         return nil
     end
-    if not entries then
-        Log.Info("TARGET READ " .. widgetLabel
-            .. ": ReadElementStructuredTextBlocks returned nil")
-        return nil
-    end
+    return result
+end
 
-    -- Log entry count and a summary of every entry so the log shows
-    -- exactly what the structured reader extracted.  Cap detailed
-    -- entry dump at 25 to keep the log manageable in degenerate
-    -- cases (long status lists, many capability errors, etc.).
-    Log.Info("TARGET READ " .. widgetLabel
-        .. ": " .. tostring(#entries) .. " entries")
-    local dumpLimit = 25
-    local dumpCount = math.min(#entries, dumpLimit)
-    for i = 1, dumpCount do
-        local entry = entries[i]
-        local role = entry.role or "(no role)"
-        local parentRole = entry.parentRole or ""
-        local text = entry.text or ""
-        -- Truncate very long texts for log readability.
-        if #text > 80 then
-            text = text:sub(1, 77) .. "..."
+--- Convenience: read a path and return a non-empty trimmed string,
+--- or nil if the path is missing / empty / a placeholder value.
+local function ReadPathString(widgetRoot, path)
+    local raw = ReadPath(widgetRoot, path)
+    if type(raw) ~= "string" then return nil end
+    if not IsValidText(raw) then return nil end
+    return raw
+end
+
+--- Convenience: read a path and treat the result as a Bool string
+--- (ConvertRawValueToString returns "On" / "Off" for bool DPs).
+local function ReadPathBool(widgetRoot, path)
+    local raw = ReadPath(widgetRoot, path)
+    return raw == BOOL_TRUE
+end
+
+--- Format a numeric distance string ("3.7" -> "3.7 feet").  XAML
+--- uses a UnitConverter to render this as locale-aware "3.7m" /
+--- "12.1ft" but the underlying VM scalar is a unit-agnostic float
+--- (BG3's internal units are roughly meters; "feet" is what TTS
+--- naturally reads as a distance unit in English speech).  Drops
+--- zero values which the XAML CountToVisibilityConverter would
+--- collapse out of the panel.
+local function FormatDistance(rawDistance)
+    if not rawDistance or rawDistance == "" then return nil end
+    local n = tonumber(rawDistance)
+    if not n or n <= 0 then return nil end
+    return string.format("%.1f feet", n)
+end
+
+--- Format a Cause clause as a standalone string, mimicking the
+--- XAML's ParameterizedTranslatedString output for the Cause Run
+--- (CursorText_c.xaml line 142 / line 313).  Returns the clause
+--- ready to concatenate after a base error message via
+--- CombineMessageAndCause -- e.g. " for ROUGH_TERRAIN" given a
+--- prefix template like " for {0}".  Returns nil for missing /
+--- empty causes so callers can leave the cause field unset.
+local function FormatCauseClause(causeText)
+    if not causeText or causeText == "" then return nil end
+    local prefix = ResolveHandle("capabilityCausePrefix")
+    if prefix and prefix:find("{0}") then
+        return prefix:gsub("{0}", causeText)
+    end
+    return " " .. causeText
+end
+
+--- Map a VMCapabilityModifier {Type, Value} pair to the loca handle
+--- key the XAML uses to render its Message Run.  Implements the
+--- DataTrigger ladder from CursorText_c.xaml (lines 150-178).
+--- Returns nil when no rule matches (XAML would render an empty
+--- Message Run, which the CapabilityError DataTemplate.Triggers
+--- sets to Visibility=Collapsed via the empty-text trigger).
+local function ResolveCapabilityHandleKey(typeValue, rawValue)
+    if not typeValue or typeValue == "" then return nil end
+    if typeValue == "MovementBlocked" then
+        return "capabilityMovementBlocked"
+    end
+    if typeValue == "MovementModification" then
+        return "capabilityMovementImpeded"
+    end
+    if typeValue == "MovementMultiplier" then
+        local n = tonumber(rawValue or "")
+        if n and math.abs(n - 0.5) < 0.001 then
+            return "capabilityMovementHalved"
         end
-        Log.Info("  [" .. i .. "] role='" .. role
-            .. "' parentRole='" .. parentRole
-            .. "' text='" .. text .. "'")
+        return "capabilityMovementImpeded"
     end
-    if #entries > dumpLimit then
-        Log.Info("  ... " .. tostring(#entries - dumpLimit)
-            .. " more entries not logged")
+    if typeValue == "MovementCostMultiplier" then
+        local n = tonumber(rawValue or "")
+        if n and math.abs(n - 2) < 0.001 then
+            return "capabilityCostDouble"
+        end
+        return "capabilityCostMultiplier"
     end
-
-    return entries
+    return nil
 end
 
---- Resolve the inter-item separator handle once, cache forever.
---- Loca lookups are cheap but the resolved string never changes
---- within a session, so a one-time cache lets the per-frame holder
---- read avoid the lookup overhead entirely.  Returns "" on resolve
---- failure so equality comparisons fall through (worst case: a
---- harmless extra phantom entry slips into the list).
-local cachedSeparatorText = nil
-local function GetItemSeparatorText()
-    if cachedSeparatorText ~= nil then return cachedSeparatorText end
-    local resolveOk, resolved = pcall(
-        Ext.Loca.GetTranslatedString, ITEM_SEPARATOR_HANDLE)
-    if resolveOk and type(resolved) == "string" then
-        cachedSeparatorText = resolved
-    else
-        cachedSeparatorText = ""
-    end
-    return cachedSeparatorText
-end
+--- Read CursorText_c-equivalent fields directly from the widget
+--- root's DataContext (the root Widget VM).  Replaces the previous
+--- TextBlock-text reader, which was vulnerable to .Text DP
+--- propagation lag (the ground-truth fields update synchronously
+--- when BG3 updates the cursor target, but the bound TextBlock.Text
+--- DP catches up across multiple frames).
+---
+--- Returns a flat table compatible with BuildTargetSpeechData's
+--- cursorInfo parameter.  All values are pre-normalized strings
+--- (percent / feet / "on" / etc.) ready for AddProperty.
+local function ReadCursorDCData(widgetRoot)
+    local cursor = {}
+    if not widgetRoot then return cursor end
 
---- Read the per-item description list out of an Advantages or
---- Disadvantages holder (TargetInfo_c.xaml ItemsControl bound to
---- HitChanceDesc.Advantages or HitChanceDesc.Disadvantages).
----
---- Returns a list of NormalizeText'd description strings, in render
---- order, with the inter-item separator filtered out.  Returns nil
---- when the holder is not currently in the visual tree (no advantage
---- / disadvantage active) or when the read finds nothing speakable.
----
---- Why scope-by-holder rather than reading the whole widget once
---- and grouping by parent: the structured TextBlock reader's
---- parentRole is the IMMEDIATE visual parent (see
---- CollectTooltipEntries_Inner in Module.inl).  The Description
---- TextBlock's immediate parent is the inline StackPanel from the
---- DataTemplate, which has no x:Name -- so a single whole-widget
---- read produces entries with role="" and parentRole="" for every
---- description, indistinguishable from each other and from generic
---- unlabeled cursor reasons.  Scoping per holder gives us the answer
---- (this entry is an Advantage vs a Disadvantage) for free.
-local function ReadModifierItemList(anchorName, label)
-    local findOk, anchor = pcall(Ext.UI.FindNameInWidget, anchorName)
-    if not findOk or not anchor then
-        Log.Info("MODIFIER LIST " .. label
-            .. ": holder '" .. anchorName .. "' not found"
-            .. " (no advantage/disadvantage active or holder hidden)")
-        return nil
+    -- Action label: the XAML TaskDescription TextBlock starts bound
+    -- to ActiveTask.PreviewDescription (a generic verb like "Cast
+    -- spell", "Move To", "Loot") and gets RE-BOUND to a more
+    -- specific value via DataTriggers (CursorText_c.xaml lines
+    -- 333-374):
+    --   1. CurrentSpellTask non-null  -> CurrentSpellTask.Name
+    --      ("Fire Bolt", "Healing Word", etc.)
+    --   2. CurrentSpellTask.SpellType == Shout  -> still the spell
+    --      Name, but the XAML wraps it with a parameterized
+    --      "Shout: {0}" handle.  We just speak the name.
+    --   3. CurrentSpellTask.ActionId == Throw / ImprovisedWeapon
+    --      with TaskObject present  -> "Throw" handle
+    --   4. Same ActionIds with TaskObject null -> "Throw" handle
+    --      with no-target wording
+    --   5. CurrentPlayer.IsRequestingPing == true  -> "Ping target"
+    --      handle (overrides everything above)
+    -- We mirror that ladder in priority order; later branches win.
+    local actionLabel = ReadPathString(widgetRoot,
+        "CurrentPlayer.UIData.ActiveTask.PreviewDescription")
+
+    -- 1: CurrentSpellTask.Name takes over when a spell is queued.
+    -- This is what produces "Fire Bolt" instead of "Cast spell".
+    local spellName = ReadPathString(widgetRoot,
+        "CurrentPlayer.SelectedCharacter.PlayerCharacterProperties.CurrentSpellTask.Name")
+    if spellName then
+        actionLabel = spellName
     end
-    local readOk, entries = pcall(
-        Ext.UI.ReadElementStructuredTextBlocks, anchor)
-    if not readOk or not entries then
-        Log.Info("MODIFIER LIST " .. label
-            .. ": ReadElementStructuredTextBlocks failed: "
-            .. tostring(entries))
-        return nil
-    end
-    local separatorText = GetItemSeparatorText()
-    local items = {}
-    for _, entry in ipairs(entries) do
-        local rawText = entry.text or ""
-        if IsValidText(rawText) and rawText ~= separatorText then
-            items[#items + 1] = NormalizeText(rawText)
+
+    -- 3 / 4: Throw and ImprovisedWeapon override the spell name
+    -- (they're not really spells; the engine routes them through
+    -- the spell-task system but the XAML re-labels them).
+    local actionId = ReadPathString(widgetRoot,
+        "CurrentPlayer.SelectedCharacter.PlayerCharacterProperties.CurrentSpellTask.ActionId")
+    if actionId == "Throw" or actionId == "ImprovisedWeapon" then
+        local hasTaskObject = ReadPath(widgetRoot,
+            "CurrentPlayer.UIData.ActiveTask.TaskObject")
+        if hasTaskObject == nil then
+            local noTargetMessage = ResolveHandle("throwActionNoTarget")
+            if noTargetMessage and noTargetMessage ~= "" then
+                actionLabel = noTargetMessage
+            end
+        else
+            local throwMessage = ResolveHandle("throwAction")
+            if throwMessage and throwMessage ~= "" then
+                actionLabel = throwMessage
+            end
         end
     end
-    Log.Info("MODIFIER LIST " .. label .. ": "
-        .. tostring(#items) .. " entries")
-    if #items == 0 then return nil end
-    return items
-end
 
---- Classify entries into a map of {label = text}.  Iterates the
---- raw entry list and assigns the first valid text seen for each
---- mapped role.  Subsequent duplicates are skipped.  The XAML may
---- render the same TextBlock twice (e.g. StatusHolderHolderHidden
---- mirrors StatusHolderHolder for width calculations); we want
---- only the first.
----
---- captureUnlabeledAsReason:  when true, any TextBlock with empty
---- role AND empty parentRole is captured into classified.reasonText
---- (joined with ". " if multiple).  This is how short context
---- strings surface for action reasons ("Target is too close", "Not
---- enough movement in the target area").
----
---- Reason filtering:
---- - bare digit text ("1") is the unlabeled Duration badge from
----   NamedStatusTemplate (DataTemplates_c.xaml line 341); we already
----   speak that authoritatively from the entity, so drop here.
---- - 1-2 char tokens ("/", "-") are XAML separators between reason
----   phrases; not speakable on their own.
---- - text that exactly duplicates a statusLabel role's text in the
----   same entry list is the HitChanceDesc explainer echoing the
----   status name (e.g. "Threatened" appears as both statusLabel and
----   as an unlabeled Run); skip the echo since we'll speak statuses
----   via the entity-side enumeration.
---- excludeTextSet (optional): set of normalized texts that the
---- caller has already captured authoritatively elsewhere
---- (advantage/disadvantage descriptions read out of
---- AdvantagesListHolder / DisadvantagesListHolder).  Skipped from
---- the unclassified-reason bucket so the same text doesn't speak
---- twice.  Compared against NormalizeText'd values to match the
---- normalization the modifier reader applies.
-local function ClassifyEntries(
-    entries, roleMap, parentRoleMap, captureUnlabeledAsReason,
-    excludeTextSet)
-    local classified = {}
-    if not entries then return classified end
-    -- First pass: collect statusLabel texts so we can dedupe their
-    -- echoes from the unlabeled-reason bucket.
-    local statusLabelTexts = {}
-    if captureUnlabeledAsReason then
-        for _, entry in ipairs(entries) do
-            if (entry.role or "") == "statusLabel" then
-                local cleaned = NormalizeText(entry.text or "")
-                if cleaned ~= "" then
-                    statusLabelTexts[cleaned] = true
+    -- 5: Ping mode overrides everything above.
+    if ReadPathBool(widgetRoot, "CurrentPlayer.IsRequestingPing") then
+        local pingMessage = ResolveHandle("pingAction")
+        if pingMessage and pingMessage ~= "" then
+            actionLabel = pingMessage
+        end
+    end
+
+    cursor.action = actionLabel
+
+    -- Hit chance: only render when ShowDescription is true (XAML
+    -- collapses the hitChance Border otherwise).  TotalHitChance is
+    -- a UInt8 percent integer (0..100); speak as "N percent".
+    -- (The C++ scalar-type recognition was extended to include
+    -- Int8/Int16/UInt8/UInt16/UInt64 -- without UInt8, this read
+    -- silently returned nil even when ShowDescription was true.)
+    if ReadPathBool(widgetRoot,
+        "CurrentPlayer.UIData.HitChanceDesc.ShowDescription") then
+        local hcRaw = ReadPathString(widgetRoot,
+            "CurrentPlayer.UIData.HitChanceDesc.TotalHitChance")
+        if hcRaw then
+            cursor.hitChance = hcRaw .. " percent"
+        end
+    end
+
+    -- Distance to cursor target.  Skip when zero (XAML collapses
+    -- the row).
+    cursor.distance = FormatDistance(ReadPathString(widgetRoot,
+        "CurrentPlayer.UIData.Cursor.Distance"))
+
+    -- Per-source advantage / disadvantage descriptions.  Each
+    -- VMAdvantage's Description scalar is the user-facing text
+    -- (e.g. "Pack Tactics", "Threatened").
+    local advantages = ReadPath(widgetRoot,
+        "CurrentPlayer.UIData.HitChanceDesc.Advantages")
+    if type(advantages) == "table" and #advantages > 0 then
+        cursor.advantages = "Advantage"
+        local descriptions = {}
+        for _, item in ipairs(advantages) do
+            local desc = item and item.Description
+            if desc and IsValidText(desc) then
+                descriptions[#descriptions + 1] = NormalizeText(desc)
+            end
+        end
+        if #descriptions > 0 then
+            cursor.advantageList = descriptions
+        end
+    end
+    local disadvantages = ReadPath(widgetRoot,
+        "CurrentPlayer.UIData.HitChanceDesc.Disadvantages")
+    if type(disadvantages) == "table" and #disadvantages > 0 then
+        cursor.disadvantages = "Disadvantage"
+        local descriptions = {}
+        for _, item in ipairs(disadvantages) do
+            local desc = item and item.Description
+            if desc and IsValidText(desc) then
+                descriptions[#descriptions + 1] = NormalizeText(desc)
+            end
+        end
+        if #descriptions > 0 then
+            cursor.disadvantageList = descriptions
+        end
+    end
+
+    -- ActiveTask.Info collection: VMText items the engine emits to
+    -- explain why an action would or would not work ("Not enough
+    -- movement", "Out of range", damage previews keyed off
+    -- TextContext="HitChance" -- the latter duplicate the hit-chance
+    -- bar above and are filtered out, mirroring the XAML's
+    -- DataTrigger that sets Visibility=Collapsed for them).
+    local infoItems = ReadPath(widgetRoot,
+        "CurrentPlayer.UIData.ActiveTask.Info")
+    if type(infoItems) == "table" and #infoItems > 0 then
+        local cursorReasons = {}
+        for _, item in ipairs(infoItems) do
+            local text = item and item.Text
+            local context = (item and item.TextContext) or ""
+            if text and IsValidText(text) and context ~= "HitChance" then
+                cursorReasons[#cursorReasons + 1] = NormalizeText(text)
+            end
+        end
+        if #cursorReasons > 0 then
+            cursor.cursorInfo = table.concat(cursorReasons, ". ")
+        end
+    end
+
+    -- Attack-of-opportunity warning -- single trigger, fires when
+    -- the move preview crosses an enemy's reach.
+    if ReadPathBool(widgetRoot,
+        "CurrentPlayer.UIData.ActiveTask.AoOWarning") then
+        local aooText = ResolveHandle("attackOfOpportunity")
+        if aooText and aooText ~= "" then
+            cursor.actionWarning = aooText
+        end
+    end
+
+    -- Surface preview message ("walking onto Fire creates a hazard",
+    -- etc.).  This is a localized scalar TranslatedString whose
+    -- resolved text comes through ReadDCPath.
+    local surfaceMessage = ReadPathString(widgetRoot,
+        "CurrentPlayer.UIData.ActiveTask.SurfaceMessage")
+    if surfaceMessage then
+        cursor.cursorInfo = (cursor.cursorInfo
+            and (cursor.cursorInfo .. ". ") or "") .. surfaceMessage
+    end
+
+    -- Surface name on the cursor target (e.g. "Blood", "Fire") --
+    -- comes through CurrentPlayer.UIData.SurfaceInformation.Header
+    -- when HasSurface is true.
+    local hasSurface = ReadPathBool(widgetRoot,
+        "CurrentPlayer.UIData.SurfaceInformation.HasSurface")
+    if hasSurface then
+        cursor.surface = ReadPathString(widgetRoot,
+            "CurrentPlayer.UIData.SurfaceInformation.Header")
+    end
+
+    -- Concentration warning: when the cursor task is itself a
+    -- concentration spell AND the character already concentrates,
+    -- speak the existing concentration name so the player hears
+    -- they'd lose it.  XAML uses a parameterized translated string
+    -- ("Concentration on {Name}"); we use plain English here since
+    -- handlerState localization isn't wired up.
+    local castingConcentration = ReadPathBool(widgetRoot,
+        "CurrentPlayer.SelectedCharacter.PlayerCharacterProperties.CurrentSpellTask.IsConcentrationSpell")
+    if castingConcentration then
+        local existingSpellName = ReadPathString(widgetRoot,
+            "CurrentPlayer.SelectedCharacter.ConcentrationSpell.Name")
+        if existingSpellName then
+            cursor.concentration =
+                "Concentrating on " .. existingSpellName
+        end
+    end
+
+    -- Capability errors (XAML's CapabilityListSelectorBehavior shows
+    -- the FIRST visible item only; we mimic that by stopping at the
+    -- first match).  The handle-key map lives in
+    -- ResolveCapabilityHandleKey; the Cause Run is appended via the
+    -- ParameterizedTranslatedString prefix.
+    local capabilityList = ReadPath(widgetRoot,
+        "CurrentPlayer.SelectedCharacter.PlayerCharacterProperties.ModifiedCapabilities")
+    if type(capabilityList) == "table" and #capabilityList > 0 then
+        for _, capItem in ipairs(capabilityList) do
+            if type(capItem) == "table" then
+                local handleKey = ResolveCapabilityHandleKey(
+                    capItem.Type, capItem.Value)
+                if handleKey then
+                    local message = ResolveHandle(handleKey)
+                    if message and message ~= "" then
+                        cursor.capabilityError = message
+                        if capItem.Cause and capItem.Cause ~= "" then
+                            cursor.capabilityCause =
+                                FormatCauseClause(capItem.Cause)
+                        end
+                        break
+                    end
                 end
             end
         end
     end
-    local unclassifiedReasons = {}
-    for _, entry in ipairs(entries) do
-        local role = entry.role or ""
-        local text = entry.text or ""
-        if IsValidText(text) then
-            local label = roleMap[role]
-            if not label and parentRoleMap then
-                label = parentRoleMap[entry.parentRole or ""]
-            end
-            if label and not classified[label] then
-                classified[label] = NormalizeText(text)
-            elseif captureUnlabeledAsReason
-                and not label and role == ""
-                and (entry.parentRole or "") == "" then
-                local cleaned = NormalizeText(text)
-                local isBareNumber = cleaned:match("^%d+$") ~= nil
-                local isSeparator = #cleaned <= 2
-                local isStatusEcho = statusLabelTexts[cleaned] == true
-                local isExcluded = excludeTextSet
-                    and excludeTextSet[cleaned] == true
-                if not isBareNumber
-                    and not isSeparator
-                    and not isStatusEcho
-                    and not isExcluded then
-                    unclassifiedReasons[#unclassifiedReasons + 1] =
-                        cleaned
-                end
+
+    -- Cannot-heal error: TargetCanBeHealed=false AND a non-null
+    -- TargetHealBlockCause produce the message + cause pair shown
+    -- by the XAML's TargetCantBeHealedError TextBlock.
+    local canBeHealed = ReadPathBool(widgetRoot,
+        "CurrentPlayer.UIData.ActiveTask.TargetCanBeHealed")
+    if not canBeHealed then
+        local cantHealMessage = ResolveHandle("targetCantBeHealed")
+        if cantHealMessage and cantHealMessage ~= "" then
+            local healCause = ReadPathString(widgetRoot,
+                "CurrentPlayer.UIData.ActiveTask.TargetHealBlockCause")
+            if healCause then
+                cursor.cannotHealMessage = cantHealMessage
+                cursor.cannotHealCause = FormatCauseClause(healCause)
+            else
+                -- TargetCanBeHealed=false sometimes fires without a
+                -- cause when the engine knows the target is dead /
+                -- already at full HP.  Skip in that case to avoid
+                -- a misleading bare "Target cannot be healed".
+                cursor.cannotHealMessage = nil
             end
         end
     end
-    if #unclassifiedReasons > 0 then
-        classified.reasonText = table.concat(
-            unclassifiedReasons, ". ")
+
+    -- High-defense warning fires when the target's AC is far above
+    -- the attacker's level (XAML's MultiBinding compares
+    -- CurrentTarget.Stats.ArmorClass.Value against
+    -- SelectedCharacter.Stats.Level.Value/2).  We can't easily
+    -- reproduce the multibinding from a single path read, so derive
+    -- it via the same arithmetic comparison in Lua.  Falls back to
+    -- silence on missing inputs (rather than risk a false positive).
+    local targetAC = tonumber(ReadPathString(widgetRoot,
+        "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Stats.ArmorClass.Value")
+        or "")
+    local selectedLevel = tonumber(ReadPathString(widgetRoot,
+        "CurrentPlayer.SelectedCharacter.Stats.Level.Value") or "")
+    local relation = ReadPathString(widgetRoot,
+        "CurrentPlayer.CurrentRegularOrCombatTurnTarget.PlayerRelation")
+    if targetAC and selectedLevel and relation == "Enemy"
+        and ReadPathBool(widgetRoot,
+            "CurrentPlayer.UIData.HitChanceDesc.ShowDescription")
+        and (targetAC - 14) > (selectedLevel / 2) then
+        local highDefMessage = ResolveHandle("highDefense")
+        if highDefMessage and highDefMessage ~= "" then
+            cursor.highDefense = highDefMessage
+        end
     end
-    return classified
+
+    -- Container state for Move To onto a chest / barrel.  Empty /
+    -- NotExplored map to user-facing strings so the player hears
+    -- whether they'd find anything.
+    local containerState = ReadPathString(widgetRoot,
+        "CurrentPlayer.UIData.ActiveTask.ContainerState")
+    if containerState == "Empty" then
+        cursor.container = "Empty"
+    elseif containerState == "NotExplored" then
+        cursor.container = "Unexplored"
+    end
+
+    -- Damage preview (e.g., "1~10" for Fire Bolt, "4~9" for Main Hand
+    -- Attack).  This lives on the DamagesPropertyTextValues TextBlock
+    -- inside the ActionDetailsTemplate, bound through Larian's
+    -- TooltipExtender attached property -- which means we can't reach
+    -- it via plain ReadDCPath.  The reachable approach is to find the
+    -- TextBlock by its x:Name and read its rendered text.  Why this
+    -- doesn't suffer from the binding-propagation lag the original
+    -- text-based read did: the cursor-info stability gate in OnTick
+    -- waits until ALL the cursor-info VM fields have settled before
+    -- this read fires, by which point the bound TextBlock text has
+    -- also propagated.  BuildTargetSpeechData already converts
+    -- "X~Y" to "X to Y" for natural speech.
+    local damageOk, damageElem = pcall(
+        Ext.UI.FindNameInWidget, "DamagesPropertyTextValues")
+    if damageOk and damageElem then
+        local readOk, entries = pcall(
+            Ext.UI.ReadElementStructuredTextBlocks, damageElem)
+        if readOk and type(entries) == "table" and #entries > 0 then
+            local rawText = entries[1].text
+            if rawText and IsValidText(rawText) then
+                cursor.damage = rawText
+            end
+        end
+    end
+
+    return cursor
+end
+
+--- Resolve the current cursor / D-pad target by reading the camera
+--- entity's GameCameraBehavior.Targets[1].  Verified against Examine
+--- ground truth: this field reflects the engine's actual cursor
+--- target at game-thread speed -- always fresh, no Noesis-marshaling
+--- lag.
+---
+--- Falls back to GameCameraBehavior.Target (singular) when Targets
+--- is empty (defensive; in practice Targets[1] was populated in every
+--- observed cycle, including when Target itself was nil because the
+--- cursor had landed on the player character).
+---
+--- Returns the entity userdata or nil when no target is selected
+--- (cursor on open ground / off any entity).
+local function ResolveCameraTargetEntity()
+    local queryOk, cameras = pcall(
+        Ext.Entity.GetAllEntitiesWithComponent, "GameCameraBehavior")
+    if not queryOk or not cameras or #cameras == 0 then return nil end
+
+    -- Single-player has one camera entity.  Split-screen would have
+    -- multiple but we don't differentiate; first entry is the local
+    -- player's camera in single-player and a reasonable starting
+    -- point in split-screen (the existing read pipeline didn't
+    -- handle split-screen either).
+    local cameraEntity = cameras[1]
+    local readOk, gcb = pcall(function()
+        return cameraEntity.GameCameraBehavior
+    end)
+    if not readOk or not gcb then return nil end
+
+    local primaryTarget
+    pcall(function()
+        local targets = gcb.Targets
+        if targets and #targets > 0 then
+            primaryTarget = targets[1]
+        end
+    end)
+    if not primaryTarget then
+        pcall(function() primaryTarget = gcb.Target end)
+    end
+    if not primaryTarget then return nil end
+
+    local resolveOk, entity = pcall(Ext.Entity.Get, primaryTarget)
+    if not resolveOk or not entity then return nil end
+    return entity
+end
+
+--- Read entity-side identity (name, HP, statuses count) from a
+--- target entity returned by ResolveCameraTargetEntity.  These fields
+--- come straight from the entity's own components -- no Noesis VM
+--- involved -- so they're always synchronized with the engine's
+--- actual state.
+---
+--- Returns a flat table compatible with BuildTargetSpeechData's
+--- targetInfo parameter.
+local function ReadEntityIdentity(targetEntity)
+    local identity = {}
+    if not targetEntity then return identity end
+
+    -- Display name via DisplayName.Name (TranslatedString handle).
+    pcall(function()
+        if targetEntity.DisplayName then
+            local nameHandle = targetEntity.DisplayName.Name
+                or targetEntity.DisplayName.NameKey
+            if nameHandle then
+                local resolved = Helpers.ResolveTranslatedString(nameHandle)
+                if resolved and resolved ~= "" then
+                    identity.name = resolved
+                end
+            end
+        end
+    end)
+
+    -- Health.Hp / MaxHp -- int counters maintained on the entity by
+    -- the combat system, updated immediately when damage / healing
+    -- resolves.
+    pcall(function()
+        if targetEntity.Health then
+            local hp = targetEntity.Health.Hp
+            local maxHp = targetEntity.Health.MaxHp
+            if hp ~= nil then identity.hpCurrent = tostring(hp) end
+            if maxHp ~= nil then identity.hpMax = tostring(maxHp) end
+        end
+    end)
+
+    -- Status overflow count: count statuses on the entity to see
+    -- whether we'd overflow the icon row sighted players see.  The
+    -- existing Noesis StatusEffects.Count was a parallel value; we
+    -- get the same number (or close to it) directly here.
+    pcall(function()
+        if targetEntity.StatusContainer
+            and targetEntity.StatusContainer.Statuses then
+            local statusCount = 0
+            for _ in pairs(targetEntity.StatusContainer.Statuses) do
+                statusCount = statusCount + 1
+            end
+            local maxDisplayed = 5
+            if statusCount > maxDisplayed then
+                identity.extraStatuses = "+"
+                    .. tostring(statusCount - maxDisplayed)
+            end
+        end
+    end)
+
+    return identity
+end
+
+--- Read TargetInfo_c-equivalent fields.  Identity (name, HP,
+--- overflow count) comes from the camera's actual cursor target
+--- entity -- see ResolveCameraTargetEntity for why this is needed.
+---
+--- Level is read from the Noesis VM since the engine-side level on
+--- combatant entities isn't exposed in a single obvious place; the
+--- VM's level value is consistent for entities of the same template
+--- so even in the rare cases when the VM lags, the level is rarely
+--- wrong (a Devourer is always level 1).  If the VM identity differs
+--- from the camera identity, we still skip the level so we don't
+--- speak the wrong level for an under-leveled rare creature.
+---
+--- widgetRoot may be nil when the TargetInfo widget is missing /
+--- invisible; identity reads work regardless because they don't go
+--- through Noesis at all.
+local function ReadTargetDCData(widgetRoot)
+    local target = {}
+
+    -- Camera-driven identity is always fresh.
+    local targetEntity = ResolveCameraTargetEntity()
+    local entityIdentity = ReadEntityIdentity(targetEntity)
+    target.name = entityIdentity.name
+    target.hpCurrent = entityIdentity.hpCurrent
+    target.hpMax = entityIdentity.hpMax
+    target.extraStatuses = entityIdentity.extraStatuses
+    target._entity = targetEntity
+
+    -- Level still comes from the VM (no clean entity-side source).
+    -- Only trust it when the VM's identity matches the camera's --
+    -- otherwise the VM is stale and the level may belong to a
+    -- different target.
+    if widgetRoot and target.name then
+        local noesisName = ReadPathString(widgetRoot,
+            "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Name")
+        local noesisHp = ReadPathString(widgetRoot,
+            "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Stats.Health.Value")
+        local identityMatches = noesisName == target.name
+            and noesisHp == target.hpCurrent
+        target._noesisIdentityMatches = identityMatches
+
+        if identityMatches then
+            local targetType = ReadPathString(widgetRoot,
+                "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Type")
+            if targetType == "Character" then
+                target.level = ReadPathString(widgetRoot,
+                    "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Stats.Level.Value")
+            end
+            target.title = ReadPathString(widgetRoot,
+                "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Title")
+        end
+    end
+
+    return target
+end
+
+--- Stable representation of a small subset of cursorInfo / target
+--- info, used to log a one-line summary per read so we can see what
+--- the DC pipeline produced this tick when the user reports a
+--- missing or wrong field.
+local function LogReadSummary(label, info, fields)
+    if not info or next(info) == nil then
+        Log.Debug("CLASSIFIED " .. label .. ": (empty)")
+        return
+    end
+    local parts = {}
+    for _, field in ipairs(fields) do
+        if info[field] ~= nil then
+            local v = info[field]
+            if type(v) == "table" then v = "[table]" end
+            parts[#parts + 1] = field .. "='" .. tostring(v) .. "'"
+        end
+    end
+    table.sort(parts)
+    Log.Debug("CLASSIFIED " .. label .. ": " .. table.concat(parts, ", "))
 end
 
 -- ---------------------------------------------------------------------------
@@ -700,9 +1064,11 @@ end
 
 --- Compose capability / heal-error text.  XAML templates render these
 --- as a two-Run TextBlock (Message + Cause, e.g. "Out of spell slots" +
---- " of level 2").  Our ClassifyEntries captures each Run separately
---- under distinct roles.  Stitch them back together for the property
---- value so the screen reader speaks one coherent sentence.
+--- " of level 2").  ReadCursorDCData captures each Run's data
+--- separately under distinct fields (capabilityError /
+--- capabilityCause, cannotHealMessage / cannotHealCause).  Stitch them
+--- back together for the property value so the screen reader speaks
+--- one coherent sentence.
 local function CombineMessageAndCause(message, cause)
     if not message or message == "" then return nil end
     if cause and cause ~= "" then
@@ -809,6 +1175,18 @@ local function BuildTargetSpeechData(
     advantageList, disadvantageList)
     local speechData = SpeechData.Create()
 
+    -- Per-instance priority override.  In SpeechData's canonical
+    -- PROPERTY_ORDER, "Damage" is priority 40 because spell/weapon
+    -- tooltips speak damage early (right after the spell name).  In
+    -- the target-cycling context the desired order is name -> Level
+    -- -> Status -> HP -> action hit chance -> Damage, which mirrors
+    -- the screen's nameplate then action card grouping.  Override
+    -- "Damage" to 155 so it sits after HP (145) and after the
+    -- pattern-priced "<action> hit chance" labels (150).
+    speechData.priorityOverrides = {
+        ["Damage"] = 155,
+    }
+
     -- Cast-blocking rejection text (out-of-range, can't target self,
     -- not enough movement, capability errors, cannot-heal errors).
     -- These ALL prevent the cast going through, so we put them in the
@@ -845,36 +1223,43 @@ local function BuildTargetSpeechData(
     end
     lastRejectionText = rejectionText
 
-    -- Target identity.
+    -- Target identity -- speak the target name PLAIN, no action
+    -- prefix.  The action gets folded into the hit-chance label
+    -- below ("Fire Bolt hit chance: X percent") which keeps the
+    -- speech tight and reads more naturally than the previous
+    -- verb-object form.
     if targetInfo.name then
         speechData:Add("name", targetInfo.name, "brief")
     end
 
-    -- Active statuses go through the "state" core field which sits
-    -- right after "name" in CORE_FIELD_LIST -- so the formatter
-    -- naturally emits "Intellect Devourer. Threatened. <rest>"
-    -- with status ownership unambiguous (these are the TARGET's
-    -- statuses, made clear by adjacency to the target name) and
-    -- without packing two facts into one field's value.
-    -- FormatStatusesPhrase filters to user-facing statuses (those
-    -- whose DisplayName resolved); INSURFACE / tutorial blockers
-    -- with unresolvable display names are dropped.
-    local statusesPhrase = FormatStatusesPhrase(statuses)
-    if statusesPhrase then
-        speechData:Add("state", statusesPhrase, "normal")
-    end
-
-    -- Level: flexible property so the formatter emits "Level: 3".
+    -- Level FIRST among the properties -- sits adjacent to the
+    -- target name, mirroring the screen's "Intellect Devourer
+    -- Lv. 1" nameplate placement.  StripLevelPrefix removes any
+    -- "Lv. "/"Level " prefix from the raw value so AddProperty's
+    -- own "Level: " label isn't redundant.
     local levelValue = StripLevelPrefix(targetInfo.level)
     if levelValue and levelValue ~= "" then
         speechData:AddProperty("Level", levelValue, "brief")
     end
 
-    -- HP: "10 of 15" from HealthText + HealthMaxText.  HealthMaxText
-    -- carries a leading slash from the XAML ("/15"); strip it and
-    -- combine as "N of M" for natural TTS.  Brief tier -- the player
-    -- needs this to decide whether one more attack will finish the
-    -- target.
+    -- Statuses come AFTER Level so the speech reads
+    -- "Intellect Devourer. Level: 1. Status: Threatened. <rest>"
+    -- with the level grouped tightly with the name (matching the
+    -- screen) and statuses one step later.  Routed through
+    -- AddProperty rather than the "state" core field because core
+    -- fields all fire before any property in CORE_FIELD_LIST order;
+    -- using "state" would push statuses BEFORE Level.  "Status"
+    -- (singular label, but the value can be a comma-joined list)
+    -- reads naturally for both single and multiple statuses.
+    local statusesPhrase = FormatStatusesPhrase(statuses)
+    if statusesPhrase then
+        speechData:AddProperty("Status", statusesPhrase, "normal")
+    end
+
+    -- HP next -- the most decision-relevant single number ("can I
+    -- finish this target with one more attack?").  HealthMaxText
+    -- carries a leading slash from the XAML ("/15") historically;
+    -- strip if present.
     if targetInfo.hpCurrent and targetInfo.hpCurrent ~= "" then
         local maxClean = targetInfo.hpMax
             and targetInfo.hpMax:gsub("^/%s*", "") or ""
@@ -885,31 +1270,33 @@ local function BuildTargetSpeechData(
         speechData:AddProperty("HP", hpPhrase, "brief")
     end
 
-    -- Combat-critical pair: hit chance + distance.  Already
-    -- normalized to spoken form ("65 percent", "8 meters").
+    -- Hit chance, prefixed by the action name so the player hears
+    -- which action the chance is for ("Fire Bolt hit chance: 80
+    -- percent", "Main Hand Attack hit chance: 65 percent").  Bare
+    -- "Hit chance" label when the action name is missing.
     if cursorInfo.hitChance then
+        local hitChanceLabel = "Hit chance"
+        if cursorInfo.action and cursorInfo.action ~= "" then
+            hitChanceLabel = cursorInfo.action .. " hit chance"
+        end
         speechData:AddProperty(
-            "Hit chance", cursorInfo.hitChance, "brief")
-    end
-    if cursorInfo.distance then
-        speechData:AddProperty(
-            "Distance", cursorInfo.distance, "brief")
+            hitChanceLabel, cursorInfo.hitChance, "brief")
     end
 
-    -- Damage preview, labeled with the action name when known so
-    -- the user hears "Guiding Bolt damage: 4 to 24" rather than
-    -- the action and damage as two disconnected fragments.  XAML
-    -- value often comes through as "4~9" (dice range); rewrite to
-    -- "4 to 9" for TTS pronounceability.  Falls back to the bare
-    -- "Damage" label when the action name isn't resolved.
+    -- Damage preview ("4~9" from XAML; rewrite to "4 to 9" for TTS).
+    -- Bare "Damage" label -- the action name is already on the hit
+    -- chance label above, so prefixing damage too would be redundant.
     if cursorInfo.damage and cursorInfo.damage ~= "" then
         local damagePhrase = cursorInfo.damage
             :gsub("(%d+)%s*~%s*(%d+)", "%1 to %2")
-        local damageLabel = "Damage"
-        if cursorInfo.action and cursorInfo.action ~= "" then
-            damageLabel = cursorInfo.action .. " damage"
-        end
-        speechData:AddProperty(damageLabel, damagePhrase, "brief")
+        speechData:AddProperty("Damage", damagePhrase, "brief")
+    end
+
+    -- Distance for movement-relevant cases (cursor on terrain or
+    -- friendly).  Lower priority than hit chance / damage.
+    if cursorInfo.distance then
+        speechData:AddProperty(
+            "Distance", cursorInfo.distance, "brief")
     end
 
     -- Attack-of-opportunity / provoke warning.  "Errors" role holds
@@ -957,21 +1344,18 @@ local function BuildTargetSpeechData(
             "Surface", cursorInfo.surface, "brief")
     end
 
-    -- Roll modifier as a single composite phrase.  XAML collapses
-    -- both Advantage and Disadvantage rows when both populate (they
-    -- cancel on the d20), so at most one mode is in play per
-    -- readout.  When source descriptions are available (read out of
+    -- Roll modifier as label-value: the mode (Advantage / Disadvantage)
+    -- becomes part of the label so the source(s) read as the value.
+    -- XAML collapses both Advantage and Disadvantage rows when both
+    -- populate (they cancel on the d20), so at most one mode is in
+    -- play per readout.  Source descriptions are read out of
     -- TargetInfo_c.xaml AdvantagesListHolder / DisadvantagesListHolder
-    -- at lines 224 and 259), they're appended as "from X, Y" so the
-    -- whole roll-state fact reads as one natural phrase:
-    --   "Disadvantage from Threatened"
-    --   "Advantage from High Ground, Pack Tactics"
-    --   "Advantage" (when sources aren't currently rendered, e.g.
-    --                ShowDescription false during cursor exploration)
-    -- Empty label so the formatter speaks just the value -- the
-    -- phrase IS the announcement; a "Roll:" prefix would add
-    -- jargon without adding information, and a separate "Sources"
-    -- property would echo the word.
+    -- at lines 224 and 259.
+    -- Output examples:
+    --   "Roll Disadvantage: Target is too close"
+    --   "Roll Advantage: High Ground, Pack Tactics"
+    --   "Roll: Advantage" (no sources rendered, e.g. ShowDescription
+    --                      false during cursor exploration)
     local rollMode = nil
     local rollSources = nil
     if cursorInfo.advantages then
@@ -982,12 +1366,12 @@ local function BuildTargetSpeechData(
         rollSources = disadvantageList
     end
     if rollMode then
-        local rollPhrase = rollMode
         if rollSources and #rollSources > 0 then
-            rollPhrase = rollPhrase .. " from "
-                .. table.concat(rollSources, ", ")
+            speechData:AddProperty("Roll " .. rollMode,
+                table.concat(rollSources, ", "), "brief")
+        else
+            speechData:AddProperty("Roll", rollMode, "brief")
         end
-        speechData:AddProperty("Roll", rollPhrase, "brief")
     end
 
     -- Reason context.  BG3 renders these as unlabeled Runs in
@@ -1072,31 +1456,37 @@ end
 -- Read & speak
 -- ---------------------------------------------------------------------------
 
---- Dump a classified {label -> text} table to the log so we can see
---- which roles survived the validity filter and which were dropped
---- or not found.
-local function LogClassified(label, classified)
-    if not classified or next(classified) == nil then
-        Log.Info("CLASSIFIED " .. label .. ": (empty)")
-        return
-    end
-    local parts = {}
-    for key, value in pairs(classified) do
-        parts[#parts + 1] = key .. "='" .. tostring(value) .. "'"
-    end
-    table.sort(parts)
-    Log.Info("CLASSIFIED " .. label .. ": " .. table.concat(parts, ", "))
-end
+-- Field whitelists for LogReadSummary -- log only the fields that
+-- actually feed BuildTargetSpeechData so the log line stays readable.
+-- (Definitions also document the full set of expected fields per
+-- widget for future maintenance.)
+local TARGET_LOG_FIELDS = {
+    "name", "title", "level", "hpCurrent", "hpMax", "extraStatuses",
+}
+local CURSOR_LOG_FIELDS = {
+    "action", "hitChance", "distance", "advantages", "disadvantages",
+    "cursorInfo", "actionWarning", "concentration",
+    "capabilityError", "capabilityCause",
+    "cannotHealMessage", "cannotHealCause",
+    "highDefense", "container", "surface",
+}
 
 --- Perform the actual widget read and speech.  Called after the
 --- defer timer fires -- never directly from the input handler.
 ---
---- Instrumented end-to-end: logs widget read results, classified
---- role maps, composed speech, and every reason we'd skip speaking.
+--- Instrumented end-to-end: logs DC read results and composed speech.
 --- When the user reports "d-pad did nothing," the log shows which
 --- stage dropped the data.
-local function PerformTargetRead()
-    Log.Info("TARGET READ: begin")
+--- forceSpeak (default false): when true, accept identity-only
+--- speech if Noesis cursor info still hasn't caught up (the retry
+--- budget exhausted).  When false, return false on identity
+--- mismatch so the caller can re-schedule.
+---
+--- Returns true when speech was emitted (or skipped intentionally
+--- via dedup/empty cases).  Returns false when the read should be
+--- retried because Noesis hasn't caught up yet.
+local function PerformTargetRead(forceSpeak)
+    Log.Debug("TARGET READ: begin")
 
     -- Log the current turn-order pool for comparison with the
     -- d-pad cycle results.  If the pool has four combatants but
@@ -1112,97 +1502,90 @@ local function PerformTargetRead()
                 names[#names + 1] =
                     (entry.isCurrent and "*" or "") .. entry.name
             end
-            Log.Info("TARGET READ: turn-order pool ("
+            Log.Debug("TARGET READ: turn-order pool ("
                 .. tostring(#turnEntries) .. "): "
                 .. table.concat(names, ", "))
         else
-            Log.Info("TARGET READ: turn-order pool = (empty)")
+            Log.Debug("TARGET READ: turn-order pool = (empty)")
         end
     end
 
-    local targetEntries = ReadWidgetEntries(
+    -- Resolve a widget root for each XAML widget (TargetInfo_c,
+    -- CursorText_c).  Both widgets ultimately route through the
+    -- same root Widget VM (CurrentPlayer / Data / Layout), so
+    -- either widget root works for any DC path -- but resolving
+    -- both serves as a presence check so missing widgets log a
+    -- specific "anchor not found" line for diagnosis.
+    local targetWidgetRoot = ResolveWidgetRoot(
         "TargetInfo_c", TARGET_INFO_ANCHOR)
-    local cursorEntries = ReadWidgetEntries(
+    local cursorWidgetRoot = ResolveWidgetRoot(
         "CursorText_c", CURSOR_TEXT_ANCHOR)
 
-    -- Per-source advantage / disadvantage descriptions read out of
-    -- TargetInfo_c's AdvantagesListHolder / DisadvantagesListHolder.
-    -- Done BEFORE classifying the widget entries so we can build an
-    -- exclude set that prevents the same Description texts from
-    -- double-speaking through the unclassified-reason fallback in
-    -- ClassifyEntries.
-    local advantageList = ReadModifierItemList(
-        ADVANTAGES_HOLDER_ANCHOR, "advantages")
-    local disadvantageList = ReadModifierItemList(
-        DISADVANTAGES_HOLDER_ANCHOR, "disadvantages")
-    local advDisadvExcludeSet = nil
-    if advantageList or disadvantageList then
-        advDisadvExcludeSet = {}
-        if advantageList then
-            for _, advantageText in ipairs(advantageList) do
-                advDisadvExcludeSet[advantageText] = true
-            end
+    local targetInfo = ReadTargetDCData(
+        targetWidgetRoot or cursorWidgetRoot)
+    local cursorInfo = ReadCursorDCData(
+        cursorWidgetRoot or targetWidgetRoot)
+
+    -- The Noesis VM (which provides cursor info -- action, distance,
+    -- hit chance, advantages, AoO warning, etc.) lags the engine's
+    -- actual cursor target intermittently.  When that happens, the
+    -- VM's identity won't match the camera's identity (which is the
+    -- ground truth -- see ResolveCameraTargetEntity), and the cursor
+    -- info belongs to the WRONG target.
+    --
+    -- Cursor info is critical accessibility data -- sighted players
+    -- read action / distance / hit chance / advantages from visual
+    -- cues we have no equivalent for.  Discarding it isn't an
+    -- option.  Instead, the per-tick OnTick handler keeps calling
+    -- this function each frame until the identity matches (so the
+    -- cursor info we read with it is for the right target).  This
+    -- function returns false when the identity hasn't caught up yet,
+    -- and OnTick checks again on the next frame -- no timer
+    -- arithmetic, just frame-by-frame polling driven by the engine
+    -- itself.  When forceSpeak is true (READ_MAX_TOTAL_MS budget
+    -- exhausted), we accept identity-only speech as a last resort
+    -- rather than blocking forever.
+    if targetInfo._noesisIdentityMatches == false then
+        if not forceSpeak then
+            Log.Info("TARGET READ: Noesis identity stale (camera='"
+                .. tostring(targetInfo.name) .. "' "
+                .. tostring(targetInfo.hpCurrent) .. "/"
+                .. tostring(targetInfo.hpMax)
+                .. "'); next tick will retry")
+            return false
         end
-        if disadvantageList then
-            for _, disadvantageText in ipairs(disadvantageList) do
-                advDisadvExcludeSet[disadvantageText] = true
-            end
-        end
+        Log.Info("TARGET READ: Noesis identity stale (camera='"
+            .. tostring(targetInfo.name) .. "' "
+            .. tostring(targetInfo.hpCurrent) .. "/"
+            .. tostring(targetInfo.hpMax)
+            .. "); retry budget exhausted, identity-only speech")
+        cursorInfo = {}
     end
 
-    -- BOTH widgets capture unlabeled Runs as reasonText.  Reason
-    -- text (e.g. "Target is too close", "Not enough movement in the
-    -- target area", "Can't reach destination") can surface in
-    -- either TargetInfo_c (HitChanceDesc explainer) or CursorText_c
-    -- (txt items / TaskDescription siblings) depending on what the
-    -- game decided to render.  ClassifyEntries already filters the
-    -- noise (bare-digit Duration badges from NamedStatusTemplate,
-    -- 1-2 char XAML separators, statusLabel echoes); we additionally
-    -- pass the advantage/disadvantage texts so the per-source
-    -- properties above own those strings cleanly.
-    local targetInfo = ClassifyEntries(
-        targetEntries, TARGET_INFO_ROLES, nil, true,
-        advDisadvExcludeSet)
-    local cursorInfo = ClassifyEntries(
-        cursorEntries, CURSOR_TEXT_ROLES,
-        PARENT_ROLE_TO_LABEL, true,
-        advDisadvExcludeSet)
+    -- Surface the per-source advantage / disadvantage descriptions
+    -- the speech builder expects.  ReadCursorDCData populated
+    -- cursor.advantageList / disadvantageList from the VM
+    -- collections.
+    local advantageList = cursorInfo.advantageList
+    local disadvantageList = cursorInfo.disadvantageList
 
-    -- Resolve target name to an entity handle by scanning the
-    -- turn-order pool.  The widget gives us a display name but not
-    -- a stable identifier, and the name can be ambiguous for generic
-    -- enemy types ("Intellect Devourer" appearing twice).  For the
-    -- common case where names are unique we pick the first match;
-    -- for duplicates we fall through to the first match which is
-    -- acceptable for the effects view (both instances typically
-    -- share statuses in the same encounter).
-    --
-    -- We cache only the UUID string (a stable identifier).  The
-    -- entity userdata pointer in entry.entity is fresh THIS tick
-    -- but we must not store it -- holding it across ticks risks
-    -- dereferencing a freed ECS record.  ResolveTargetEntity()
-    -- below re-resolves from the UUID on each use via
-    -- Ext.Entity.Get (returns nil cleanly for dead/missing
-    -- entities).
+    -- Cache the cursor target UUID for the effects view.  We get
+    -- the live entity straight from ResolveCameraTargetEntity (no
+    -- name-pool lookup needed -- the camera gives us the precise
+    -- entity, even when multiple combatants share a name).  Only
+    -- cache the UUID string, never the entity userdata pointer
+    -- across ticks (caching pointers across teardown windows
+    -- caused "dead object in ToString" SEH faults).
     lastTargetName = targetInfo.name
     lastTargetEntityUuid = nil
-    if targetInfo.name and targetInfo.name ~= ""
-        and Combat and Combat.ReadTurnOrder then
-        local turnEntries = Combat.ReadTurnOrder()
-        if turnEntries then
-            for _, entry in ipairs(turnEntries) do
-                if entry.name == targetInfo.name and entry.entity then
-                    pcall(function()
-                        if entry.entity.Uuid
-                            and entry.entity.Uuid.EntityUuid then
-                            lastTargetEntityUuid = tostring(
-                                entry.entity.Uuid.EntityUuid)
-                        end
-                    end)
-                    break
-                end
+    if targetInfo._entity then
+        pcall(function()
+            if targetInfo._entity.Uuid
+                and targetInfo._entity.Uuid.EntityUuid then
+                lastTargetEntityUuid = tostring(
+                    targetInfo._entity.Uuid.EntityUuid)
             end
-        end
+        end)
     end
 
     -- Record freshness timestamp so the effects view can decide
@@ -1211,8 +1594,8 @@ local function PerformTargetRead()
     -- resolved" case also ages out.
     lastTargetReadAtMs = Ext.Utils.MonotonicTime()
 
-    LogClassified("TargetInfo_c", targetInfo)
-    LogClassified("CursorText_c", cursorInfo)
+    LogReadSummary("TargetInfo_c", targetInfo, TARGET_LOG_FIELDS)
+    LogReadSummary("CursorText_c", cursorInfo, CURSOR_LOG_FIELDS)
 
     -- Read the authoritative status list from the target entity.
     -- EnumerateStatuses returns {statusId, name, description,
@@ -1225,10 +1608,10 @@ local function PerformTargetRead()
     local targetEntity = ResolveTargetEntity()
     if targetEntity then
         entityStatuses = EnumerateStatuses(targetEntity)
-        Log.Info("TARGET READ: entity statuses ("
+        Log.Debug("TARGET READ: entity statuses ("
             .. tostring(#entityStatuses) .. ")")
         for _, statusEntry in ipairs(entityStatuses) do
-            Log.Info("  status: id='"
+            Log.Debug("  status: id='"
                 .. tostring(statusEntry.statusId) .. "' name='"
                 .. tostring(statusEntry.name) .. "' lifetime="
                 .. tostring(statusEntry.rawLifetime))
@@ -1241,7 +1624,7 @@ local function PerformTargetRead()
     if not speechData then
         Log.Info("TARGET READ: no speakable data (widgets produced"
             .. " no classifiable entries)")
-        return
+        return true
     end
 
     local candidatePhrase = speechData:Format()
@@ -1258,7 +1641,7 @@ local function PerformTargetRead()
         and (nowMs - lastSpokenAtMs) < DEDUP_WINDOW_MS then
         Log.Info("TARGET READ: dedup suppressed (same phrase within "
             .. tostring(DEDUP_WINDOW_MS) .. "ms)")
-        return
+        return true
     end
     lastSpokenAtMs = nowMs
 
@@ -1268,28 +1651,413 @@ local function PerformTargetRead()
     -- It also records handlerState.spokenRoles / lastSpokenFullText
     -- so subsequent tooltip / INPC events can cross-off what we said.
     speechData:Speak(handlerState, true, nil, true)
+    return true
 end
 
---- Schedule a deferred target read.  Cancels any previously-pending
---- read by invalidating its cancel key, so rapid presses coalesce
---- into a single read of the final state.
-local function ScheduleTargetRead()
-    deferredReadPending = true
-    deferredReadCancelKey = deferredReadCancelKey + 1
-    local myCancelKey = deferredReadCancelKey
-    Ext.Timer.WaitFor(READ_DEFER_MS, function()
-        if myCancelKey ~= deferredReadCancelKey then
-            -- A newer press came in and scheduled its own read.
-            -- Drop this one.
-            return
-        end
-        deferredReadPending = false
-        local readOk, readErr = pcall(PerformTargetRead)
-        if not readOk then
-            Log.Error("TargetSelect read error: " .. tostring(readErr))
+--- Snapshot the current camera target UUID.  Returns nil when no
+--- camera entity exists or no target is currently selected.  Used
+--- as a "pre-press" snapshot so the per-tick handler can detect
+--- when the engine has actually processed a D-pad input (camera
+--- UUID diverges from the snapshot).
+local function SnapshotCameraTargetUuid()
+    local entity = ResolveCameraTargetEntity()
+    if not entity then return nil end
+    local uuid
+    pcall(function()
+        if entity.Uuid and entity.Uuid.EntityUuid then
+            uuid = tostring(entity.Uuid.EntityUuid)
         end
     end)
+    return uuid
 end
+
+--- Snapshot the CurrentPlayer.CurrentTarget identity from the
+--- TargetInfo_c VM.  Used as a SECOND advance signal alongside the
+--- camera UUID so D-pad targeting works outside combat.
+---
+--- Why a second signal: the combat camera target field
+--- (GameCameraBehavior.Targets[1]) is only populated during combat.
+--- In exploration the engine's D-pad target cycle updates a
+--- different VM field -- CurrentPlayer.CurrentTarget -- which the
+--- TargetInfo_c.xaml widget binds for its name / AC / rarity / etc.
+--- displays.  By snapshotting the CurrentTarget's EntityHandle (or
+--- Name as fallback) and watching it for divergence, we detect a
+--- successful exploration cycle the same way we detect a combat
+--- cycle via camera UUID.
+---
+--- Returns nil when the widget isn't mounted (e.g. no target on
+--- screen at all) -- the OnTick advance check handles nil-vs-value
+--- as a divergence, which is exactly what we want when the press
+--- transitions from "no target" to "Shadowheart targeted."
+local function SnapshotCurrentTargetIdentity()
+    local widgetRoot = ResolveWidgetRoot(
+        "TargetInfo_c", TARGET_INFO_ANCHOR)
+    if not widgetRoot then return nil end
+    -- EntityHandle is the most stable per-entity identifier exposed
+    -- on CurrentTarget; falls through to .Name only when the handle
+    -- read returns nil (which can happen for non-character targets
+    -- the engine hasn't fully classified yet).
+    local handleValue = ReadPath(
+        widgetRoot, "CurrentPlayer.CurrentTarget.EntityHandle")
+    if handleValue ~= nil then
+        return tostring(handleValue)
+    end
+    local nameValue = ReadPath(
+        widgetRoot, "CurrentPlayer.CurrentTarget.Name")
+    if nameValue and nameValue ~= "" then
+        return tostring(nameValue)
+    end
+    return nil
+end
+
+-- Per-press state.  Set by OnButtonInput, consumed by the per-tick
+-- handler.  Nil when no press is awaiting the engine to process.
+--
+-- Fields:
+--   prePressCameraUuid -- camera target UUID at the moment of the
+--     D-pad press, BEFORE the engine processed it.  The tick handler
+--     waits for the live camera UUID to diverge from this.
+--   startTimeMs        -- monotonic time of the press; used to bound
+--     how long we wait before giving up.
+--   pressId            -- monotonic counter; the tick handler
+--     ignores stale pending records (a newer press supersedes them).
+local pendingPress = nil
+local nextPressId = 0
+
+-- Diagnostic: per-tick cursor-info evolution logger.  Active for the
+-- first DIAG_EVOLVE_MAX_TICKS frames after a D-pad press.  Logs the
+-- raw cursor-info VM values each tick so we can see whether the
+-- cursor-info VM fields evolve over time (settling toward the truth)
+-- or stay uniformly stale.  Read-only -- does not affect speech.
+-- Declared BEFORE MarkPendingPress so the local reference resolves
+-- correctly (Lua locals are lexical).
+local DIAG_EVOLVE_MAX_TICKS = 40
+local diagEvolveState = nil
+
+-- Hash a small set of cursor-info VM fields into a comparable string.
+-- Used by the stability gate in OnTick to detect when the cursor info
+-- has (a) diverged from the pre-press snapshot (engine has updated
+-- the values) and (b) stabilized across two consecutive ticks (engine
+-- is done updating).  Field choice mirrors the diagnostic logger:
+-- ShowDescription / TotalHitChance / AoOWarning / ActiveTask.Info are
+-- the fields the diagnostic showed evolving across ticks.
+local function ComputeCursorInfoHash(widgetRoot)
+    if not widgetRoot then return "" end
+    local parts = {}
+    -- ActiveTask.PreviewDescription is the action label ("Move To",
+    -- "Cast spell", "Main Hand Attack", ...).  MUST be in the hash
+    -- so the engine's stage-1 transition (Move To -> Cast spell at
+    -- ~120ms post-press) resets stability.  Without this, evolves
+    -- where action changes but hc/info stay zero/empty look
+    -- identical and the stability timer expires during the quiet
+    -- zone between stage 1 (action transition) and stage 2 (hit
+    -- chance / warnings populate at ~320ms).
+    parts[#parts + 1] = "act:"
+        .. tostring(ReadPath(widgetRoot,
+            "CurrentPlayer.UIData.ActiveTask.PreviewDescription"))
+    parts[#parts + 1] = "show:"
+        .. tostring(ReadPath(widgetRoot,
+            "CurrentPlayer.UIData.HitChanceDesc.ShowDescription"))
+    parts[#parts + 1] = "hc:"
+        .. tostring(ReadPath(widgetRoot,
+            "CurrentPlayer.UIData.HitChanceDesc.TotalHitChance"))
+    parts[#parts + 1] = "aoo:"
+        .. tostring(ReadPath(widgetRoot,
+            "CurrentPlayer.UIData.ActiveTask.AoOWarning"))
+    local info = ReadPath(widgetRoot,
+        "CurrentPlayer.UIData.ActiveTask.Info")
+    if type(info) == "table" then
+        for index, item in ipairs(info) do
+            parts[#parts + 1] = "info" .. index .. ":"
+                .. tostring(item and item.Text)
+                .. "/" .. tostring(item and item.TextContext)
+        end
+    end
+    return table.concat(parts, "|")
+end
+
+--- Called by OnButtonInput on every accepted D-pad press.  Records
+--- the pre-press camera UUID AND the pre-press cursor-info hash so
+--- the per-tick handler can detect when both have updated.  No timer
+--- involved -- the next render frame will trigger the read attempt.
+local function MarkPendingPress(preCameraUuid)
+    nextPressId = nextPressId + 1
+    -- Pre-press cursor info hash: captures whatever cursor-info state
+    -- was visible at the moment of the press.  After the press the
+    -- engine eventually updates these fields; the stability gate in
+    -- OnTick waits for the hash to (1) differ from this snapshot, then
+    -- (2) stabilize for one more tick.
+    local cursorWidgetRoot = ResolveWidgetRoot(
+        "CursorText_c", CURSOR_TEXT_ANCHOR)
+    local prePressCursorHash =
+        ComputeCursorInfoHash(cursorWidgetRoot)
+
+    -- Snapshot CurrentPlayer.CurrentTarget identity in addition to
+    -- the camera UUID.  See SnapshotCurrentTargetIdentity for why:
+    -- the combat camera-target field is empty in exploration, so
+    -- without this second signal the engine could process a
+    -- successful exploration D-pad cycle and we'd never notice
+    -- (camera UUID stays unchanged the whole time, the gate times
+    -- out, we fall back to identity-only Tav speech).
+    local prePressCurrentTargetId = SnapshotCurrentTargetIdentity()
+
+    pendingPress = {
+        prePressCameraUuid = preCameraUuid,
+        prePressCurrentTargetId = prePressCurrentTargetId,
+        prePressCursorHash = prePressCursorHash,
+        startTimeMs = Ext.Utils.MonotonicTime(),
+        pressId = nextPressId,
+        -- Stability tracking: cursor-info hash + timestamp of when
+        -- it was last DIFFERENT.  Diagnostic showed the engine runs
+        -- a multi-stage compute pipeline (range check → hit chance
+        -- attempt → pathfind → AoO check → settle), each stage
+        -- producing a briefly stable intermediate state.  Wait for
+        -- the hash to be UNCHANGED for STABILITY_MS milliseconds to
+        -- get past the intermediate states and capture the final
+        -- settled value.
+        lastSeenCursorHash = nil,
+        lastHashChangeMs = nil,
+    }
+    diagEvolveState = {
+        startTimeMs = pendingPress.startTimeMs,
+        ticksLogged = 0,
+    }
+end
+
+local function DiagEvolveTick()
+    if not diagEvolveState then return end
+    if diagEvolveState.ticksLogged >= DIAG_EVOLVE_MAX_TICKS then
+        diagEvolveState = nil
+        return
+    end
+
+    diagEvolveState.ticksLogged = diagEvolveState.ticksLogged + 1
+    local elapsedMs = Ext.Utils.MonotonicTime()
+        - diagEvolveState.startTimeMs
+
+    -- Resolve a cursor widget root for the path reads.
+    local cursorWidgetRoot = ResolveWidgetRoot(
+        "CursorText_c", CURSOR_TEXT_ANCHOR)
+    if not cursorWidgetRoot then
+        Log.Debug("CURSOR EVOLVE [" .. tostring(diagEvolveState.ticksLogged)
+            .. "@" .. tostring(elapsedMs) .. "ms] no cursor widget")
+        return
+    end
+
+    -- Camera target identity.
+    local camEntity = ResolveCameraTargetEntity()
+    local camId = "nil"
+    if camEntity then
+        pcall(function()
+            local name
+            if camEntity.DisplayName and camEntity.DisplayName.Name then
+                local resolved = Helpers.ResolveTranslatedString(
+                    camEntity.DisplayName.Name)
+                if resolved and resolved ~= "" then name = resolved end
+            end
+            local hp = "?"
+            if camEntity.Health then
+                hp = tostring(camEntity.Health.Hp) .. "/"
+                    .. tostring(camEntity.Health.MaxHp)
+            end
+            camId = (name or "?") .. " " .. hp
+        end)
+    end
+
+    -- Raw cursor-info VM fields.
+    local action = ReadPath(cursorWidgetRoot,
+        "CurrentPlayer.UIData.ActiveTask.PreviewDescription")
+    local showDesc = ReadPath(cursorWidgetRoot,
+        "CurrentPlayer.UIData.HitChanceDesc.ShowDescription")
+    local totalHC = ReadPath(cursorWidgetRoot,
+        "CurrentPlayer.UIData.HitChanceDesc.TotalHitChance")
+    local aoo = ReadPath(cursorWidgetRoot,
+        "CurrentPlayer.UIData.ActiveTask.AoOWarning")
+
+    -- ActiveTask.Info collection: summarize first few entries.
+    local info = ReadPath(cursorWidgetRoot,
+        "CurrentPlayer.UIData.ActiveTask.Info")
+    local infoStr = "nil"
+    if type(info) == "table" then
+        if #info == 0 then
+            infoStr = "[]"
+        else
+            local items = {}
+            for index, item in ipairs(info) do
+                local txt = (item and item.Text) or "?"
+                local ctx = (item and item.TextContext) or ""
+                items[#items + 1] = '"' .. txt .. '"'
+                    .. (ctx ~= "" and ("/" .. ctx) or "")
+                if index >= 3 then
+                    items[#items + 1] = "..."
+                    break
+                end
+            end
+            infoStr = "[" .. table.concat(items, ", ") .. "]"
+        end
+    end
+
+    Log.Debug("CURSOR EVOLVE [" .. tostring(diagEvolveState.ticksLogged)
+        .. "@" .. tostring(elapsedMs) .. "ms]"
+        .. " cam=" .. camId
+        .. " action=" .. tostring(action)
+        .. " showDesc=" .. tostring(showDesc)
+        .. " hc=" .. tostring(totalHC)
+        .. " aoo=" .. tostring(aoo)
+        .. " info=" .. infoStr)
+end
+
+--- Per-tick handler.  Runs on every game tick (Ext.Events.Tick).
+--- When pendingPress is set, attempts the read; when not, no-op.
+---
+--- Two conditions must hold before we speak:
+---   1. The camera UUID has changed from the pre-press snapshot
+---      (engine has processed the press).
+---   2. PerformTargetRead succeeds (Noesis identity matches camera
+---      identity, so the cursor info is for the right target).
+--- If either fails, we DO NOTHING this tick -- the next tick will
+--- check again.  No retry timers, no fixed intervals.
+---
+--- After READ_MAX_TOTAL_MS, we force-speak whatever we have to
+--- avoid blocking on engine state that may never arrive (e.g.,
+--- target despawned mid-press, focus lost, weird transient state).
+local function OnTick()
+    -- Diagnostic logging fires independently of pendingPress so we
+    -- still see field evolution for ticks that occur after we've
+    -- already spoken (whether speech was correct or stale).
+    DiagEvolveTick()
+
+    if not pendingPress then return end
+
+    local elapsedMs = Ext.Utils.MonotonicTime()
+        - pendingPress.startTimeMs
+    local timeoutReached = elapsedMs >= READ_MAX_TOTAL_MS
+
+    -- Phase 1: wait for ANY of three signals to diverge from
+    -- pre-press, indicating BG3 has acknowledged the press:
+    --   * Camera UUID (combat target cycle).
+    --   * CurrentTarget VM identity (exploration target cycle).
+    --   * Cursor-info hash (target-prompt error messages).
+    --
+    -- The third signal is essential when the engine REJECTS the
+    -- press: e.g. queuing Revivify on a downed-not-dead party
+    -- member produces a sequence of cursor-prompt error messages
+    -- ("Can't target self" -> "No target" -> "Target must be a
+    -- playable character") with the cursor staying glued to the
+    -- caster.  Without the cursor-hash signal, neither camera nor
+    -- target ID advances and the gate waits the full 900ms
+    -- timeout before falling back to stale identity-only speech.
+    -- With it, the message change registers as "press handled" and
+    -- the user hears the actual rejection in ~300-400ms.
+    local currentUuid = SnapshotCameraTargetUuid()
+    local cameraAdvanced = currentUuid ~= pendingPress.prePressCameraUuid
+    local currentTargetId = SnapshotCurrentTargetIdentity()
+    local currentTargetAdvanced =
+        currentTargetId ~= pendingPress.prePressCurrentTargetId
+    local cursorHashNow = ComputeCursorInfoHash(
+        ResolveWidgetRoot("CursorText_c", CURSOR_TEXT_ANCHOR))
+    local cursorHashAdvanced =
+        cursorHashNow ~= pendingPress.prePressCursorHash
+    local pressAcknowledged = cameraAdvanced
+        or currentTargetAdvanced or cursorHashAdvanced
+    if not pressAcknowledged and not timeoutReached then
+        return  -- engine hasn't processed yet; next tick
+    end
+
+    -- Phase 2: stability gate on cursor info.  After the engine
+    -- processes the press (camera UUID advances), the cursor-info VM
+    -- fields can do one of two things: (a) keep updating across
+    -- multiple ticks as the engine runs through its compute pipeline
+    -- before settling, or (b) stay identical to the pre-press values
+    -- because the new target happens to share the same hit chance /
+    -- info / etc. as the previous one.  We can't tell (a) from (b)
+    -- by comparing to the pre-press snapshot -- in (b), the hash
+    -- equals pre-press and would block forever.  Instead, the moment
+    -- camera UUID advances, RESET the stability tracking and wait
+    -- STABILITY_MS of unchanged hash from THAT point.  Both cases
+    -- collapse to the same logic: the engine has settled when the
+    -- cursor-info hash hasn't changed for STABILITY_MS post-advance.
+    local cursorWidgetRoot = ResolveWidgetRoot(
+        "CursorText_c", CURSOR_TEXT_ANCHOR)
+    local currentCursorHash = ComputeCursorInfoHash(cursorWidgetRoot)
+    local nowMs = Ext.Utils.MonotonicTime()
+
+    -- Initialize stability tracking the FIRST tick we observe camera
+    -- advance.  Crediting any time before camera advance would let
+    -- pre-press stale-but-stable hashes pass the gate.
+    if pendingPress.cameraAdvanceObservedMs == nil then
+        pendingPress.cameraAdvanceObservedMs = nowMs
+        pendingPress.lastSeenCursorHash = currentCursorHash
+        pendingPress.lastHashChangeMs = nowMs
+        return  -- start fresh on the next tick
+    end
+
+    if currentCursorHash ~= pendingPress.lastSeenCursorHash then
+        pendingPress.lastSeenCursorHash = currentCursorHash
+        pendingPress.lastHashChangeMs = nowMs
+        return  -- still settling
+    end
+
+    -- The cursor-info VM evolves in two stages on attackable
+    -- targets: stage 1 (~120ms after press) is the action-label
+    -- transition (Move To -> Cast spell / Main Hand Attack), and
+    -- stage 2 (~320ms after press) is when ShowDescription flips
+    -- to On with TotalHitChance populated, then stage 3 (~360ms)
+    -- adjusts to final state (e.g. swaps to a "Not enough movement"
+    -- warning).  The quiet zone between stages 1 and 2 is ~200ms,
+    -- so STABILITY_MS must be larger than that to avoid firing
+    -- mid-pipeline.  250ms catches the full evolution while keeping
+    -- the total speech delay around 600-650ms post-press.  For
+    -- friendly / movement-only targets where stage 2 never fires,
+    -- the 250ms wait runs from the camera-advance reset and we
+    -- speak around 350-400ms post-press.
+    local STABILITY_MS = 250
+    local stableForMs = nowMs - pendingPress.lastHashChangeMs
+    if stableForMs < STABILITY_MS and not timeoutReached then
+        return  -- not stable long enough yet
+    end
+
+    -- All gates passed (or timeout fired).  Do the read + speak.
+    local readOk, completed = pcall(
+        PerformTargetRead, timeoutReached)
+    if not readOk then
+        Log.Error("TargetSelect tick error: " .. tostring(completed))
+        pendingPress = nil
+        return
+    end
+
+    if completed then
+        Log.Info("TARGET READ: completed via tick ("
+            .. tostring(elapsedMs) .. "ms after press, camAdv="
+            .. tostring(cameraAdvanced)
+            .. ", tgtAdv=" .. tostring(currentTargetAdvanced)
+            .. ", cursorAdv=" .. tostring(cursorHashAdvanced)
+            .. ", timeout=" .. tostring(timeoutReached) .. ")")
+        pendingPress = nil
+        return
+    end
+
+    -- PerformTargetRead returned false (its internal Noesis-vs-camera
+    -- identity check failed even after our gates).  This is rare now
+    -- that the cursor-info stability gate ran first -- but if it
+    -- happens, the natural per-frame cadence retries on the next tick
+    -- (or the timeout will eventually force speech).
+end
+
+local tickSubscriptionId = nil
+local function SubscribeTick()
+    if tickSubscriptionId then return end
+    tickSubscriptionId = Ext.Events.Tick:Subscribe(function()
+        local handleOk, handleErr = pcall(OnTick)
+        if not handleOk then
+            Log.Error("TargetSelect tick handler error: "
+                .. tostring(handleErr))
+        end
+    end)
+    Log.Debug("TargetSelect: tick subscription active")
+end
+
+SubscribeTick()
 
 -- ---------------------------------------------------------------------------
 -- Input wiring
@@ -1333,6 +2101,54 @@ local function ShouldHandleDPad()
         return false
     end
 
+    -- GPS routing entity list owns D-pad for category/item navigation
+    -- (handled by WorldNav).  TargetSelect must not accept the press
+    -- in parallel: the engine doesn't actually advance the camera
+    -- target while the list is open, so the pending press times out
+    -- 925ms later and falls back to identity-only speech, leaking
+    -- "Tav. HP: 6 of 10" into the middle of list navigation.
+    local Nav = BG3Access.Client.WorldNav
+    if Nav and Nav.IsEntityListOpen and Nav.IsEntityListOpen() then
+        return false
+    end
+
+    -- WorldUI panels (Container, Examine, SpellBook, ActiveRoll, etc.)
+    -- own D-pad while open: BG3 routes up/down for item browsing,
+    -- left/right for tab cycling, A for select.  TargetSelect must
+    -- step aside or it races with the panel and reads stale camera
+    -- info ("Container: Empty" while the user expected the loot list
+    -- to focus an item).
+    --
+    -- PartyLine is one exception: PartyLine_c is the always-visible
+    -- HUD portrait row that activates the handler from snapshot-
+    -- discovery without representing an actual interactive panel.
+    -- PartyLineActive_c (the LT-opened expanded party panel) ALSO
+    -- maps to PartyLineHandler, so the LT-held edge case isn't
+    -- distinguishable here -- accept the false negative; LT is rarely
+    -- held during target select.
+    --
+    -- SelectionFlyOut is the second exception: gui::DCActiveSearch /
+    -- gui::DCSelectionFlyOut backs both the combat-start target-picker
+    -- flyout AND the X-button context menu.  The widget often persists
+    -- (same Noesis address reused) after the context menu closes, but
+    -- BG3 never fires a widgetRemoved event -- only a C++-side
+    -- "context menu closed" log.  Result: panelHandler stays pinned
+    -- to SelectionFlyOut indefinitely after a context-menu interaction,
+    -- and TargetSelect is gated for the rest of combat (or until
+    -- another panel takes the slot).  Letting D-pad pass through
+    -- restores combat-target cycling; in the rare case the flyout is
+    -- genuinely visible, BG3 uses LB/RB and stick for navigation
+    -- inside it, not D-pad, so the pass-through doesn't conflict.
+    local World = BG3Access.Client.WorldUI
+    if World and World.GetActivePanelHandler then
+        local panelHandler = World.GetActivePanelHandler()
+        if panelHandler and panelHandler.name
+            and panelHandler.name ~= "PartyLine"
+            and panelHandler.name ~= "SelectionFlyOut" then
+            return false
+        end
+    end
+
     return true
 end
 
@@ -1368,16 +2184,23 @@ local function OnButtonInput(event)
         local inCC = CC and CC.IsInCC and CC.IsInCC() or false
         Log.Info("TARGET BUTTON " .. buttonName
             .. ": gated (inCombat=" .. tostring(inCombat)
-            .. " localPlayerTurn=" .. tostring(IsLocalPlayerTurn())
+            .. " turnAllowsTargeting=" .. tostring(IsLocalPlayerTurn())
             .. " menu=" .. menuName
             .. " inCC=" .. tostring(inCC)
             .. ")")
         return
     end
+    -- Snapshot the camera target UUID NOW, before BG3's game thread
+    -- has had a chance to process this D-pad event.  The per-tick
+    -- handler (OnTick) waits for the live camera UUID to diverge
+    -- from this snapshot -- the only reliable signal that the engine
+    -- has actually advanced the cursor.  No timer involved; the next
+    -- render frame triggers the check.
+    local prePressCameraUuid = SnapshotCameraTargetUuid()
     Log.Info("TARGET BUTTON " .. buttonName
-        .. ": accepted, scheduling read in "
-        .. tostring(READ_DEFER_MS) .. "ms")
-    ScheduleTargetRead()
+        .. ": accepted, marking pending (pre-press camera="
+        .. tostring(prePressCameraUuid) .. ")")
+    MarkPendingPress(prePressCameraUuid)
 end
 
 --- Subscribe to controller input.  Idempotent -- safe to call from
@@ -1674,8 +2497,7 @@ BG3Access.Client.TargetSelect = {
         handlerState.lastSpokenFullText = nil
         handlerState.spokenRoles = {}
         handlerState.spokenValues = {}
-        deferredReadCancelKey = deferredReadCancelKey + 1
-        deferredReadPending = false
+        pendingPress = nil
         lastTargetName = nil
         lastTargetEntityUuid = nil
         lastTargetReadAtMs = 0

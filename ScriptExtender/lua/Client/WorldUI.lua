@@ -48,18 +48,31 @@ local DEFAULT_PANEL_HINT = false
 
 local tooltipSuppressed      = false  -- handlers set true to suppress speech
 local tooltipEnabled         = true   -- future settings toggle
--- Dedup state for radial fallback tooltip path.  Its .lastTooltipSpeech
--- field holds the last spoken tooltip string for subset / superset
--- collapsing across tooltip waves.  Mutated by DispatchTooltip fallback.
-local tooltipState           = {lastTooltipSpeech = nil}
 local lastSpokenRadialTitle  = nil    -- title filter: prevent tooltip re-speaking title (inspect pipeline)
 local lastRawTooltipTexts    = nil    -- full raw texts for inspect readback
-local lastRadialSpeechData   = nil    -- SpeechData from radial slot speech (for tooltip diff)
+-- Synthetic handlerState for the radial speech path.  The radial
+-- isn't a panel handler, so it doesn't carry its own handlerState,
+-- but SpeechData:Speak needs one to record spokenRoles + last text
+-- into.  Same shape and semantics as a panel handler's state:
+-- spokenRoles is the cross-off set FromTooltip consults to skip
+-- already-spoken roles; lastSpokenFullText is what Speak records.
+-- Reset spokenRoles on slot change (SpeakRadialSlot), focus /
+-- selection change (DispatchTooltip), and ResetTooltipState.
+local radialHandlerState     = {
+    spokenRoles        = {},
+    lastSpokenFullText = nil,
+}
 
--- Forward declarations: panel handler state needed by DispatchTooltip.
--- These are set by HandlePanelWidgetAdded / RoutePanelSnapshot (defined later).
-local activePanelHandler     = nil
-local lastFocusedDCType      = nil
+-- Forward declaration: the WorldUI dispatcher (Client/Dispatcher.lua
+-- instance) is created later in this file once the handler registration
+-- list is in place.  Closures earlier in the file (DispatchTooltip etc.)
+-- capture this upvalue and query the dispatcher at call time, so the
+-- nil-then-assigned pattern works without a separate mirror variable.
+local worldUIDispatcher = nil
+-- DC type of the most recently focused element.  Set by RoutePanelSnapshot
+-- on every focus change; consumed by DispatchTooltip to give handlers
+-- context for tooltip role mapping.
+local lastFocusedDCType = nil
 
 --- SetTooltipSuppressed: called by handlers that speak their own
 --- descriptions (radial, future settings menu, etc.).
@@ -111,6 +124,13 @@ local radialHintSpoken = false
 -- Tracks whether the radial is currently open (to distinguish fresh
 -- opens from LB/RB page switches within the radial).
 local inRadial = false
+-- Last gathered radial slot data, kept so the radial detail handler
+-- (RS Left) can rebuild a property list for the currently-focused
+-- slot.  Set by HandleRadialSlot, cleared by ClearRadialFocus and
+-- ResetTooltipState.  Independent of lastRawTooltipTexts: slot
+-- identity (title, slotType, tagProps, API description) lives here;
+-- mid-tooltip-load progressive details live in lastRawTooltipTexts.
+local lastRadialSlotData = nil
 
 -- ============================================================================
 -- Tag parsing
@@ -139,6 +159,96 @@ local function IsValidText(text)
     if text:match("^h%x+g") then return false end
     if text:find("s_HandleUnknown") then return false end
     return true
+end
+
+-- ============================================================================
+-- Radial noise property categorization
+-- ============================================================================
+-- PropertyText is a single XAML TextBlock that Larian reuses for many
+-- semantic types (range, save, attack, cost, frequency, weapon-class).
+-- Coming through FromTooltip it carries the generic label "Property"
+-- (or "txt" / "Name" / "VariationWarnings" / "EmpoweredMetamagicText"
+-- for spell variants).  Stripping the label was ambiguous ("Melee.
+-- DEX Save. Short Rest" had no context); categorizing the VALUE into
+-- a canonical label produces coherent speech ("Range: Melee. Saving
+-- throw: Dexterity. Recharge: Short Rest").  Unrecognized values from
+-- these noisy roles get dropped (the user has Inspect / detail view
+-- for full readback).
+--
+-- Shared between the radial fallback speech path (DispatchTooltip)
+-- and the radial detail view (BuildRadialDetailList).  Kept identical
+-- so detail-view labels match what the user heard during navigation.
+
+local RADIAL_NOISE_LABELS = {
+    Property               = true,
+    txt                    = true,
+    Name                   = true,
+    VariationWarnings      = true,
+    EmpoweredMetamagicText = true,
+}
+
+--- CategorizeRadialNoiseValue: map a noise property value to a
+--- canonical {label, value} pair, or return nils to indicate the
+--- value is unrecognized noise that should be dropped.
+--- @param value string  Raw property value from FromTooltip.
+--- @return string|nil, string|nil  Canonical label, transformed value.
+local function CategorizeRadialNoiseValue(value)
+    if value == "Melee"
+        or value:match("^[%d%.]+%s?m$")
+        or value:match("^[%d%.]+%s?ft$")
+        or value:match("^[%d%.]+%s?feet$") then
+        return "Range", value
+    elseif value:match("^(%u+)%s+Save$") then
+        -- "DEX Save" -> "Saving throw: Dexterity".  Canonical D&D
+        -- label, full ability name (no abbreviation -- screen
+        -- readers may pronounce "DEX" as a word or as letters;
+        -- "Dexterity" is unambiguous).
+        local abbrev = value:match("^(%u+)%s+Save$")
+        local fullAbility =
+            Helpers.ExpandAbilityAbbreviation(abbrev) or abbrev
+        return "Saving throw", fullAbility
+    elseif value == "Attack Roll" or value == "Saving Throw" then
+        return "Attack type", value
+    elseif value == "Short Rest" or value == "Long Rest" then
+        return "Recharge", value
+    elseif value == "Per turn" then
+        return "Frequency", "Once per turn"
+    elseif value == "Action"
+        or value == "Bonus Action"
+        or value == "Reaction" then
+        return "Cost", value
+    elseif value:lower() == "concentration" then
+        return "Concentration", "Yes"
+    end
+    return nil, nil
+end
+
+--- RecategorizeRadialNoiseProperties: mutate speechData.properties to
+--- relabel XAML-role-named entries (Property, txt, Name, etc.) into
+--- canonical labels (Range, Saving throw, Attack type, Recharge,
+--- Frequency, Cost, Concentration) based on value pattern.
+--- Unrecognized values from noise roles are dropped entirely.
+--- Non-noise properties pass through untouched.
+--- @param speechData table  SpeechData with .properties array.
+local function RecategorizeRadialNoiseProperties(speechData)
+    local recategorizedProps = {}
+    for _, prop in ipairs(speechData.properties) do
+        if RADIAL_NOISE_LABELS[prop.label] then
+            local newLabel, newValue =
+                CategorizeRadialNoiseValue(prop.value)
+            if newLabel then
+                recategorizedProps[#recategorizedProps + 1] = {
+                    label = newLabel,
+                    value = newValue,
+                    tier  = prop.tier,
+                }
+            end
+            -- else: unrecognized noise -> drop entirely.
+        else
+            recategorizedProps[#recategorizedProps + 1] = prop
+        end
+    end
+    speechData.properties = recategorizedProps
 end
 
 -- ============================================================================
@@ -321,7 +431,7 @@ end
 -- Speech output (decides what and how to speak from gathered data)
 -- ============================================================================
 
---- SpeakRadialSlot: speak the slot title and API description.
+--- SpeakRadialSlot: speak the slot title and description.
 --- Combat stats (dice, range, cost) come from the C++ tooltip scanner
 --- which reads them from the popup TextBlocks -- no Lua API duplication.
 --- Builds SpeechData so the tooltip handler can diff against it.
@@ -335,15 +445,23 @@ local function SpeakRadialSlot(slotData)
 
     -- Track title for inspect panel filtering (separate pipeline).
     lastSpokenRadialTitle = cleanTitle
-    tooltipState.lastTooltipSpeech = nil
 
-    -- API-sourced description (spell/passive flavor text not shown in tooltip).
+    -- Description: speak when slotData carries one.  The earlier
+    -- design skipped it under the assumption "the tooltip popup
+    -- carries it, so adding it here would duplicate."  That holds
+    -- ONLY for the action radial (RB / VMHotBar) where Larian shows
+    -- a separate Tooltip popup with the spell/item description.
+    -- The shortcuts menu (RT) renders its description inline in the
+    -- radial widget itself -- there's no follow-up tooltip popup --
+    -- so without this, shortcut descriptions never speak.  Speak
+    -- the description; on the action radial, spokenRoles dedup
+    -- (seeded by this :Speak) blocks the tooltip wave from re-
+    -- speaking the same description text.
     if slotData.description and slotData.description ~= "" then
-        local cleanedDescription = Helpers.StripMarkupTags(slotData.description)
-        if cleanedDescription:sub(-1) == "." then
-            cleanedDescription = cleanedDescription:sub(1, -2)
+        local cleanDesc = Helpers.StripMarkupTags(slotData.description)
+        if cleanDesc and cleanDesc ~= "" then
+            speechData:Add("description", cleanDesc, "normal")
         end
-        speechData:Add("description", cleanedDescription, "normal")
     end
 
     -- HotBar item extras from tag props (gold value, stack count).
@@ -365,17 +483,15 @@ local function SpeakRadialSlot(slotData)
         end
     end
 
-    -- Store for tooltip diff (radial isn't a panel handler, so
-    -- DispatchTooltip checks this as radial fallback).
-    lastRadialSpeechData = speechData
-
-    local fullText = speechData:Format()
-    if not fullText then return end
-
-    -- No Lua-side dedup for radial events.  C++ handles dedup via
-    -- pointer address comparison and resets on center rest.
-    Log.Info("RADIAL [" .. slotData.slotType .. "]: " .. fullText)
-    Ext.Tolk.Speak(fullText, true)
+    -- New slot: reset the cross-off set so the upcoming tooltip
+    -- waves on this slot start fresh.  Speak then accumulates
+    -- this slot's fields onto the empty set (same mechanism panel
+    -- handlers use via RecordSpokenRoles + Speak).  No-op when
+    -- Format produces empty content.  Log tag preserves the
+    -- existing "RADIAL [<slotType>]" prefix for debugging.
+    radialHandlerState.spokenRoles = {}
+    speechData:Speak(radialHandlerState, true, nil, true,
+        "RADIAL [" .. slotData.slotType .. "]")
 end
 
 -- ============================================================================
@@ -407,8 +523,19 @@ end
 
 --- ClearRadialFocus: called by the Manager when focus moves to a
 --- non-radial element, indicating the radial has been closed.
+--- Also re-arms the hint so the next open re-announces it -- same
+--- pattern as panel hints (tabHintSpoken reset on handler
+--- deactivation via ResetHint).  Without resetting here, the hint
+--- only fires on the FIRST open of a play session and any
+--- subsequent reopens (e.g. after closing/reopening from the
+--- shortcuts menu) speak just the title with no controls
+--- reminder.
 local function ClearRadialFocus()
     inRadial = false
+    radialHintSpoken = false
+    -- Drop the cached slot data so the radial detail handler stops
+    -- claiming a focused slot once the radial has closed.
+    lastRadialSlotData = nil
 end
 
 
@@ -417,12 +544,155 @@ end
 -- ============================================================================
 
 --- HandleRadialSlot: gather data then speak.
+--- Caches the gathered slotData so the radial detail handler (RS Left)
+--- can rebuild a property list for the focused slot without re-reading
+--- the snapshot.
 --- @param snapshot table  The full TickSnapshot from C++.
 local function HandleRadialSlot(snapshot)
     local slotData = GatherRadialSlotData(snapshot)
     if slotData then
+        lastRadialSlotData = slotData
         SpeakRadialSlot(slotData)
     end
+end
+
+-- ============================================================================
+-- Radial detail view (RS Left): D-pad-navigated property list
+-- ============================================================================
+-- The radial slot tooltip popup is read in full by Inspect (RS press),
+-- but Inspect's vertical card-stack navigation is hijacked by the LS
+-- direction the user is holding to keep the radial slot focused.  For
+-- bottom-half radial positions (4 to 8 o'clock) the LS is held DOWN,
+-- which navigates Inspect downward through the explanation cards
+-- before they finish reading.  Detail view sidesteps this entirely:
+-- d-pad navigation is independent of LS direction, so the user can
+-- step through individual properties (Damage, Range, Saving throw,
+-- etc.) at their own pace regardless of which radial position they
+-- have focused.
+--
+-- Source of truth:
+--   - Identity (Name) and API description come from cached slotData
+--     (set by HandleRadialSlot).
+--   - Combat facts (Damage, Damage type, Dice, Range, Saving throw,
+--     Attack type, Recharge, Frequency, Cost, Concentration,
+--     Duration, Properties) come from lastRawTooltipTexts via
+--     SpeechData.FromTooltip + RecategorizeRadialNoiseProperties --
+--     the SAME pipeline the radial fallback speech uses, so the
+--     labels the user heard during navigation match the labels in
+--     the detail view.
+--   - Economy (Value, Count) for HotBar slots come from tagProps.
+
+--- BuildRadialDetailList: build a {label, value} property list for
+--- the currently-focused radial slot.
+--- @param focusedData table  Cached slotData (title, description,
+---     slotType, tagProps).
+--- @param tooltipTexts table|nil  Cached raw tooltip texts.
+--- @return table|nil  Array of {label, value}, or nil if empty.
+local function BuildRadialDetailList(focusedData, tooltipTexts)
+    if not focusedData then return nil end
+
+    local detailList = {}
+    local seenLabels = {}
+    local function addField(label, val)
+        if val and val ~= "" and not seenLabels[label] then
+            seenLabels[label] = true
+            detailList[#detailList + 1] =
+                {label = label, value = val}
+        end
+    end
+
+    -- Identity from slotData.
+    local cleanTitle = Helpers.StripMarkupTags(focusedData.title)
+    addField("Name", cleanTitle)
+
+    -- Description: prefer the API-resolved one cached on slotData
+    -- (HotBar route uses Stats DB; ShortcutsMenu uses C++ TextBlock).
+    -- The tooltip's description core field can fill in if slotData
+    -- has no description (rare, but possible for actions whose Stats
+    -- entry lacks a Description attribute).
+    if IsValidText(focusedData.description) then
+        addField("Description", focusedData.description)
+    end
+
+    -- HotBar economy / stack info from tagProps.  ShortcutsMenu
+    -- entries don't carry tagProps, so this block silently no-ops.
+    if focusedData.slotType == "HotBar" and focusedData.tagProps then
+        local goldValue = focusedData.tagProps["Gold"]
+        if goldValue and goldValue ~= "" and goldValue ~= "0" then
+            addField("Value", goldValue .. " gold")
+        end
+        local stackCount = focusedData.tagProps["Count"]
+        if stackCount and stackCount ~= "" and stackCount ~= "0"
+            and stackCount ~= "1" then
+            addField("Count", stackCount .. " available")
+        end
+    end
+
+    -- Tooltip-sourced facts.  Apply the same noise categorization
+    -- as the speech path so labels stay consistent.
+    if tooltipTexts and #tooltipTexts > 0 then
+        local speechData = SpeechData.FromTooltip(tooltipTexts)
+        RecategorizeRadialNoiseProperties(speechData)
+
+        -- Pull selected core fields.  Skip name/title (already
+        -- added).  Skip count/value (handled from tagProps above
+        -- to avoid label collisions).
+        local CORE_FIELD_LABELS = {
+            description           = "Description",
+            technicalDescription  = "Technical description",
+            additionalDescription = "Additional description",
+            status                = "Status",
+            state                 = "State",
+        }
+        for fieldName, label in pairs(CORE_FIELD_LABELS) do
+            local entry = speechData.coreFields[fieldName]
+            if entry and entry.text then
+                addField(label, entry.text)
+            end
+        end
+
+        -- Properties (Damage, Damage type, Dice, Range, Saving
+        -- throw, Attack type, Recharge, Frequency, Cost,
+        -- Concentration, Duration, Category, Properties, etc.).
+        for _, prop in ipairs(speechData.properties) do
+            addField(prop.label, prop.value)
+        end
+    end
+
+    return #detailList > 0 and detailList or nil
+end
+
+--- The radial detail handler.  Same shape as panel/CC handlers:
+--- name, BuildDetailList, GetLastFocusedData.  Used by EventRouter's
+--- FindActiveDetailHandler when the radial is open.  Detail view
+--- title stays "Detail view" (no viewLabel override).
+local radialDetailHandler = {
+    name = "Radial",
+    BuildDetailList = function(focusedData, tooltipTexts)
+        return BuildRadialDetailList(focusedData, tooltipTexts)
+    end,
+    GetLastFocusedData = function()
+        if not inRadial or not lastRadialSlotData then return nil end
+        return lastRadialSlotData
+    end,
+}
+
+--- IsRadialOpen: returns true if the radial menu is currently open
+--- (between HandleRadialOpen and ClearRadialFocus).  Exposed for
+--- EventRouter's FindActiveDetailHandler to gate the radial detail
+--- handler check.
+local function IsRadialOpen()
+    return inRadial
+end
+
+--- GetRadialDetailHandler: returns the radial detail handler, but
+--- only when the radial is actually open AND a slot has been focused
+--- (so GetLastFocusedData would return non-nil).  Returning nil
+--- otherwise lets EventRouter fall through to the panel/menu handler
+--- check or to the GPS toggle path.
+local function GetRadialDetailHandler()
+    if not inRadial or not lastRadialSlotData then return nil end
+    return radialDetailHandler
 end
 
 -- ============================================================================
@@ -437,14 +707,25 @@ end
 ---     (nil on focus-only ticks with no tooltip data).
 --- @param snapshot table  The full TickSnapshot (for change flags).
 local function DispatchTooltip(structuredTooltipData, snapshot)
-    -- Reset dedup on navigation (even when suppressed, so re-entering
-    -- a suppressed element doesn't carry stale state).
+    -- Reset panel handlers' string dedup on navigation (even when
+    -- suppressed, so re-entering a suppressed element doesn't carry
+    -- stale state).
+    --
+    -- DO NOT reset radialHandlerState.spokenRoles here.  The reset
+    -- point for the radial cross-off is radialSlotChanged
+    -- (SpeakRadialSlot owns that), NOT focusChanged or
+    -- selectionChanged -- those flags can fire on tooltip-arrival
+    -- ticks for reasons unrelated to the slot changing (each
+    -- progressive-load wave can carry focusChanged in BG3's
+    -- snapshot model).  Resetting here wipes the slot's
+    -- accumulated spokenRoles mid-wave, defeating cross-off.
+    local activeHandler = worldUIDispatcher
+        and worldUIDispatcher:GetActiveHandler() or nil
+
     if snapshot.focusChanged or snapshot.selectionChanged then
-        if activePanelHandler and activePanelHandler.ResetTooltipDedup then
-            activePanelHandler.ResetTooltipDedup()
+        if activeHandler and activeHandler.ResetTooltipDedup then
+            activeHandler.ResetTooltipDedup()
         end
-        -- Also clear radial fallback dedup.
-        tooltipState.lastTooltipSpeech = nil
     end
 
     -- Tooltip-close signal: tooltipChanged is true but no texts arrived.
@@ -453,8 +734,8 @@ local function DispatchTooltip(structuredTooltipData, snapshot)
     -- the tooltip's contents.  Runs even when the module is suppressed
     -- so state can't linger past a suppression boundary.
     if snapshot.tooltipChanged and not structuredTooltipData then
-        if activePanelHandler and activePanelHandler.ClearCompareData then
-            activePanelHandler.ClearCompareData()
+        if activeHandler and activeHandler.ClearCompareData then
+            activeHandler.ClearCompareData()
         end
         CloseCompareView(true)
         lastRawTooltipTexts = nil
@@ -467,26 +748,60 @@ local function DispatchTooltip(structuredTooltipData, snapshot)
     lastRawTooltipTexts = structuredTooltipData
 
     -- Dispatch to active panel handler.
-    if activePanelHandler and activePanelHandler.HandleTooltip then
-        activePanelHandler.HandleTooltip(
+    if activeHandler and activeHandler.HandleTooltip then
+        activeHandler.HandleTooltip(
             structuredTooltipData, structuredTooltipData, lastFocusedDCType)
         return
     end
 
-    -- Radial fallback: no panel handler active, build simple SpeechData
-    -- from roles and speak directly.  Use "brief" verbosity for radial
-    -- context (damage/cost only, matching old minimal behavior).
-    local fallbackSpeech = SpeechData.FromTooltip(structuredTooltipData)
-    if lastRadialSpeechData then
-        fallbackSpeech = fallbackSpeech:Diff(lastRadialSpeechData)
-    end
-    local tooltipSpeech = fallbackSpeech:Format("brief")
-    if tooltipSpeech and tooltipSpeech ~= ""
-        and tooltipSpeech ~= tooltipState.lastTooltipSpeech then
-        tooltipState.lastTooltipSpeech = tooltipSpeech
-        Log.Info("TOOLTIP (radial fallback): " .. tooltipSpeech)
-        Ext.Tolk.Speak(tooltipSpeech, false)
-    end
+    -- Radial fallback: no panel handler active.  Same dedup
+    -- mechanism panel handlers use -- spokenRoles cross-off:
+    -- FromTooltip skips any role whose key (<fieldName> or
+    -- "property:<label>") is in radialHandlerState.spokenRoles.
+    -- The set is seeded by SpeakRadialSlot via :Speak, then grown
+    -- by each tooltip wave's :Speak.  Result: every field speaks
+    -- at most once across the slot speech + every progressive-
+    -- load tooltip wave on the same slot.
+    --
+    -- After cross-off, apply a radial-specific tier policy via
+    -- RetierProperties:
+    --   Brief   -> nothing (slot path already spoke the name).
+    --   Normal  -> + damage range only (Damage / Amount labels).
+    --   Verbose -> + everything else (dice, type, range, properties,
+    --              cost, frequency, etc.).
+    -- The universal TOOLTIP_ROLE_MAP tiers are calibrated for full
+    -- panel tooltip surfaces where "normal" reasonably includes
+    -- Damage type / Range / Property entries.  In the radial, the
+    -- user has Inspect (RS) for full-detail readback on demand, so
+    -- the hover speech stays terse.  Universal map stays intact
+    -- for panel use.
+    local fallbackSpeech = SpeechData.FromTooltip(
+        structuredTooltipData, radialHandlerState.spokenRoles)
+    fallbackSpeech:RetierProperties(function(prop)
+        if prop.label == "Damage" or prop.label == "Amount" then
+            return "normal"
+        end
+        return "verbose"
+    end)
+    -- Pre-record cross-off keys with the ORIGINAL labels BEFORE
+    -- categorization mutates them.  Speak's auto-accumulate after
+    -- categorization will record under the NEW labels (e.g.
+    -- "property:Range:melee"), but the next wave's FromTooltip
+    -- looks up with the ORIGINAL XAML role labels ("property:
+    -- Property:melee").  Pre-recording with the original labels
+    -- ensures wave-to-wave cross-off still works.
+    fallbackSpeech:PopulateSpokenRoles(radialHandlerState.spokenRoles)
+
+    -- Categorize / drop XAML-role-named properties for rendering.
+    -- Shared with BuildRadialDetailList so detail-view labels match
+    -- what the user heard during slot navigation.
+    RecategorizeRadialNoiseProperties(fallbackSpeech)
+    -- Speak handles format / log / Tolk / spokenRoles populate.
+    -- isScreenEntry=false, userInitiated=false -> queue (don't
+    -- interrupt the slot speech that just fired).  Log tag
+    -- preserves "TOOLTIP (radial fallback)" for debugging.
+    fallbackSpeech:Speak(radialHandlerState, false, nil, false,
+        "TOOLTIP (radial fallback)")
 end
 
 --- HandleInspectNav: called by EventRouter when d-pad moves focus between
@@ -606,11 +921,14 @@ end
 
 --- ResetTooltipState: clear all tooltip state (called on GameStateChanged).
 local function ResetTooltipState()
-    tooltipState.lastTooltipSpeech = nil
     tooltipSuppressed = false
     lastSpokenRadialTitle = nil
     lastRawTooltipTexts = nil
-    lastRadialSpeechData = nil
+    radialHandlerState.spokenRoles = {}
+    radialHandlerState.lastSpokenFullText = nil
+    -- Drop the cached radial slot too so a stale slot can't survive
+    -- a state transition (game-state change closes the radial).
+    lastRadialSlotData = nil
 end
 
 -- ============================================================================
@@ -652,18 +970,25 @@ local function CreatePanelHandler(config)
     local handlerState = {
         lastSpokenName       = nil,
         lastSpokenFullText   = nil,
-        lastSpokenTab        = nil,
+        currentTabContext        = nil,
         lastSpokenTitle      = nil,
-        lastSpeechData       = nil,   -- SpeechData from last handler speech
+        previousSpeechData       = nil,   -- SpeechData from last handler speech
         lastFocusedData      = nil,   -- last focusedElement data table (for detail view)
-        lastTooltipSpeech    = nil,   -- tooltip dedup (inline comparison)
-        spokenRoles          = {},    -- set of field names spoken (for tooltip cross-off)
+        hasSpokenTooltip     = false, -- "did a tooltip already speak on this focus" -- drives state-change interrupt
+        spokenRoles          = {},    -- map of field key -> spoken value (for value-aware tooltip cross-off)
         spokenValues         = {},    -- set of spoken values (for carousel dedup)
         tabHintSpoken        = false,
         screenEntryJustSpoke = false,
-        -- Optional: set by onWidgetAdded hooks for overrides.
-        titleOverride        = nil,
-        bodyOverride         = nil,
+        -- Screen-entry override SpeechData.  Handlers populate any
+        -- core field on this (title / sectionLabel / description /
+        -- status / count / etc.) from onWidgetAdded; the factory's
+        -- screen-entry pipeline reads the overrides and uses them
+        -- in place of (or in addition to) extracted values.  One
+        -- mechanism replaces the older per-field titleOverride /
+        -- sectionLabelOverride / bodyOverride pattern -- adding a
+        -- new override slot is now zero factory changes, just
+        -- :Add() the new field name from the handler.
+        screenEntryOverrides = SpeechData.Create(),
         -- Set by HandleWidgetAdded for the current tick.  HandleSnapshot
         -- consumes (and clears) this on the same tick so widget-derived
         -- title/body/namedTexts come from THIS handler's event, not a
@@ -674,20 +999,32 @@ local function CreatePanelHandler(config)
     -- -----------------------------------------------------------------
     -- RecordSpokenRoles: populate spokenRoles and spokenValues from
     -- a SpeechData's fields so tooltip cross-off and carousel dedup
-    -- can reference what was already spoken.
+    -- can reference what was already spoken.  Stores the actual
+    -- field/property values into spokenRoles (value-aware cross-off
+    -- per ShouldSkipSpoken in SpeechData.lua) so subsequent tooltip
+    -- waves with matching role+value get skipped while state-change
+    -- waves (same role, different value) emit.
+    -- Also resets hasSpokenTooltip so the next tooltip on this focus
+    -- queues (not interrupts).
     -- -----------------------------------------------------------------
     local function RecordSpokenRoles(speechData)
         handlerState.spokenRoles = {}
         handlerState.spokenValues = {}
+        handlerState.hasSpokenTooltip = false
         for fieldName, fieldValue in pairs(speechData.coreFields) do
-            handlerState.spokenRoles[fieldName] = true
+            handlerState.spokenRoles[fieldName] = fieldValue
             if fieldValue and fieldValue ~= "" then
                 handlerState.spokenValues[
                     Helpers.NormalizeForCompare(fieldValue)] = true
             end
         end
         for _, prop in ipairs(speechData.properties) do
-            handlerState.spokenRoles["property:" .. prop.label] = true
+            -- Property key encodes value so multi-instance labels
+            -- (e.g. PropertyText emitting "Property: Melee" and
+            -- "Property: Light") each get their own slot.  Stored
+            -- value `true` = presence-only skip in ShouldSkipSpoken.
+            handlerState.spokenRoles[
+                "property:" .. prop.label .. ":" .. prop.value] = true
             if prop.value and prop.value ~= "" then
                 handlerState.spokenValues[
                     Helpers.NormalizeForCompare(prop.value)] = true
@@ -753,7 +1090,7 @@ local function CreatePanelHandler(config)
             and focusedElement.isTab
         if snapshot.selectionChanged then
             isScreenEntry = true
-        elseif widgetEvent and not handlerState.lastSpokenTab then
+        elseif widgetEvent and not handlerState.currentTabContext then
             isScreenEntry = true
         elseif snapshot.focusChanged and focusedElement.isTab
             and not tabIsItem then
@@ -791,14 +1128,20 @@ local function CreatePanelHandler(config)
         -- Standalone carousel or value.
         -- =============================================================
         if isCarouselOnly then
-            local carouselValue = snapshot.inlineCarouselValue
-            if carouselValue ~= handlerState.lastSpokenFullText
-                and not handlerState.spokenValues[
-                    Helpers.NormalizeForCompare(carouselValue)] then
-                local carouselSpeech = SpeechData.Create()
-                carouselSpeech:Add("value", carouselValue, "brief")
-                carouselSpeech:Speak(handlerState, false, nil, userInitiated)
+            -- Role-based dedup.  See Menus.lua isCarouselOnly path
+            -- for full rationale.  Selector panels (inventory grids,
+            -- equipment slots, etc.) fire both a focus snapshot AND
+            -- a carousel snapshot per press; the focus path's "name"
+            -- role IS what the carousel value would re-speak.  Same
+            -- role, same item, suppressed.
+            if handlerState.spokenRoles
+                and handlerState.spokenRoles["name"] then
+                return
             end
+            local carouselValue = snapshot.inlineCarouselValue
+            local carouselSpeech = SpeechData.Create()
+            carouselSpeech:Add("name", carouselValue, "brief")
+            carouselSpeech:Speak(handlerState, false, nil, userInitiated)
             return
         end
 
@@ -808,22 +1151,21 @@ local function CreatePanelHandler(config)
             if config.customItemFn then
                 local customName = config.customItemFn(
                     focusedElement, handlerState, snapshot)
-                -- SpeechData object: compute delta against previous
-                -- SpeechData and speak only what changed.
+                -- SpeechData object: speak only what changed vs the
+                -- prior speech.  SpeakDelta handles formatting the
+                -- delta, recording the FULL state into spokenRoles +
+                -- lastSpokenFullText (so the next delta computes
+                -- against the right baseline and tooltip cross-off
+                -- knows the full set of currently-spoken roles), and
+                -- emitting via Tolk with the right interrupt logic.
                 if type(customName) == "table" and customName.coreFields then
-                    local delta = customName:Delta(
-                        handlerState.lastSpeechData)
-                    local deltaFormatted = delta:Format()
-                    -- Always update lastSpeechData so subsequent
-                    -- deltas compare against the most recent state,
-                    -- even when the current tick was silent.
-                    handlerState.lastSpeechData = customName
-                    handlerState.lastSpokenFullText = customName:Format()
-                    if deltaFormatted and deltaFormatted ~= "" then
-                        Log.Info("VALUE [" .. config.name .. "]: "
-                            .. deltaFormatted)
-                        Ext.Tolk.Speak(deltaFormatted, true)
-                    end
+                    local previousSpeechData =
+                        handlerState.previousSpeechData
+                    handlerState.previousSpeechData = customName
+                    customName:SpeakDelta(handlerState,
+                        previousSpeechData,
+                        false, nil, true,
+                        "VALUE [" .. config.name .. "]")
                     return
                 end
                 -- Non-empty string: wrap in SpeechData and speak.
@@ -866,7 +1208,7 @@ local function CreatePanelHandler(config)
             normalTab = tabName and Helpers.NormalizeForCompare(tabName) or ""
 
             -- Dedup: skip if same tab.
-            if tabName and tabName == handlerState.lastSpokenTab then
+            if tabName and tabName == handlerState.currentTabContext then
                 Log.Debug("SKIP screen entry (same tab) ["
                     .. config.name .. "]: " .. tabName)
                 return
@@ -879,7 +1221,7 @@ local function CreatePanelHandler(config)
 
             -- Always update, even when nil, so widgetAdded doesn't
             -- re-trigger.  Empty string = "screen entry processed".
-            handlerState.lastSpokenTab = tabName or ""
+            handlerState.currentTabContext = tabName or ""
             handlerState.lastSpokenName = nil
 
             -- Gather data sources.
@@ -901,12 +1243,20 @@ local function CreatePanelHandler(config)
             local widgetTitle, widgetBody, widgetActions =
                 Helpers.ExtractFromWidgetData(widgetEvent)
 
-            -- Title.  Handler titleOverride takes priority (e.g., Container
-            -- handler sets the container name, which is more specific than
-            -- a generic tab name like "Inventory" from namedTexts).
-            if handlerState.titleOverride then
-                screenTitle = handlerState.titleOverride
-                handlerState.titleOverride = nil
+            -- Read all screen-entry overrides up front.  Handlers
+            -- populate these via handlerState.screenEntryOverrides
+            -- (a SpeechData) from onWidgetAdded.  One mechanism
+            -- replaces the older per-field titleOverride /
+            -- sectionLabelOverride / bodyOverride pattern.
+            local overrides = handlerState.screenEntryOverrides
+            local overrideCoreFields = (overrides and overrides.coreFields)
+                or {}
+
+            -- Title.  Handler override takes priority (e.g., Container
+            -- handler sets the container name, which is more specific
+            -- than a generic tab name like "Inventory" from namedTexts).
+            if overrideCoreFields["title"] then
+                screenTitle = overrideCoreFields["title"]
             else
                 screenTitle = nsTitle or widgetTitle
             end
@@ -940,8 +1290,16 @@ local function CreatePanelHandler(config)
                 end
             end
 
-            -- Tab name (suppress if title contains it or unresolved handle).
-            if tabName then
+            -- Section label (slot 2: subtitle / state info under
+            -- title).  Handler override takes priority so panels can
+            -- inject subtitle-position state (e.g., TadpolePowers
+            -- showing tadpole count).  Fall back to extracted tabName
+            -- for tab-based menus, suppressing when the title already
+            -- contains it or it's an unresolved loca handle.
+            if overrideCoreFields["sectionLabel"] then
+                speechData:Add("sectionLabel",
+                    overrideCoreFields["sectionLabel"], "brief")
+            elseif tabName then
                 local showTabName = true
                 if tabName:match("^h%x+g") then
                     showTabName = false
@@ -956,16 +1314,15 @@ local function CreatePanelHandler(config)
                 end
             end
 
-            -- Body.
+            -- Body.  Override takes priority over extracted text
+            -- (handler explicitly setting description means it's the
+            -- authoritative body for this panel).
             local bodyAssembled = nil
-            if nsBodyParts and #nsBodyParts > 0 then
+            if overrideCoreFields["description"] then
+                bodyAssembled = overrideCoreFields["description"]
+            elseif nsBodyParts and #nsBodyParts > 0 then
                 bodyAssembled = table.concat(nsBodyParts, ". ")
-            end
-            if not bodyAssembled and handlerState.bodyOverride then
-                bodyAssembled = handlerState.bodyOverride
-                handlerState.bodyOverride = nil
-            end
-            if not bodyAssembled and widgetBody then
+            elseif widgetBody then
                 bodyAssembled = widgetBody
             end
             local statusText = Helpers.ExtractStatusText(
@@ -980,12 +1337,37 @@ local function CreatePanelHandler(config)
             if widgetActions then
                 speechData:Add("instructionHint", widgetActions, "normal")
             end
+
+            -- Apply any OTHER override core fields beyond title /
+            -- sectionLabel / description (e.g., status, count,
+            -- additionalDescription, instructionHint).  This is the
+            -- "free" extensibility -- handlers can add any of the 15
+            -- core fields via screenEntryOverrides without touching
+            -- the factory.  Properties on the override SpeechData
+            -- also get merged.
+            if overrides then
+                for fieldName, fieldValue in pairs(overrides.coreFields) do
+                    if fieldName ~= "title"
+                        and fieldName ~= "sectionLabel"
+                        and fieldName ~= "description" then
+                        speechData:Add(fieldName, fieldValue,
+                            overrides.tiers[fieldName])
+                    end
+                end
+                for _, prop in ipairs(overrides.properties) do
+                    speechData:AddProperty(
+                        prop.label, prop.value, prop.tier)
+                end
+                -- One-shot consume: replace with fresh empty
+                -- SpeechData so the next screen entry starts clean.
+                handlerState.screenEntryOverrides = SpeechData.Create()
+            end
         else
             -- Item navigation: dedup check.
             if elemId == handlerState.lastSpokenName
                 and not hasCarousel then
                 local text = Helpers.ExtractTextFromData(
-                    focusedElement, handlerState.lastSpokenTab, false)
+                    focusedElement, handlerState.currentTabContext, false)
                 if not text
                     or text == handlerState.lastSpokenFullText then
                     Log.Debug("DEDUP SKIP [" .. config.name .. "]: "
@@ -1053,12 +1435,12 @@ local function CreatePanelHandler(config)
                 for _, prop in ipairs(customSpeechData.properties) do
                     merged:AddProperty(prop.label, prop.value, prop.tier)
                 end
-                handlerState.lastSpeechData = merged
+                handlerState.previousSpeechData = merged
                 RecordSpokenRoles(merged)
                 merged:Speak(handlerState, isScreenEntry, nil,
                     userInitiated)
             else
-                handlerState.lastSpeechData = customSpeechData
+                handlerState.previousSpeechData = customSpeechData
                 RecordSpokenRoles(customSpeechData)
                 customSpeechData:Speak(handlerState, isScreenEntry, nil,
                     userInitiated)
@@ -1073,7 +1455,7 @@ local function CreatePanelHandler(config)
         end
         if not customHandled and (not splitName or splitName == "") then
             splitName = Helpers.ExtractTextFromData(
-                focusedElement, handlerState.lastSpokenTab, isScreenEntry)
+                focusedElement, handlerState.currentTabContext, isScreenEntry)
             splitValue = nil
             splitDesc = nil
             splitValueDesc = nil
@@ -1126,7 +1508,7 @@ local function CreatePanelHandler(config)
 
         -- Cache focused element data for detail view (RS Left).
         handlerState.lastFocusedData = focusedElement
-        handlerState.lastSpeechData = speechData
+        handlerState.previousSpeechData = speechData
         -- Record which fields we spoke (for tooltip cross-off).
         RecordSpokenRoles(speechData)
         speechData:Speak(handlerState, isScreenEntry, nil, userInitiated)
@@ -1152,14 +1534,13 @@ local function CreatePanelHandler(config)
     local function ResetState()
         handlerState.lastSpokenName = nil
         handlerState.lastSpokenFullText = nil
-        handlerState.lastSpokenTab = nil
+        handlerState.currentTabContext = nil
         handlerState.lastSpokenTitle = nil
-        handlerState.lastSpeechData = nil
+        handlerState.previousSpeechData = nil
         handlerState.lastFocusedData = nil
         handlerState.tabHintSpoken = false
         handlerState.screenEntryJustSpoke = false
-        handlerState.titleOverride = nil
-        handlerState.bodyOverride = nil
+        handlerState.screenEntryOverrides = SpeechData.Create()
         handlerState.pendingWidgetEvent = nil
         -- Compare stash lives across tooltip events; clear on handler
         -- teardown so re-entering the panel doesn't pick up state from
@@ -1175,13 +1556,12 @@ local function CreatePanelHandler(config)
     --- the same handler (e.g., switching tabs in inventory).
     --- Preserves tabHintSpoken so the hint doesn't re-speak.
     local function ResetNavigation()
-        handlerState.lastSpokenTab = nil
+        handlerState.currentTabContext = nil
         handlerState.lastSpokenTitle = nil
         handlerState.lastSpokenName = nil
-        handlerState.lastSpeechData = nil
+        handlerState.previousSpeechData = nil
         handlerState.screenEntryJustSpoke = false
-        handlerState.titleOverride = nil
-        handlerState.bodyOverride = nil
+        handlerState.screenEntryOverrides = SpeechData.Create()
     end
 
     --- ResetHint: reset tabHintSpoken so the hint speaks on next visit.
@@ -1199,7 +1579,7 @@ local function CreatePanelHandler(config)
         ResetHint         = ResetHint,
         customTooltipFn   = config.customTooltipFn,
         GetLastSpeechData = function()
-            return handlerState.lastSpeechData
+            return handlerState.previousSpeechData
         end,
         GetLastFocusedData = function()
             return handlerState.lastFocusedData
@@ -1289,36 +1669,48 @@ local function CreatePanelHandler(config)
                 end
             end
 
-            -- Format and speak with inline dedup.  No explicit
-            -- verbosity: Format() falls back to the module-global
-            -- currentVerbosity so RS-Down cycling affects tooltips
-            -- the same as every other speech path.
-            local tooltipSpeech = tooltipData:Format()
-            if not tooltipSpeech or tooltipSpeech == "" then return end
-            if tooltipSpeech == handlerState.lastTooltipSpeech then return end
-
             -- Interrupt vs queue decision:
             --   First tooltip after focus change -> queue, because
             --   the item handler already spoke the name and the
-            --   tooltip is supplemental (lastTooltipSpeech is nil
-            --   here because DispatchTooltip resets it on focus /
-            --   selection change).
+            --   tooltip is supplemental.
             --   Tooltip refreshed in-place while focus stayed put
             --   (e.g. user pressed A on a Reactions entry and the
             --   ReactionStatusText flipped) -> interrupt, because
             --   the new state is the only thing the user is waiting
             --   to hear and they want immediate confirmation.
-            local previousSpeech = handlerState.lastTooltipSpeech
-            local isStateChange = previousSpeech ~= nil
-                and previousSpeech ~= ""
-            handlerState.lastTooltipSpeech = tooltipSpeech
-            Log.Info("TOOLTIP" .. (isStateChange
-                and " (state change, interrupt)" or "")
-                .. ": " .. tooltipSpeech)
-            Ext.Tolk.Speak(tooltipSpeech, isStateChange)
+            -- The hasSpokenTooltip flag distinguishes the two cases:
+            -- false on the first tooltip after focus, true when a
+            -- prior tooltip already spoke on this focus.  Reset by
+            -- RecordSpokenRoles on item-nav / screen-entry, and by
+            -- ResetTooltipDedup at focus boundaries when no item
+            -- speech happened.  Pass isStateChange as userInitiated
+            -- so Speak's existing interrupt rule emits correctly.
+            --
+            -- Dedup of identical-content waves comes from value-
+            -- aware spokenRoles cross-off: Speak's auto-accumulate
+            -- records what was spoken, FromTooltip skips matching
+            -- role+value entries on subsequent waves.  No string
+            -- compare needed -- if all roles match, FromTooltip
+            -- returns empty, Format returns nil, Speak early-returns.
+            local isStateChange = handlerState.hasSpokenTooltip
+            local emitted = tooltipData:Speak(handlerState, false, nil,
+                isStateChange,
+                isStateChange and "TOOLTIP (state change, interrupt)"
+                              or "TOOLTIP")
+            -- Mark that a tooltip has spoken on this focus so the
+            -- next wave's interrupt decision sees state-change.
+            if emitted then
+                handlerState.hasSpokenTooltip = true
+            end
         end,
         ResetTooltipDedup = function()
-            handlerState.lastTooltipSpeech = nil
+            -- Called from DispatchTooltip on focusChanged /
+            -- selectionChanged so the first tooltip on the new
+            -- focus queues (not interrupts).  RecordSpokenRoles
+            -- also resets this; ResetTooltipDedup is the safety
+            -- net for focus changes that arrive without an
+            -- accompanying item speech.
+            handlerState.hasSpokenTooltip = false
         end,
         --- ClearCompareData: invalidate tooltip-derived compare stash.
         --- Called by DispatchTooltip on the tooltip-close signal so a
@@ -1714,7 +2106,7 @@ local ExamineHandler = CreatePanelHandler({
 
 -- Container inventory (opening a bag/pouch from the inventory).
 -- onWidgetAdded captures the container name from namedTexts and sets
--- titleOverride so screen entry speaks "Alchemy Pouch" instead of
+-- screenEntryOverrides so screen entry speaks "Alchemy Pouch" instead of
 -- a generic tab name like "Inventory".
 -- customItemFn suppresses item speech on screen entry: the container
 -- name IS the announcement; the focused item's description is redundant.
@@ -1727,7 +2119,8 @@ local ContainerHandler = CreatePanelHandler({
             if containerName and containerName ~= ""
                 and not containerName:match("^h%x+g")
                 and not containerName:find("%[ForceUpdate%]") then
-                handlerState.titleOverride = containerName
+                handlerState.screenEntryOverrides:Add(
+                    "title", containerName, "brief")
             end
         end
     end,
@@ -1844,75 +2237,31 @@ local ActiveRollHandler = CreatePanelHandler({
         if rollState == previousState then return end
 
         -- Entry: roll screen just appeared (WaitForStart or Introduction).
+        -- We do NOT speak from here.  Instead we stash the widget
+        -- dcProps so customItemFn can build a single combined
+        -- SpeechData (roll context + focused dice modifier) on the
+        -- next HandleSnapshot dispatch.  The factory's standard
+        -- screen-entry pipeline then makes ONE Speak call -- no race
+        -- with the focused-item path that previously caused the
+        -- entry hint to be interrupted.  Two Speaks were the bug.
         if rollState == "WaitForStart"
             or rollState == "IntroductionAnimation" then
-            -- Always mark hint as spoken so the generic screen entry
-            -- pipeline doesn't speak it separately.  We include it
-            -- in the entry speech below.
-            handlerState.tabHintSpoken = true
-
             -- Skip if DC isn't fully populated yet (first widget event
             -- often arrives before the game sets SkillOrAbility).  The
-            -- INPC-driven second event will have complete data.
+            -- INPC-driven second event will have complete data.  When
+            -- not ready, leave activeRollWidgetDcProps unset so
+            -- customItemFn returns empty SpeechData (suppress factory
+            -- speech) until the INPC retry delivers full data.
             local skillName = dcProps.SkillOrAbility
             if not skillName or skillName == ""
                 or skillName:match("^h%x+g") then
                 return
             end
-            local speechData = SpeechData.Create()
-
-            -- Dialogue line (for dialogue skill checks).
-            local dialogueLine = dcProps.SelectedDialogueLine
-            if dialogueLine and dialogueLine ~= ""
-                and not dialogueLine:match("^h%x+g")
-                and not dialogueLine:find("%[ForceUpdate%]") then
-                speechData:Add("description", dialogueLine, "normal")
-            end
-
-            -- Build title from roll info: skill, ability check, DC,
-            -- advantage.  Combined into a single "title" field so it
-            -- always speaks regardless of verbosity tier.
-            local titleParts = {}
-            if skillName and skillName ~= ""
-                and not skillName:match("^h%x+g") then
-                titleParts[#titleParts + 1] = skillName
-            end
-            local abilityText = dcProps.AbilityCheckText
-            if abilityText and abilityText ~= ""
-                and dcProps.IsPureAbilityRoll ~= "True"
-                and not abilityText:match("^h%x+g") then
-                titleParts[#titleParts + 1] = abilityText
-            end
-            local roll = dcProps.Roll
-            if roll and type(roll) == "table" then
-                local difficultyCheck = roll.DifficultyCheck
-                if difficultyCheck and difficultyCheck ~= "" then
-                    titleParts[#titleParts + 1] = "DC " .. difficultyCheck
-                end
-                local advantageType = roll.RollAdvantageType
-                if advantageType
-                    and advantageType ~= "None"
-                    and advantageType ~= "" then
-                    titleParts[#titleParts + 1] = advantageType
-                end
-            end
-            if #titleParts > 0 then
-                speechData:Add("title",
-                    table.concat(titleParts, ". "))
-            end
-
-            -- Navigation hint (globally toggleable via hintsEnabled).
-            speechData:Add("navigationHint",
-                "Y to roll. Left and right to browse bonuses.")
-
-            local formatted = speechData:Format()
-            if formatted and formatted ~= "" then
-                handlerState.lastRollState = rollState
-                Log.Info("ACTIVE ROLL entry: " .. formatted)
-                handlerState.lastSpokenFullText = formatted
-                handlerState.entrySpoken = true
-                speechData:Speak(handlerState, true)
-            end
+            -- Mark state consumed and stash widget data for
+            -- customItemFn.  entrySpoken is set by customItemFn when
+            -- it actually emits the combined entry speech.
+            handlerState.lastRollState = rollState
+            handlerState.activeRollWidgetDcProps = dcProps
 
             -- Pre-commit dice announcement (hearing the natural d20
             -- BEFORE reroll choice) is handled by dedicated branches
@@ -2057,13 +2406,36 @@ local ActiveRollHandler = CreatePanelHandler({
         handlerState.lastRollState = nil
         handlerState.entrySpoken = false
         handlerState.lastBonusElemId = nil
+        handlerState.activeRollWidgetDcProps = nil
+        handlerState.subPanelEntered = false
     end,
     customItemFn = function(focusedElement, handlerState, snapshot)
-        -- Suppress item speech until the entry announcement has spoken.
-        -- The game focuses Thieves' Tools before the INPC delivers
-        -- complete roll data, causing item speech to get interrupted.
-        -- Return empty SpeechData to suppress all generic speech too.
-        if not handlerState.entrySpoken then
+        -- Single-Speak architecture: the entry context (skill,
+        -- ability check, DC, advantage, dialogue line, nav hint) and
+        -- the focused dice modifier are merged into ONE SpeechData
+        -- and returned together on first focus after widget add.
+        -- The factory's screen-entry merge produces a single Speak
+        -- so the entry hint can never be interrupted by a follow-up
+        -- item-nav speak (the bug that previously needed a deferred-
+        -- queue band-aid).  Subsequent focuses skip the entry block.
+        --
+        -- Three states:
+        --   1. entrySpoken=true: just speak the focused item.
+        --   2. entrySpoken=false AND widget data not ready
+        --      (activeRollWidgetDcProps nil): return empty SpeechData
+        --      so the factory suppresses speech.  INPC retries.
+        --   3. entrySpoken=false AND data ready: build entry block,
+        --      append focused item, set entrySpoken=true.
+        local widgetDcProps = handlerState.activeRollWidgetDcProps
+        if not handlerState.entrySpoken and not widgetDcProps then
+            -- Reset currentTabContext so the next snapshot (when INPC
+            -- finally delivers SkillOrAbility) is detected as a fresh
+            -- screen entry by the factory.  Without this, the factory
+            -- would have set currentTabContext="" on this same tick and
+            -- the next dispatch would be classified as item-nav --
+            -- speech would APPEND instead of INTERRUPT, queuing
+            -- behind any in-progress audio.
+            handlerState.currentTabContext = nil
             return SpeechData.Create()
         end
 
@@ -2078,60 +2450,231 @@ local ActiveRollHandler = CreatePanelHandler({
 
         -- Dedup on elemId: skip only when the same element is focused
         -- consecutively.  Different elements always speak even when
-        -- their text is identical (e.g., two "+2" bonuses).
-        if elemId and elemId == handlerState.lastBonusElemId then
+        -- their text is identical (e.g., two "+2" bonuses).  Skip
+        -- dedup on the entry-speech tick -- that emission is the
+        -- screen-entry announcement, not a same-item repeat.
+        if handlerState.entrySpoken
+            and elemId
+            and elemId == handlerState.lastBonusElemId then
             return SpeechData.Create()
         end
         handlerState.lastBonusElemId = elemId
 
+        local combinedSpeech = SpeechData.Create()
+
+        -- ----- Entry block (one-shot on first focus after widget add) -----
+        if not handlerState.entrySpoken and widgetDcProps then
+            -- title: skill + ability check as ONE coherent phrase
+            -- (single space, not period -- "Sleight of Hand Dexterity
+            -- Check" reads as one thing, the kind of roll being made).
+            -- DC and advantage become labeled properties so a screen
+            -- reader announces them as discrete pieces of information
+            -- ("Difficulty: DC 20") rather than ambiguous title parts.
+            local titleParts = {}
+            local skillName = widgetDcProps.SkillOrAbility
+            if skillName and skillName ~= ""
+                and not skillName:match("^h%x+g") then
+                titleParts[#titleParts + 1] = skillName
+            end
+            local abilityText = widgetDcProps.AbilityCheckText
+            if abilityText and abilityText ~= ""
+                and widgetDcProps.IsPureAbilityRoll ~= "True"
+                and not abilityText:match("^h%x+g") then
+                titleParts[#titleParts + 1] = abilityText
+            end
+            if #titleParts > 0 then
+                combinedSpeech:Add("title",
+                    table.concat(titleParts, " "), "brief")
+            end
+
+            -- DC and advantage go in `sectionLabel` (slot 2 in
+            -- CORE_FIELD_LIST -- speaks immediately after `title`,
+            -- before `navigationHint` and `name`).  Matches the
+            -- on-screen layout: the "DIFFICULTY CLASS 20" panel
+            -- sits directly under the "Sleight of Hand / Dexterity
+            -- Check" header, ABOVE the bonus cards the player
+            -- navigates.  AddProperty wouldn't work -- properties
+            -- slot after `name`, which would put DC after the
+            -- focused bonus and read as if it described the bonus.
+            local roll = widgetDcProps.Roll
+            if roll and type(roll) == "table" then
+                local labelParts = {}
+                local difficultyCheck = roll.DifficultyCheck
+                if difficultyCheck and difficultyCheck ~= "" then
+                    labelParts[#labelParts + 1] =
+                        "DC " .. difficultyCheck
+                end
+                local advantageType = roll.RollAdvantageType
+                if advantageType and advantageType ~= "None"
+                    and advantageType ~= "" then
+                    labelParts[#labelParts + 1] = advantageType
+                end
+                if #labelParts > 0 then
+                    combinedSpeech:Add("sectionLabel",
+                        table.concat(labelParts, ". "), "brief")
+                end
+            end
+
+            -- Navigation hint.  Single canonical place.  X opens the
+            -- "Add Bonus" sub-panel where a nearby party member can
+            -- spend a resource (Guidance, Bardic Inspiration, Bless,
+            -- etc.) to contribute an extra bonus on top of the
+            -- always-on modifiers.
+            combinedSpeech:Add("navigationHint",
+                "Y to roll. X to add bonus. "
+                .. "Left and right to browse bonuses.")
+
+            -- Dialogue line (skill checks during dialogue).  Goes in
+            -- description -- spoken AFTER the focused item name in
+            -- CORE_FIELD_LIST order, which keeps the urgent context
+            -- (what's being rolled, what's focused) up front.
+            local dialogueLine = widgetDcProps.SelectedDialogueLine
+            if dialogueLine and dialogueLine ~= ""
+                and not dialogueLine:match("^h%x+g")
+                and not dialogueLine:find("%[ForceUpdate%]") then
+                combinedSpeech:Add("description", dialogueLine, "normal")
+            end
+
+            -- Mark consumed so the next item navigation skips this
+            -- block.  Suppress factory's own hint emission too.
+            handlerState.entrySpoken = true
+            handlerState.tabHintSpoken = true
+            handlerState.activeRollWidgetDcProps = nil
+            Log.Info("ACTIVE ROLL entry: "
+                .. table.concat(titleParts, ". "))
+        end
+
         local dcType = focusedElement.dcType or ""
 
-        -- VMBoost: modifier name + boost type + numeric value or dice.
-        -- BoostType distinguishes "ProficiencyBonus" vs "ExpertiseBonus"
-        -- (XAML uses DataTrigger on BoostType to render the label).
-        if dcType:find("VMBoost") then
-            local name = dcProps.Name or ""
-            local parts = {}
-            if name ~= "" then parts[#parts + 1] = name end
+        -- Sub-panel entry/exit tracking.  We snapshot the previous
+        -- value, then reset to false; the VMBoost branch sets it
+        -- back to true ONLY if the focus is a spell-derived boost
+        -- (i.e. inside the X "Add Bonus" sub-panel).  This handles
+        -- back-out via B (focus returns to main row -- could be
+        -- VMItem, non-spell VMBoost, or anything) AND repeat-entry
+        -- via X (re-announce next time) without needing a separate
+        -- exit branch in every catch-all.
+        local previousSubPanelEntered = handlerState.subPanelEntered
+        handlerState.subPanelEntered = false
 
-            -- Boost type label (Proficiency / Expertise).
+        -- VMBoost: a roll modifier card.  Two flavours:
+        --   1. Always-on bonuses (proficiency, expertise, ability
+        --      mod): dcProps.Name is set directly ("Sleight of Hand
+        --      Proficiency").  No offering character -- they're
+        --      inherent to the rolling character.
+        --   2. Spell-derived boosts from the X "Add Bonus" sub-panel
+        --      (Guidance, Bardic Inspiration, Bless, etc.):
+        --      dcProps.Name is empty.  The spell name lives in
+        --      BoostModifier.Name; the offering party member lives
+        --      in Owner.Name.  Speak "Spell +Xd Y from Character".
+        if dcType:find("VMBoost") then
+            local isSpellDerived = false
+
+            -- name (slot 4): the boost identifier as a single noun
+            -- phrase.  Always-on bonuses fuse skill + type qualifier
+            -- ("Sleight of Hand" + "Proficiency" -> "Sleight of Hand
+            -- Proficiency"), matching how the sighted card renders
+            -- them as one inseparable label.  Spell-derived boosts
+            -- use BoostModifier.Name alone ("Guidance"); their
+            -- BoostType is empty/Custom so no qualifier is added.
+            local boostName = dcProps.Name or ""
+            if boostName == "" then
+                local boostModifier = dcProps.BoostModifier
+                if type(boostModifier) == "table"
+                    and boostModifier.Name then
+                    boostName = boostModifier.Name
+                    isSpellDerived = true
+                end
+            end
+            -- BoostType qualifier ("Proficiency" / "Expertise"):
+            -- part of the bonus identity, not a separate property.
+            -- Only append when the resulting phrase doesn't already
+            -- end with the qualifier (defensive against future game
+            -- versions that might bake the qualifier into Name).
             local boostType = dcProps.BoostType
-            if boostType and boostType ~= "" then
+            if boostName ~= "" and boostType and boostType ~= "" then
+                local qualifier = nil
                 if boostType == "ProficiencyBonus" then
-                    parts[#parts + 1] = "Proficiency"
+                    qualifier = "Proficiency"
                 elseif boostType == "ExpertiseBonus" then
-                    parts[#parts + 1] = "Expertise"
+                    qualifier = "Expertise"
+                end
+                if qualifier
+                    and not boostName:lower():find(
+                        qualifier:lower(), 1, true) then
+                    boostName = boostName .. " " .. qualifier
+                end
+            end
+            if boostName ~= ""
+                and not boostName:match("^h%x+g") then
+                combinedSpeech:Add("name", boostName, "brief")
+            end
+
+            -- Sub-panel state tracking (uses isSpellDerived to
+            -- distinguish "in X panel" vs "on main row").
+            if isSpellDerived then
+                handlerState.subPanelEntered = true
+                if not previousSubPanelEntered then
+                    -- First spell-derived focus = user just opened
+                    -- the X "Add Bonus" panel.  Sighted players
+                    -- see it slide in with party portraits; speak
+                    -- the equivalent.
+                    combinedSpeech:Add("title", "Add Bonus", "brief")
+                    combinedSpeech:Add("instructionHint",
+                        "A to apply. B to go back.")
                 end
             end
 
-            -- Numeric value ("+3", "-1").
+            -- value (slot 8): the bonus magnitude.  Boosts have
+            -- EITHER a numeric Value ("+2" for Proficiency / ability
+            -- mod) OR a dice value ("+1d4" for Guidance) -- never
+            -- both in practice.  When a future case has both, we'd
+            -- need a property fallback; for now, prefer dice.
             local value = dcProps.Value
-            if value and value ~= "" and value ~= "0" then
+            local diceTypeSet = dcProps.DiceTypeSet
+            local diceStr = nil
+            if type(diceTypeSet) == "table" then
+                diceStr = diceTypeSet.Str
+            end
+            if diceStr and diceStr ~= "" then
+                combinedSpeech:Add("value", "+" .. diceStr, "brief")
+            elseif value and value ~= "" and value ~= "0" then
                 local numericValue = tonumber(value)
                 if numericValue and numericValue > 0 then
-                    parts[#parts + 1] = "+" .. value
+                    combinedSpeech:Add("value",
+                        "+" .. value, "brief")
                 elseif numericValue then
-                    parts[#parts + 1] = value
+                    combinedSpeech:Add("value", value, "brief")
                 end
             end
 
-            -- Dice bonus ("+1d4" from Guidance, etc.).
-            local diceTypeSet = dcProps.DiceTypeSet
-            if diceTypeSet and type(diceTypeSet) == "table" then
-                local diceStr = diceTypeSet.Str
-                if diceStr and diceStr ~= "" then
-                    parts[#parts + 1] = "+" .. diceStr
+            -- AddProperty("From", ...): offering character.  Only for
+            -- spell-derived boosts where the source differs from the
+            -- rolling character.  Always-on bonuses skip this --
+            -- their Owner is the rolling character itself.
+            if isSpellDerived then
+                local owner = dcProps.Owner
+                if type(owner) == "table" and owner.Name then
+                    local ownerName = owner.Name
+                    if ownerName ~= ""
+                        and not ownerName:match("^h%x+g") then
+                        combinedSpeech:AddProperty(
+                            "From", ownerName, "brief")
+                    end
                 end
             end
 
-            if #parts > 0 then
-                local itemSpeech = SpeechData.Create()
-                itemSpeech:Add("name",
-                    table.concat(parts, " "), "brief")
-                return itemSpeech
+            -- If we built any boost-related fields, return.  Empty
+            -- (no name, no value, no properties) means the dcProps
+            -- didn't carry usable data -- log and fall through.
+            if next(combinedSpeech.coreFields) ~= nil
+                or #combinedSpeech.properties > 0 then
+                return combinedSpeech
             end
 
-            -- Debug: log dcProps when VMBoost produces no text.
+            -- Diagnostic: log dcProps when VMBoost produces nothing
+            -- (a future spell type with neither dcProps.Name nor
+            -- BoostModifier.Name set).
             local propDump = {}
             for propName, propValue in pairs(dcProps) do
                 propDump[#propDump + 1] = propName .. "="
@@ -2145,14 +2688,13 @@ local ActiveRollHandler = CreatePanelHandler({
             local advantageType = dcProps.AdvantageType or ""
             local description = dcProps.Description or ""
             if advantageType ~= "" then
-                local itemSpeech = SpeechData.Create()
                 local advantageText = advantageType
                 if description ~= ""
                     and not description:match("^h%x+g") then
                     advantageText = advantageType .. ": " .. description
                 end
-                itemSpeech:Add("name", advantageText, "brief")
-                return itemSpeech
+                combinedSpeech:Add("name", advantageText, "brief")
+                return combinedSpeech
             end
         end
 
@@ -2161,9 +2703,8 @@ local ActiveRollHandler = CreatePanelHandler({
             local name = dcProps.Name
             if name and name ~= ""
                 and not name:match("^h%x+g") then
-                local itemSpeech = SpeechData.Create()
-                itemSpeech:Add("name", name, "brief")
-                return itemSpeech
+                combinedSpeech:Add("name", name, "brief")
+                return combinedSpeech
             end
         end
 
@@ -2172,13 +2713,72 @@ local ActiveRollHandler = CreatePanelHandler({
             local name = dcProps.Name
             if name and name ~= ""
                 and not name:match("^h%x+g") then
-                local itemSpeech = SpeechData.Create()
-                itemSpeech:Add("name", name, "brief")
-                return itemSpeech
+                combinedSpeech:Add("name", name, "brief")
+                return combinedSpeech
             end
         end
 
-        -- Other types: fall through to generic pipeline.
+        -- Diagnostic: log unrecognized focused-element dcType +
+        -- dcProps so we can identify the structure of new VM types.
+        -- Skip VMItem (already handled cleanly by generic extraction
+        -- for items like Thieves' Tools) and Grid / non-VM types
+        -- (containers / wrappers handled by generic extraction).
+        if dcType:find("VM")
+            and not dcType:find("VMItem") then
+            local propDump = {}
+            for propName, propValue in pairs(dcProps) do
+                propDump[#propDump + 1] = propName .. "="
+                    .. tostring(propValue):sub(1, 60)
+            end
+            Log.Info("ActiveRoll UNHANDLED dcType=" .. dcType
+                .. " props={ " .. table.concat(propDump, " | ") .. " }")
+        end
+
+        -- Non-VM focused element (e.g., the lockpicking Grid that
+        -- shows the tool being used as "Thieves' Tools").  Mirror the
+        -- factory's generic extraction so the focused item still
+        -- speaks.  We can't return nil here when the entry block was
+        -- just built -- the factory takes our return as authoritative
+        -- and skips its own generic extraction, which would drop the
+        -- entry block.  So extract the name in-place and merge with
+        -- the entry block into one SpeechData.
+        local genericName, genericValue, genericDesc, genericValueDesc =
+            Helpers.FormatDCTextSplit(dcProps, dcType)
+        if not genericName or genericName == "" then
+            genericName = Helpers.ExtractTextFromData(
+                focusedElement, handlerState.currentTabContext,
+                not handlerState.entrySpoken)
+            genericValue = nil
+            genericDesc = nil
+            genericValueDesc = nil
+        end
+        if genericName and genericName:match("^h%x+g") then
+            genericName = nil
+        end
+        if genericName and genericName ~= "" then
+            combinedSpeech:Add("name", genericName, "brief")
+            if genericValue and genericValue ~= "" then
+                combinedSpeech:Add("value", genericValue, "brief")
+            end
+            -- Item description goes in additionalDescription so it
+            -- doesn't clobber the dialogue line in description (set
+            -- by the entry block above for dialogue skill checks).
+            -- Both speak in CORE_FIELD_LIST order: description first
+            -- (dialogue / urgent context), then additionalDescription
+            -- (item flavour text).
+            local descText = genericValueDesc or genericDesc
+            if descText and descText ~= "" then
+                combinedSpeech:Add(
+                    "additionalDescription", descText, "verbose")
+            end
+        end
+
+        -- If anything got added (entry block or generic name), return
+        -- the combined SpeechData.  Otherwise return nil so the
+        -- factory's pipeline can do its own thing (no-op fallback).
+        if next(combinedSpeech.coreFields) ~= nil then
+            return combinedSpeech
+        end
         return nil
     end,
 })
@@ -2235,12 +2835,13 @@ local ReactionHandler = CreatePanelHandler({
         end
         if #pieces == 0 then return end
         local triggerText = table.concat(pieces, " ")
-        -- Use titleOverride (not bodyOverride) so the trigger text
+        -- Use title slot (not description) so the trigger text
         -- precedes the navigation hint -- urgent context (WHY I'm
         -- being asked) leads, choice mechanics follow.  The user
         -- hears: "Reaction: Goblin moves out of Shadowheart's reach.
         -- A to use reaction. B to skip all. Opportunity Attack."
-        handlerState.titleOverride = "Reaction: " .. triggerText
+        handlerState.screenEntryOverrides:Add(
+            "title", "Reaction: " .. triggerText, "brief")
     end,
     customItemFn = function(focusedElement, handlerState, snapshot)
         local dcProps = focusedElement.dcProps
@@ -2289,9 +2890,133 @@ local ReactionHandler = CreatePanelHandler({
 })
 
 -- Alchemy crafting (recipes and ingredients).
+--
+-- The recipe list is grouped by category (Potions, Elixirs, Grenades,
+-- Coatings, Extracts).  Each category is an Expander whose header is
+-- an LSToggleButton (DC = ls.VMRecipesCollection).  Inside each
+-- expanded category is an ItemsControl of recipe entries
+-- (DC = ls.VMRecipe).
+--
+-- Per AlchemyPanel_c.xaml:
+--   - Expander header: GroupName TextBlock renders three inline Runs
+--     (InheritedTag = localized category name + " (" +
+--      TotalCraftableRecipes + "/" + ItemsSource.Count + ")"), e.g.
+--     "Potions (3/8)".  Localized.
+--   - Recipe entry: Name TextBlock bound to Result.Item.NameAlchemy.
+--
+-- For screen-reader use, "Potions (3/8)" is awkward (parens read as
+-- punctuation).  Rephrase the category header into "<name>. 3 of 8
+-- craftable." -- name in the name core field, count as a bare-label
+-- property (per SpeechData.lua:494-503 empty-label = bare render).
+-- Recipe entries are a single rendered string; speak as the name.
 local AlchemyHandler = CreatePanelHandler({
     name = "Alchemy",
-    hint = "Up and down to browse recipes.",
+    hint = "Up and down to browse recipes, left and right on a recipe to browse ingredients.",
+    onReset = function(handlerState)
+        -- Clear craft-counter baseline so re-entering the panel
+        -- starts fresh.  Without this, a stale lastTotal from a
+        -- prior session could mask the first craft on reopen
+        -- (e.g. closed panel after one craft -> lastTotal=1; new
+        -- panel session DC starts at 0 -> 0 < 1, no increment
+        -- detected even after a real craft brings it back to 1).
+        handlerState.lastTotalCreatedItems = nil
+    end,
+    onWidgetAdded = function(widgetData, handlerState)
+        -- Two responsibilities, both keyed off the panel-level
+        -- ExtractCraftingMessage TextBlock (AlchemyPanel_c.xaml:1252):
+        --
+        -- (1) Suppress the toast text from screen-entry sweep.  The
+        --     TextBlock has Opacity=0 by default and only fades
+        --     visible during a transient post-craft animation, but
+        --     its bound text resolves regardless of opacity -- so on
+        --     screen entry it'd say "0 items added to <name>'s
+        --     inventory" (the empty initial state) which is
+        --     misleading.  Clearing the namedTexts entry BEFORE
+        --     screen entry consumes pendingWidgetEvent prevents
+        --     ExtractFromNamedTexts from picking it up via its
+        --     "message"-name pattern (Helpers.lua:998).
+        --
+        -- (2) Announce on craft success.  TotalCreatedItems on the
+        --     panel DC (gui::DCAlchemy) increments after a Craft
+        --     Item action; the widgetAdded INPC fires with the new
+        --     value.  When we detect an increment, speak the
+        --     captured rendered toast text via SpeechData.Alert --
+        --     audio equivalent of the visual fade-in.  First call
+        --     just sets the baseline (lastTotal nil) so we don't
+        --     announce "0 items added" on initial entry.
+        if not widgetData then return end
+        local craftMessage = nil
+        if widgetData.namedTexts then
+            craftMessage = widgetData.namedTexts.ExtractCraftingMessage
+            widgetData.namedTexts.ExtractCraftingMessage = nil
+        end
+        local dcProps = widgetData.dcProps
+        if not dcProps then return end
+        local total = tonumber(dcProps.TotalCreatedItems) or 0
+        local lastTotal = handlerState.lastTotalCreatedItems
+        if lastTotal ~= nil and total > lastTotal and craftMessage then
+            local cleaned = Helpers.StripMarkupTags(craftMessage)
+            if cleaned and cleaned ~= "" then
+                SpeechData.Alert(cleaned, "queue")
+            end
+        end
+        handlerState.lastTotalCreatedItems = total
+    end,
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local readOk, textBlocks = pcall(Ext.UI.ReadFocusedTextBlocks)
+        if not readOk or not textBlocks or #textBlocks == 0 then
+            return nil
+        end
+        -- Join all non-empty rendered TextBlocks with a space.
+        -- AlchemyPanel_c.xaml shapes:
+        --   - Expander header (RecipesListTemplate): one GroupName
+        --     TextBlock with three inline Runs that already render
+        --     as a single string ("Potions (3/8)") -- one entry.
+        --   - Recipe entry (VMRecipe): one Name TextBlock -- one
+        --     entry.
+        --   - Ingredient slot (CraftingSlot, lines 381-408): TWO
+        --     TextBlocks -- "Salts of" prefix + "Rogue's Morsel"
+        --     specific name.  Need both joined.
+        -- A single-entry slot joins to itself unchanged; the multi-
+        -- entry case is the ingredient slot we need to fix.
+        local pieces = {}
+        for _, text in ipairs(textBlocks) do
+            local cleaned = Helpers.StripMarkupTags(text)
+            if cleaned and cleaned ~= "" then
+                pieces[#pieces + 1] = cleaned
+            end
+        end
+        if #pieces == 0 then return nil end
+        local rawText = table.concat(pieces, " ")
+
+        local speechData = SpeechData.Create()
+        -- Match "<category> (<craftable>/<total>)" -- digits required
+        -- on both sides of the slash so a recipe name happening to
+        -- end in parens won't false-match.
+        local categoryName, craftable, total = rawText:match(
+            "^(.-)%s*%((%d+)/(%d+)%)$")
+        if categoryName and craftable and total then
+            -- Append expanded/collapsed state.  Same pattern as
+            -- SpellBook.lua:609-613: focusedElement.isChecked is a
+            -- tri-state set by C++ on toggleable elements (true =
+            -- expanded, false = collapsed, nil = not a toggle /
+            -- unknown).  Sighted UX shows an arrow rotating between
+            -- "right" and "down"; audio mirror is the state word.
+            local isChecked = focusedElement.isChecked
+            if isChecked == true then
+                categoryName = categoryName .. ", expanded"
+            elseif isChecked == false then
+                categoryName = categoryName .. ", collapsed"
+            end
+            speechData:Add("name", categoryName, "brief")
+            speechData:AddProperty("",
+                craftable .. " of " .. total .. " craftable",
+                "brief")
+        else
+            speechData:Add("name", rawText, "brief")
+        end
+        return speechData
+    end,
 })
 
 -- Item combination crafting.
@@ -2347,6 +3072,7 @@ local JournalQuestsHandler = CreatePanelHandler({
                 categoryName = dcProps.QuestCategory.Description
             end
             if not categoryName or categoryName == "" then
+                Log.Info("WALK-FALLBACK: QuestCategoryContainer.Description empty, walking text blocks")
                 -- Fallback: read text blocks from the expander.
                 local readOk, headerTexts = pcall(
                     Ext.UI.ReadFocusedTextBlocks)
@@ -2390,6 +3116,7 @@ local JournalQuestsHandler = CreatePanelHandler({
                 end
             end
             if not questTitle or questTitle == "" then
+                Log.Info("WALK-FALLBACK: QuestView.Quest.Title (and Text/Name/Title) empty, walking text blocks")
                 -- Fallback: read text blocks.
                 local readOk, headerTexts = pcall(
                     Ext.UI.ReadFocusedTextBlocks)
@@ -2410,12 +3137,14 @@ local JournalQuestsHandler = CreatePanelHandler({
                     if hasUpdate == "False" or hasUpdate == false then
                         questTitle = questTitle .. ", new update"
                     end
-                    local isChecked = focusedElement.isChecked
-                    if isChecked == true then
-                        questTitle = questTitle .. ", expanded"
-                    elseif isChecked == false then
-                        questTitle = questTitle .. ", collapsed"
-                    end
+                    -- NOTE: do NOT append expanded/collapsed for
+                    -- leaf QuestView entries.  The XAML wraps each
+                    -- quest in an LSToggleButton (so isChecked is
+                    -- always reported), but the toggle has no visible
+                    -- effect for leaf quests -- the right pane shows
+                    -- the same details either way.  Only category
+                    -- containers (ls.QuestCategoryContainer) actually
+                    -- expand/collapse their child rows in the list.
                     return questTitle, nil, nil
                 end
             end
@@ -2441,6 +3170,7 @@ local JournalQuestsHandler = CreatePanelHandler({
                     objectiveText, "brief")
                 return objSpeech
             end
+            Log.Info("WALK-FALLBACK: QuestObjective.Description empty, walking text blocks")
             -- Fallback: text blocks.
             local readOk, texts = pcall(
                 Ext.UI.ReadFocusedTextBlocks)
@@ -2477,20 +3207,22 @@ local JournalQuestsHandler = CreatePanelHandler({
             return "", nil, nil
         end
 
-        -- Generic expander button fallback.
+        -- Generic expander button fallback.  Same rationale as the
+        -- QuestView branch above: do NOT append expanded/collapsed.
+        -- Genuine category-header expanders are caught by the
+        -- QuestCategoryContainer branch (which keeps the suffix
+        -- because those toggles ACTUALLY show/hide their child rows
+        -- in the list).  Anything reaching here is a leaf with an
+        -- invisible IsChecked toggle -- announcing "expanded" /
+        -- "collapsed" is misleading.
         if elemId:find("ExpanderButton") then
+            Log.Info("WALK-FALLBACK: JournalQuests generic ExpanderButton fallback (dcType=" .. tostring(dcType) .. ")")
             local readOk, headerTexts = pcall(
                 Ext.UI.ReadFocusedTextBlocks)
             if readOk and headerTexts and #headerTexts > 0 then
                 local headerName = Helpers.StripMarkupTags(
                     headerTexts[1])
                 if headerName and headerName ~= "" then
-                    local isChecked = focusedElement.isChecked
-                    if isChecked == true then
-                        headerName = headerName .. ", expanded"
-                    elseif isChecked == false then
-                        headerName = headerName .. ", collapsed"
-                    end
                     return headerName, nil, nil
                 end
             end
@@ -2521,10 +3253,591 @@ local JournalQuestsHandler = CreatePanelHandler({
     end,
 })
 
--- Dialogue history with portraits.
+-- Dialogue history with portraits (JournalDialogues_c.xaml).
+--
+-- DC is gui::DCJournalDialogues / ls.DCJournalDialogues.  The left
+-- ListBox (DialoguesTree) holds three DC types interleaved:
+--
+--   ls.JournalDialogueDayGroup -- "By Date" expander row.  Has
+--     DayOfMonth + MonthName scalars; XAML formats as "<day>, <month>".
+--   ls.JournalDialogueMapGroup -- "By Location" expander row.  Has
+--     Map scalar (already a translated location name).
+--   ls.JournalDialogue -- a dialogue entry.  Has Participants
+--     collection (each {_type=ls.DialogueParticipant, Name="..."}),
+--     Map scalar, DayOfMonth + MonthName scalars.  XAML filters out
+--     the narrator participant for display; we mirror that by name.
+--
+-- Sort mode (DataContext.GroupingTab) is "ByDate" or "ByMap".  The
+-- entry display swaps Map / Day visibility based on mode -- we don't
+-- need to mirror that since we always speak whatever fields are
+-- meaningful.
+local JOURNAL_DIALOGUE_ENTRY_TYPES = {
+    ["ls.JournalDialogueDayGroup"] = true,
+    ["ls.JournalDialogueMapGroup"] = true,
+    ["ls.JournalDialogue"]         = true,
+}
+
 local JournalDialoguesHandler = CreatePanelHandler({
     name = "JournalDialogues",
-    hint = false,
+    hint = "Use bumpers to switch categories."
+        .. " Up and down to browse dialogues."
+        .. " Press Y to switch sort by date or by location.",
+    onWidgetAdded = function(widgetData, handlerState)
+        -- Stash the dialogues widget DC so we can find SelectedItem
+        -- even after focus drifts away (the always-loaded
+        -- gui::DCCrossplayNotifications HUD steals focus on
+        -- post-settle ticks, leaving focusedElement pointing nowhere
+        -- useful).  dcProps captured at load is a one-shot snapshot;
+        -- live SelectedItem comes via dcProps.SelectedItem, which the
+        -- C++ collector re-reads any time we get a fresh widget event.
+        handlerState.dialoguesWidgetData = widgetData
+    end,
+    onReset = function(handlerState)
+        handlerState.dialoguesWidgetData = nil
+    end,
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        -- DialoguesTree uses ls:MoveFocus.IsFocused="{Binding
+        -- IsSelected, ...}" plus VirtualizingStackPanel.  D-pad up/
+        -- down fires SelectNextListBoxItem ForceSelect=True which
+        -- changes the ListBox.SelectedItem but does NOT raise
+        -- Noesis's GotFocus on the new ListBoxItem.  Worse, on the
+        -- post-settle tick after the panel opens, focus drifts to
+        -- the always-loaded gui::DCCrossplayNotifications HUD widget
+        -- (confirmed in DIALOGUES probe logs).
+        --
+        -- Resolution chain to find the active entry:
+        --   1. focusedElement if its dcType is a journal entry type
+        --   2. selectedElement if its dcType is a journal entry type
+        --   3. focusedElement.dcProps.SelectedItem (DialoguesTree's
+        --      SelectedItem flows back into DC.SelectedItem via the
+        --      two-way binding in JournalDialogues_c.xaml line 225).
+        --      Sub-object _type carries the journal entry class.
+        --   4. Fall back to the cached widget DC's SelectedItem when
+        --      focus has drifted off the dialogues panel entirely.
+        local function FromSelectedItemSubObject(dcProps)
+            if type(dcProps) ~= "table" then return nil end
+            local selectedItem = dcProps.SelectedItem
+            if type(selectedItem) ~= "table" then return nil end
+            local subType = selectedItem._type
+            if not subType then return nil end
+            -- C++ reports type names as "ls.JournalDialogue" etc;
+            -- strip the namespace if needed.
+            local normalized = subType
+            if not JOURNAL_DIALOGUE_ENTRY_TYPES[normalized] then
+                local stripped = normalized:gsub("^gui::", "")
+                                          :gsub("^ls%.", "ls.")
+                if JOURNAL_DIALOGUE_ENTRY_TYPES[stripped] then
+                    normalized = stripped
+                end
+            end
+            if not JOURNAL_DIALOGUE_ENTRY_TYPES[normalized] then
+                return nil
+            end
+            return {
+                dcType  = normalized,
+                dcProps = selectedItem,
+                elemId  = "DC.SelectedItem",
+            }
+        end
+
+        local entry = nil
+        if focusedElement.dcType
+            and JOURNAL_DIALOGUE_ENTRY_TYPES[focusedElement.dcType] then
+            entry = focusedElement
+        elseif snapshot.selectedElement
+            and snapshot.selectedElement.dcType
+            and JOURNAL_DIALOGUE_ENTRY_TYPES[
+                snapshot.selectedElement.dcType] then
+            entry = snapshot.selectedElement
+        else
+            entry = FromSelectedItemSubObject(focusedElement.dcProps)
+            if not entry and snapshot.selectedElement then
+                entry = FromSelectedItemSubObject(
+                    snapshot.selectedElement.dcProps)
+            end
+            if not entry and handlerState.dialoguesWidgetData then
+                entry = FromSelectedItemSubObject(
+                    handlerState.dialoguesWidgetData.dcProps)
+            end
+            if not entry then
+                entry = focusedElement  -- last-ditch fall-through
+            end
+        end
+
+        local dcType = entry.dcType
+        local dcProps = entry.dcProps
+        local elemId = entry.elemId or ""
+
+        -- Tab ListBoxItem (Journal nav carousel itself): suppress.
+        if elemId:find("^ListBoxItem::")
+            and not JOURNAL_DIALOGUE_ENTRY_TYPES[dcType] then
+            return "", nil, nil
+        end
+
+        -- Date expander row: speak "Date, <day> <month>, expanded/collapsed".
+        if dcType == "ls.JournalDialogueDayGroup" and dcProps then
+            local day = dcProps.DayOfMonth
+            local month = dcProps.MonthName
+            local headerText = nil
+            if type(month) == "string" and month ~= "" then
+                month = Helpers.GetTranslatedStringIfHandle(month)
+                if type(day) == "string" and day ~= "" then
+                    headerText = day .. " " .. month
+                else
+                    headerText = month
+                end
+            elseif type(day) == "string" and day ~= "" then
+                headerText = "Day " .. day
+            end
+            if not headerText or headerText == "" then
+                Log.Info("WALK-FALLBACK: JournalDialogueDayGroup DayOfMonth/MonthName empty, walking text blocks")
+                -- Fallback: read text blocks from the expander.
+                local readOk, headerTexts = pcall(
+                    Ext.UI.ReadFocusedTextBlocks)
+                if readOk and headerTexts and #headerTexts > 0 then
+                    headerText = Helpers.StripMarkupTags(headerTexts[1])
+                end
+            end
+            if headerText and headerText ~= "" then
+                local label = "Date, " .. headerText
+                local areShown = dcProps.AreDialoguesShown
+                if areShown == "True" or areShown == true then
+                    label = label .. ", expanded"
+                elseif areShown == "False" or areShown == false then
+                    label = label .. ", collapsed"
+                end
+                return label, nil, nil
+            end
+            return "", nil, nil
+        end
+
+        -- Location expander row: speak "Location, <map>, expanded/collapsed".
+        if dcType == "ls.JournalDialogueMapGroup" and dcProps then
+            local mapName = dcProps.Map
+            if type(mapName) == "string" and mapName ~= "" then
+                mapName = Helpers.GetTranslatedStringIfHandle(mapName)
+                mapName = Helpers.StripMarkupTags(mapName)
+            else
+                Log.Info("WALK-FALLBACK: JournalDialogueMapGroup.Map empty, walking text blocks")
+                -- Fallback: TextBlock "Map".
+                local readOk, headerTexts = pcall(
+                    Ext.UI.ReadFocusedTextBlocks)
+                if readOk and headerTexts and #headerTexts > 0 then
+                    mapName = Helpers.StripMarkupTags(headerTexts[1])
+                end
+            end
+            if mapName and mapName ~= "" then
+                local label = "Location, " .. mapName
+                local areShown = dcProps.AreDialoguesShown
+                if areShown == "True" or areShown == true then
+                    label = label .. ", expanded"
+                elseif areShown == "False" or areShown == false then
+                    label = label .. ", collapsed"
+                end
+                return label, nil, nil
+            end
+            return "", nil, nil
+        end
+
+        -- Dialogue entry: speaker + location + day, structured.
+        if dcType == "ls.JournalDialogue" and dcProps then
+            local entrySpeech = SpeechData.Create()
+
+            -- Use the resolved scalar SpeakerName (e.g. "Shadowheart").
+            -- Avoid walking dcProps.Participants -- DialogueParticipant.
+            -- Name is a parameterized translated string that resolves to
+            -- placeholder text like "[1]" at the scalar-read layer, not
+            -- to the speaker's name.  SpeakerName is the parent VM's
+            -- already-resolved primary speaker scalar.
+            local speakerName = dcProps.SpeakerName
+            if type(speakerName) == "string" and speakerName ~= "" then
+                speakerName = Helpers.GetTranslatedStringIfHandle(
+                    speakerName)
+                speakerName = Helpers.StripMarkupTags(speakerName)
+                if speakerName ~= "" then
+                    entrySpeech:Add("name", speakerName, "brief")
+                end
+            end
+
+            -- Location (Map): only meaningful when sorting by date,
+            -- but harmless to speak in either mode.
+            local mapName = dcProps.Map
+            if type(mapName) == "string" and mapName ~= "" then
+                mapName = Helpers.GetTranslatedStringIfHandle(mapName)
+                mapName = Helpers.StripMarkupTags(mapName)
+                if mapName ~= "" then
+                    entrySpeech:AddProperty("Location",
+                        mapName, "brief")
+                end
+            end
+
+            -- Date.
+            local day = dcProps.DayOfMonth
+            local month = dcProps.MonthName
+            if type(month) == "string" and month ~= "" then
+                month = Helpers.GetTranslatedStringIfHandle(month)
+                local dateText = month
+                if type(day) == "string" and day ~= "" then
+                    dateText = day .. " " .. month
+                end
+                entrySpeech:AddProperty("Date", dateText, "normal")
+            end
+
+            -- Dialogue content: iterate DialogueLines.  Per the
+            -- JournalDialogues_c.xaml DialogueLine template (line 360+)
+            -- each line renders as "Speaker.Name: Text" except narrator
+            -- lines, where the Name span collapses (the IsNarrator=False
+            -- DataTrigger only sets the speaker when speaker is NOT the
+            -- narrator).  We mirror: prefix Speaker for character lines,
+            -- skip the prefix for narrator lines (they keep their
+            -- *italicized* narration framing in the Text itself).
+            --
+            -- Both bindings are direct property bindings on the
+            -- JournalDialogueLine VM with no parameterized loca, so
+            -- scalar extraction returns the resolved text -- no walk
+            -- needed.  SpeakerName is exposed as a top-level scalar on
+            -- each line VM (separate from Speaker sub-object), so use
+            -- it directly.
+            if type(dcProps.DialogueLines) == "table" then
+                local lineParts = {}
+                for _, line in ipairs(dcProps.DialogueLines) do
+                    if type(line) == "table" then
+                        local lineText = line.Text
+                        if type(lineText) == "string"
+                            and lineText ~= ""
+                            and not lineText:match("^h%x+g") then
+                            lineText = Helpers.GetTranslatedStringIfHandle(
+                                lineText)
+                            lineText = Helpers.StripMarkupTags(lineText)
+                        else
+                            lineText = nil
+                        end
+
+                        local speakerName = line.SpeakerName
+                        if type(speakerName) == "string"
+                            and speakerName ~= ""
+                            and speakerName ~= "Narrator" then
+                            speakerName = Helpers.GetTranslatedStringIfHandle(
+                                speakerName)
+                            speakerName = Helpers.StripMarkupTags(speakerName)
+                        else
+                            speakerName = nil
+                        end
+
+                        if lineText and lineText ~= "" then
+                            local linePiece
+                            if speakerName and speakerName ~= "" then
+                                linePiece = speakerName .. ": " .. lineText
+                            else
+                                linePiece = lineText
+                            end
+                            lineParts[#lineParts + 1] = linePiece
+                        end
+                    end
+                end
+                if #lineParts > 0 then
+                    entrySpeech:Add("description",
+                        table.concat(lineParts, " "), "normal")
+                end
+            end
+
+            -- Fallback when scalar extraction produced nothing:
+            -- read TextBlocks from the focused entry subtree and stitch
+            -- them into a single phrase (mirrors CombatLog handler).
+            if next(entrySpeech.coreFields) == nil
+                and #entrySpeech.properties == 0 then
+                Log.Info("WALK-FALLBACK: JournalDialogue scalar extraction empty, walking text blocks")
+                local readOk, entryTexts = pcall(
+                    Ext.UI.ReadFocusedTextBlocks)
+                if readOk and entryTexts and #entryTexts > 0 then
+                    local cleanedParts = {}
+                    for _, entryText in ipairs(entryTexts) do
+                        local cleaned = Helpers.StripMarkupTags(entryText)
+                        if cleaned and cleaned ~= "" then
+                            cleanedParts[#cleanedParts + 1] = cleaned
+                        end
+                    end
+                    if #cleanedParts > 0 then
+                        return table.concat(cleanedParts, ", "), nil, nil
+                    end
+                end
+                return "", nil, nil
+            end
+
+            return entrySpeech
+        end
+
+        -- Fall through to generic pipeline.
+        return nil
+    end,
+})
+
+-- Inspiration list (JournalInspiration_c.xaml).
+--
+-- The controller XAML omits ContextName but the keyboard sibling
+-- (JournalInspiration.xaml) declares
+-- ls:UIWidget.ContextName="JournalInspiration" and
+-- d:DesignInstance {x:Type ls:DCJournalInspiration}, so the runtime
+-- DC type is ls.DCJournalInspiration (or gui::DCJournalInspiration
+-- in C++ form).  The state machine binding feeds the same DC into
+-- both XAML variants.
+--
+-- Left list (BackgroundsList) holds ls.VMBackground entries with
+-- Title scalar and BackgroundOwners collection (each
+-- {_type=ls.VMGoalOwner, Name="..."}).  Side panel populates from
+-- focused entry's Title + Description + GoalCategories ->
+-- BackgroundGoals.
+local JournalInspirationHandler = CreatePanelHandler({
+    name = "JournalInspiration",
+    hint = "Use bumpers to switch categories."
+        .. " Up and down to browse inspirations.",
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local dcType = focusedElement.dcType
+        local dcProps = focusedElement.dcProps
+
+        -- Background category row in the main list.
+        if dcType == "ls.VMBackground" and dcProps then
+            local entrySpeech = SpeechData.Create()
+
+            local title = dcProps.Title
+            if type(title) == "string" and title ~= "" then
+                title = Helpers.GetTranslatedStringIfHandle(title)
+                title = Helpers.StripMarkupTags(title)
+                if title ~= "" then
+                    -- Inspiration entries surface their Title as both
+                    -- the focused element's tabName (the factory will
+                    -- emit it as "tab" during screen entry) and the
+                    -- VMBackground.Title scalar.  Skip the "name" field
+                    -- when they match to avoid "Charlatan. Charlatan."
+                    -- The factory's string-return dedup doesn't run
+                    -- when we return SpeechData, so do it here.
+                    local tabName = focusedElement.tabName
+                    if tabName then
+                        tabName = Helpers.GetTranslatedStringIfHandle(
+                            tabName)
+                    end
+                    local isDuplicate = tabName
+                        and Helpers.NormalizeForCompare(title)
+                            == Helpers.NormalizeForCompare(tabName)
+                    if not isDuplicate then
+                        entrySpeech:Add("name", title, "brief")
+                    end
+                end
+            end
+
+            -- Owners (party members who satisfied this background):
+            -- collected as comma-joined names so the user knows who
+            -- earned it.
+            if type(dcProps.BackgroundOwners) == "table" then
+                local ownerNames = {}
+                for _, owner in ipairs(dcProps.BackgroundOwners) do
+                    if type(owner) == "table" then
+                        local ownerName = owner.Name
+                        if type(ownerName) == "string"
+                            and ownerName ~= "" then
+                            ownerNames[#ownerNames + 1] =
+                                Helpers.GetTranslatedStringIfHandle(
+                                    ownerName)
+                        end
+                    end
+                end
+                if #ownerNames > 0 then
+                    entrySpeech:AddProperty("Earned by",
+                        table.concat(ownerNames, ", "), "normal")
+                end
+            end
+
+            -- Description from the side panel binding (focused
+            -- VMBackground.Description).
+            local desc = dcProps.Description
+            if type(desc) == "table" then
+                desc = desc.Str or desc.Text or nil
+            end
+            if type(desc) == "string" and desc ~= "" then
+                desc = Helpers.GetTranslatedStringIfHandle(desc)
+                desc = Helpers.StripMarkupTags(desc)
+                if desc ~= "" then
+                    entrySpeech:Add("description", desc, "verbose")
+                end
+            end
+
+            if next(entrySpeech.coreFields) == nil
+                and #entrySpeech.properties == 0 then
+                Log.Info("WALK-FALLBACK: JournalInspiration VMBackground scalars empty, walking text blocks")
+                -- Fallback: TextBlock subtree.
+                local readOk, texts = pcall(
+                    Ext.UI.ReadFocusedTextBlocks)
+                if readOk and texts and #texts > 0 then
+                    local cleaned = Helpers.StripMarkupTags(texts[1])
+                    if cleaned and cleaned ~= "" then
+                        return cleaned, nil, nil
+                    end
+                end
+                return "", nil, nil
+            end
+
+            return entrySpeech
+        end
+
+        -- Inspiration goal items in the side panel
+        -- (ls.VMBackgroundGoal): Title + Description + GoalOwners.
+        if dcType == "ls.VMBackgroundGoal" and dcProps then
+            local goalSpeech = SpeechData.Create()
+            local title = dcProps.Title
+            if type(title) == "string" and title ~= "" then
+                title = Helpers.GetTranslatedStringIfHandle(title)
+                title = Helpers.StripMarkupTags(title)
+                if title ~= "" then
+                    goalSpeech:Add("name", title, "brief")
+                end
+            end
+            local desc = dcProps.Description
+            if type(desc) == "table" then
+                desc = desc.Str or desc.Text or nil
+            end
+            if type(desc) == "string" and desc ~= "" then
+                desc = Helpers.GetTranslatedStringIfHandle(desc)
+                desc = Helpers.StripMarkupTags(desc)
+                if desc ~= "" then
+                    goalSpeech:Add("description", desc, "normal")
+                end
+            end
+            if type(dcProps.GoalOwners) == "table" then
+                local ownerNames = {}
+                for _, owner in ipairs(dcProps.GoalOwners) do
+                    if type(owner) == "table" then
+                        local ownerName = owner.Name
+                        if type(ownerName) == "string"
+                            and ownerName ~= "" then
+                            ownerNames[#ownerNames + 1] =
+                                Helpers.GetTranslatedStringIfHandle(
+                                    ownerName)
+                        end
+                    end
+                end
+                if #ownerNames > 0 then
+                    goalSpeech:AddProperty("Earned by",
+                        table.concat(ownerNames, ", "), "normal")
+                end
+            end
+            if next(goalSpeech.coreFields) == nil
+                and #goalSpeech.properties == 0 then
+                return "", nil, nil
+            end
+            return goalSpeech
+        end
+
+        return nil
+    end,
+})
+
+-- Tutorials list (JournalTutorials_c.xaml).
+--
+-- Widget DC is ls.JournalTutorial (per ContextName="JournalTutorial"
+-- in the XAML).  The TreeView has two DC types:
+--   ls.TutorialContainer -- category expander.  SectionValue is an
+--     enum (e.g. "Combat", "Inventory") that the XAML resolves via
+--     EnumTranslatedStringConverter with prefix
+--     'h9de08869g5612g419fgbccbg4655074a1030'.  We try the same
+--     prefix-based lookup; on miss, fall back to the raw enum or
+--     TextBlock contents.
+--   ls.TutorialView -- a tutorial entry.  Title, IsNewTutorial,
+--     HasBeenShown, DescriptionController.
+local TUTORIAL_SECTION_LOCA_PREFIX =
+    "h9de08869g5612g419fgbccbg4655074a1030"
+
+local function ResolveTutorialSection(sectionValue)
+    if not sectionValue or type(sectionValue) ~= "string"
+        or sectionValue == "" then
+        return nil
+    end
+    -- Larian enum->loca pattern: <prefix>_<EnumValue>.
+    local handle = TUTORIAL_SECTION_LOCA_PREFIX .. "_" .. sectionValue
+    if Ext.Loca and Ext.Loca.GetTranslatedString then
+        local translated = Ext.Loca.GetTranslatedString(handle)
+        if translated and translated ~= "" and translated ~= handle then
+            return translated
+        end
+    end
+    -- Fall back to the raw enum value (CamelCase like
+    -- "InventoryAndItems") -- still readable.
+    return sectionValue
+end
+
+local JournalTutorialsHandler = CreatePanelHandler({
+    name = "JournalTutorials",
+    hint = "Use bumpers to switch categories."
+        .. " Up and down to browse tutorials.",
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local dcType = focusedElement.dcType
+        local dcProps = focusedElement.dcProps
+
+        -- Category expander.
+        if dcType == "ls.TutorialContainer" and dcProps then
+            local sectionName =
+                ResolveTutorialSection(dcProps.SectionValue)
+            if not sectionName or sectionName == "" then
+                Log.Info("WALK-FALLBACK: TutorialContainer.SectionValue empty/unresolvable, walking text blocks")
+                local readOk, headerTexts = pcall(
+                    Ext.UI.ReadFocusedTextBlocks)
+                if readOk and headerTexts and #headerTexts > 0 then
+                    sectionName = Helpers.StripMarkupTags(headerTexts[1])
+                end
+            end
+            if sectionName and sectionName ~= "" then
+                local label = "Category, " .. sectionName
+                local isChecked = focusedElement.isChecked
+                if isChecked == true then
+                    label = label .. ", expanded"
+                elseif isChecked == false then
+                    label = label .. ", collapsed"
+                end
+                return label, nil, nil
+            end
+            return "", nil, nil
+        end
+
+        -- Tutorial entry.
+        if dcType == "ls.TutorialView" and dcProps then
+            local entrySpeech = SpeechData.Create()
+            local title = dcProps.Title
+            if type(title) == "string" and title ~= "" then
+                title = Helpers.GetTranslatedStringIfHandle(title)
+                title = Helpers.StripMarkupTags(title)
+                if title ~= "" then
+                    entrySpeech:Add("name", title, "brief")
+                end
+            end
+            -- "New" indicator (matches the bullet image in XAML).
+            if dcProps.IsNewTutorial == "True"
+                or dcProps.IsNewTutorial == true then
+                entrySpeech:AddProperty("Status", "new", "brief")
+            elseif dcProps.HasBeenShown == "False"
+                or dcProps.HasBeenShown == false then
+                entrySpeech:AddProperty("Status", "unread", "normal")
+            end
+            -- Description: DescriptionController is a CtxTransString,
+            -- not extracted as a scalar.  The side panel renders it
+            -- separately.  Skip for entry speech; the user can press
+            -- A to view the side panel detail.
+            if next(entrySpeech.coreFields) == nil
+                and #entrySpeech.properties == 0 then
+                Log.Info("WALK-FALLBACK: TutorialView scalars empty, walking text blocks")
+                local readOk, texts = pcall(
+                    Ext.UI.ReadFocusedTextBlocks)
+                if readOk and texts and #texts > 0 then
+                    local cleaned = Helpers.StripMarkupTags(texts[1])
+                    if cleaned and cleaned ~= "" then
+                        return cleaned, nil, nil
+                    end
+                end
+                return "", nil, nil
+            end
+            return entrySpeech
+        end
+
+        return nil
+    end,
 })
 
 -- Full-screen Combat Log overlay (JournalCombatLog_c.xaml).
@@ -2550,41 +3863,92 @@ local CombatLogHandler = CreatePanelHandler({
     hint = "Up and down to browse entries."
         .. " Right stick click for details. B to close.",
     customItemFn = function(focusedElement, handlerState, snapshot)
-        local elemId = focusedElement.elemId or ""
-        -- Skip the ListBox container itself; only speak each
-        -- focused entry (ListBoxItem::N).
-        if not elemId:find("^ListBoxItem::") then
-            return nil
-        end
-
-        local readOk, entryTexts = pcall(
-            Ext.UI.ReadFocusedTextBlocks)
-        if not readOk or not entryTexts or #entryTexts == 0 then
-            return ""
-        end
-
-        -- Stitch all TextBlocks in the focused entry into one
-        -- phrase.  Most entries are a single line, but multi-Run
-        -- formats appear (e.g. "Intellect Devourer received
-        -- Condition: Dash" where the condition name is a separate
-        -- styled Run).  Strip markup tags from each chunk.
-        local cleanedParts = {}
-        for _, entryText in ipairs(entryTexts) do
-            local cleaned = Helpers.StripMarkupTags(entryText)
-            if cleaned and cleaned ~= "" then
-                cleanedParts[#cleanedParts + 1] = cleaned
+        -- JournalCombatLog_c.xaml uses the same virtualizing-list
+        -- pattern as DialoguesTree (line 77 carries Larian's own
+        -- comment: "Focus is always on ListBox and SelectedItem is
+        -- not a FrameworkElement").  D-pad updates SelectedItem via
+        -- ls:SelectNextListBoxItem ForceSelect=True; Larian's
+        -- MoveFocus.IsFocused on the ListBoxItem container follows
+        -- IsSelected, but Noesis keyboard focus stays on the outer
+        -- ListBox.  Our class delegate's CSC-VM path captures the
+        -- IsSelected ListBoxItem container into snapshot.selectedElement,
+        -- so prefer it when focused isn't itself a ListBoxItem.
+        local entry = focusedElement
+        local entryElemId = focusedElement.elemId or ""
+        if not entryElemId:find("^ListBoxItem::") then
+            if snapshot.selectedElement
+                and (snapshot.selectedElement.elemId or "")
+                    :find("^ListBoxItem::") then
+                entry = snapshot.selectedElement
+            else
+                -- Focused on the ListBox itself with no selection
+                -- captured -- nothing to speak as an entry.  Generic
+                -- pipeline would otherwise read the ListBox's name
+                -- ("Combat Log") repeatedly.
+                return ""
             end
         end
-        if #cleanedParts == 0 then return "" end
-        return table.concat(cleanedParts, " ")
+
+        -- ReadFocusedTextBlocks reads from the FOCUSED element's
+        -- subtree.  When `entry` is the captured ListBoxItem (not
+        -- the actual focused element), the read still uses Noesis
+        -- focus -- which is the ListBox -- and would return ALL
+        -- entries' text.  Only safe to call when `entry` is itself
+        -- the focused element.  Fall through to selectedElement
+        -- entry text via dcProps if available; otherwise the speech
+        -- pipeline gets the elemText from the entry data table.
+        if entry == focusedElement then
+            local readOk, entryTexts = pcall(
+                Ext.UI.ReadFocusedTextBlocks)
+            if not readOk or not entryTexts or #entryTexts == 0 then
+                return ""
+            end
+            -- Stitch all TextBlocks in the focused entry into one
+            -- phrase.  Most entries are a single line, but multi-Run
+            -- formats appear (e.g. "Intellect Devourer received
+            -- Condition: Dash" where the condition name is a separate
+            -- styled Run).  Strip markup tags from each chunk.
+            local cleanedParts = {}
+            for _, entryText in ipairs(entryTexts) do
+                local cleaned = Helpers.StripMarkupTags(entryText)
+                if cleaned and cleaned ~= "" then
+                    cleanedParts[#cleanedParts + 1] = cleaned
+                end
+            end
+            if #cleanedParts == 0 then return "" end
+            return table.concat(cleanedParts, " ")
+        end
+
+        -- Selected ListBoxItem path: text comes from the entry's
+        -- elemText (the C++ extractor populates this from the
+        -- container's rendered text) or its templateTexts array.
+        if entry.elemText and entry.elemText ~= "" then
+            local cleaned = Helpers.StripMarkupTags(entry.elemText)
+            if cleaned and cleaned ~= "" then return cleaned end
+        end
+        if type(entry.templateTexts) == "table"
+            and #entry.templateTexts > 0 then
+            local parts = {}
+            for _, t in ipairs(entry.templateTexts) do
+                local cleaned = Helpers.StripMarkupTags(t)
+                if cleaned and cleaned ~= "" then
+                    parts[#parts + 1] = cleaned
+                end
+            end
+            if #parts > 0 then
+                return table.concat(parts, " ")
+            end
+        end
+        return ""
     end,
 })
 
--- Illithid power tree progression.
-local TadpoleHandler = CreatePanelHandler({
-    name = "TadpolePowers",
-    hint = false,
-})
+-- Brain panel handler is implemented in Client/TadpolePowers.lua to
+-- isolate the brain-specific complexity (cursor input, ExtenderData
+-- read for cost / recharge / duration / unavailable lines, prereq
+-- lookup, future snap-to-power navigation).
+local TadpoleHandler = BG3Access.Client.TadpolePowers
+    .CreateTadpoleHandler(CreatePanelHandler)
 
 -- Ground item or equipment slot picker.
 -- C++ post-processor extracts ObjectCollectionList[0].Title as
@@ -2622,7 +3986,7 @@ local SelectionFlyOutHandler = CreatePanelHandler({
         local hasWidgetThisTick = snapshot.widgetEvents
             and #snapshot.widgetEvents > 0
         local isScreenEntry = snapshot.selectionChanged
-            or (hasWidgetThisTick and not handlerState.lastSpokenTab)
+            or (hasWidgetThisTick and not handlerState.currentTabContext)
             or (snapshot.focusChanged and focusedElement.isTab)
         if isScreenEntry and handlerState.collectionTitle then
             speechData:Add("title", handlerState.collectionTitle, "brief")
@@ -2634,7 +3998,7 @@ local SelectionFlyOutHandler = CreatePanelHandler({
                 focusedElement.dcType)
         if not itemName or itemName == "" then
             itemName = Helpers.ExtractTextFromData(
-                focusedElement, handlerState.lastSpokenTab, isScreenEntry)
+                focusedElement, handlerState.currentTabContext, isScreenEntry)
         end
         if itemName and itemName ~= "" then
             speechData:Add("name", itemName, "brief")
@@ -2674,8 +4038,7 @@ local RewardHandler = CreatePanelHandler({
 local SavePopupHandler = CreatePanelHandler({
     name = "SavePopup",
     hint = "A to save. Y to rename. B to cancel.",
-    customItemFn = function(focusedElement, snapshot, effectiveTab,
-                            handlerState)
+    customItemFn = function(focusedElement, handlerState, snapshot)
         if focusedElement.elemType
             and focusedElement.elemType:find("TextBox") then
             return "Using your keyboard, type a name for this save."
@@ -2690,7 +4053,8 @@ local SavePopupHandler = CreatePanelHandler({
             if title and title ~= ""
                 and not title:match("^h%x+g")
                 and not title:find("%[ForceUpdate%]") then
-                handlerState.titleOverride = title
+                handlerState.screenEntryOverrides:Add(
+                    "title", title, "brief")
             end
         end
     end,
@@ -2935,6 +4299,7 @@ local TutorialHandler = CreatePanelHandler({
     name = "Tutorial",
     hint = "A to dismiss.",
     onWidgetAdded = function(widgetData, handlerState)
+        local overrides = handlerState.screenEntryOverrides
         -- Title from Tutorial sub-object in dcProps.
         local dcProps = widgetData and widgetData.dcProps
         if dcProps then
@@ -2944,30 +4309,32 @@ local TutorialHandler = CreatePanelHandler({
                 if title and title ~= ""
                     and not title:match("^h%x+g")
                     and not title:find("%[ForceUpdate%]") then
-                    handlerState.titleOverride = "Tutorial: " .. title
+                    overrides:Add("title",
+                        "Tutorial: " .. title, "brief")
                 end
                 local description = tutorial.DescriptionController
                     or tutorial.Description
                 if description and description ~= ""
                     and not description:match("^h%x+g")
                     and not description:find("%[ForceUpdate%]") then
-                    handlerState.bodyOverride = description
+                    overrides:Add("description", description, "normal")
                 end
             end
             -- Fallback: top-level Title/Text from dcProps.
-            if not handlerState.titleOverride then
+            if not overrides:HasField("title") then
                 local title = dcProps.Title or dcProps.Text
                 if title and title ~= ""
                     and not title:match("^h%x+g") then
-                    handlerState.titleOverride = "Tutorial: " .. title
+                    overrides:Add("title",
+                        "Tutorial: " .. title, "brief")
                 end
             end
         end
 
         -- Also try namedTexts for rendered TextBlock content.
         if widgetData and widgetData.namedTexts
-            and not handlerState.titleOverride
-            and not handlerState.bodyOverride then
+            and not overrides:HasField("title")
+            and not overrides:HasField("description") then
             local parts = {}
             for elementName, elementText in pairs(widgetData.namedTexts) do
                 if elementText and elementText ~= ""
@@ -2977,21 +4344,21 @@ local TutorialHandler = CreatePanelHandler({
                 end
             end
             if #parts > 0 then
-                handlerState.titleOverride = "Tutorial"
-                handlerState.bodyOverride = table.concat(parts, ". ")
+                overrides:Add("title", "Tutorial", "brief")
+                overrides:Add("description",
+                    table.concat(parts, ". "), "normal")
             end
         end
 
-        if handlerState.titleOverride or handlerState.bodyOverride then
-            Log.Info("TUTORIAL: title="
-                .. tostring(handlerState.titleOverride)
-                .. " body="
-                .. tostring(handlerState.bodyOverride
-                    and handlerState.bodyOverride:sub(1, 60)))
+        if overrides:HasField("title")
+            or overrides:HasField("description") then
+            local titleStr = overrides.coreFields["title"] or "(none)"
+            local bodyStr = overrides.coreFields["description"] or "(none)"
+            Log.Info("TUTORIAL: title=" .. titleStr
+                .. " body=" .. bodyStr:sub(1, 60))
         end
     end,
-    customItemFn = function(focusedElement, snapshot, tabName,
-                            handlerState)
+    customItemFn = function(focusedElement, handlerState, snapshot)
         -- Tutorial body arrives on the tick AFTER screen entry
         -- (dcProps not populated on the widget event tick).
         -- Check dcProps each tick for the Tutorial sub-object.
@@ -3033,12 +4400,12 @@ local MapHandler = CreatePanelHandler({
             local regionName =
                 widgetData.namedTexts.SubRegionName
             if regionName and regionName ~= "" then
-                handlerState.titleOverride = regionName
+                handlerState.screenEntryOverrides:Add(
+                    "title", regionName, "brief")
             end
         end
     end,
-    customItemFn = function(focusedElement, snapshot, tabName,
-                            handlerState)
+    customItemFn = function(focusedElement, handlerState, snapshot)
         -- Waypoint items: read the Name property.
         if not focusedElement then return nil, nil, nil end
         local dcProps = focusedElement.dcProps
@@ -3252,695 +4619,603 @@ local function NormalizeDCType(dcType)
     return dcType:gsub("^gui::", ""):gsub("^ls%.", "")
 end
 
-local DC_TYPE_HANDLERS = {
-    -- Character sheet / inventory
-    ["gui::DCCharacterPanels"]    = CharacterPanelHandler,
-    ["ls.DCCharacterPanels"]      = CharacterPanelHandler,
-    -- Trading
-    ["gui::DCTrade"]              = TradeHandler,
-    ["ls.DCTrade"]                = TradeHandler,
-    -- Container inventory (bags, pouches)
-    ["gui::DCContainerInventory"] = ContainerHandler,
-    ["ls.DCContainerInventory"]   = ContainerHandler,
-    -- Examine / inspect (widget DC is generic ls.Widget, so discovery
-    -- uses focused element DC types: VMRangeStat, VMResistance, etc.)
-    ["gui::DCExamine"]            = ExamineHandler,
-    ["ls.DCExamine"]              = ExamineHandler,
-    ["gui::VMRangeStat"]          = ExamineHandler,
-    ["ls.VMRangeStat"]            = ExamineHandler,
-    ["gui::VMResistance"]         = ExamineHandler,
-    ["ls.VMResistance"]           = ExamineHandler,
-    -- Dice rolls and reactions
-    ["gui::DCActiveRoll"]         = ActiveRollHandler,
-    ["ls.DCActiveRoll"]           = ActiveRollHandler,
-    ["gui::DCReactionDecision"]   = ReactionHandler,
-    ["ls.DCReactionDecision"]     = ReactionHandler,
-    -- Crafting
-    ["gui::DCAlchemy"]            = AlchemyHandler,
-    ["ls.DCAlchemy"]              = AlchemyHandler,
-    ["gui::DCCombine"]            = CombineHandler,
-    ["ls.DCCombine"]              = CombineHandler,
-    -- Item transfer
-    ["gui::DCDonate"]             = DonateHandler,
-    ["ls.DCDonate"]               = DonateHandler,
-    ["gui::DCPickpocket"]         = PickpocketHandler,
-    ["ls.DCPickpocket"]           = PickpocketHandler,
-    ["gui::DCLearnSpells"]        = LearnSpellsHandler,
-    ["ls.DCLearnSpells"]          = LearnSpellsHandler,
-    -- Spell book / actions
-    ["gui::VMSpellBook"]          = SpellBookHandler,
-    ["ls.VMSpellBook"]            = SpellBookHandler,
-    -- Camp / rest
-    ["gui::DCMakeCamp"]           = CampHandler,
-    ["ls.DCMakeCamp"]             = CampHandler,
-    -- Journal
-    ["gui::DCJournalQuests"]      = JournalQuestsHandler,
-    ["ls.DCJournalQuests"]        = JournalQuestsHandler,
-    ["gui::DCJournalDialogues"]   = JournalDialoguesHandler,
-    ["ls.DCJournalDialogues"]     = JournalDialoguesHandler,
-    -- Illithid powers
-    ["gui::DCTadpolePowersTree"]  = TadpoleHandler,
-    ["ls.DCTadpolePowersTree"]    = TadpoleHandler,
-    -- Selection / rewards
-    ["gui::DCSelectionFlyOut"]    = SelectionFlyOutHandler,
-    ["ls.DCSelectionFlyOut"]      = SelectionFlyOutHandler,
-    ["gui::DCActiveSearch"]       = SelectionFlyOutHandler,
-    ["ls.DCActiveSearch"]         = SelectionFlyOutHandler,
-    ["gui::DCRewardPanel"]        = RewardHandler,
-    ["ls.DCRewardPanel"]          = RewardHandler,
-    -- Popups
-    ["gui::DCNewSavegamePopup"]   = SavePopupHandler,
-    ["ls.DCNewSavegamePopup"]     = SavePopupHandler,
-    ["gui::DCProofOfHonour"]      = HonourHandler,
-    ["ls.DCProofOfHonour"]        = HonourHandler,
-    -- Settings (in-game)
-    ["gui::DCConnectivityMenu"]   = ConnectivityHandler,
-    ["ls.DCConnectivityMenu"]     = ConnectivityHandler,
-    ["gui::DCSignUp"]             = SignUpHandler,
-    ["ls.DCSignUp"]               = SignUpHandler,
-    ["gui::DCFirstTimeSetup"]     = FirstTimeSetupHandler,
-    ["ls.DCFirstTimeSetup"]       = FirstTimeSetupHandler,
-    ["gui::DCHDRCalibration"]     = HDRHandler,
-    ["ls.DCHDRCalibration"]       = HDRHandler,
-    ["gui::DCGammaCalibration"]   = GammaHandler,
-    ["ls.DCGammaCalibration"]     = GammaHandler,
-    ["gui::DCReport"]             = ReportHandler,
-    ["ls.DCReport"]               = ReportHandler,
-    -- Party portraits (LT from world)
-    ["gui::DCPartyLine"]          = PartyLineHandler,
-    ["ls.DCPartyLine"]            = PartyLineHandler,
-    -- Multiplayer lobby
-    ["gui::DCLobby"]              = LobbyHandler,
-    ["ls.DCLobby"]                = LobbyHandler,
-    -- Tutorial popups
-    ["gui::DCTutorial"]           = TutorialHandler,
-    ["ls.DCTutorial"]             = TutorialHandler,
-    -- Book / document viewer
-    ["gui::DCBook"]               = BookHandler,
-    ["ls.DCBook"]                 = BookHandler,
-    -- Map / waypoint fast travel
-    ["gui::DCJournalMap"]         = MapHandler,
-    ["ls.JournalMap"]             = MapHandler,
-}
-
--- All handler instances for batch reset.
-local ALL_PANEL_HANDLERS = {
-    CharacterPanelHandler,
-    SpellBookHandler,
-    TradeHandler,
-    ContainerHandler,
-    ExamineHandler,
-    ActiveRollHandler,
-    ReactionHandler,
-    AlchemyHandler,
-    CombineHandler,
-    DonateHandler,
-    PickpocketHandler,
-    LearnSpellsHandler,
-    CampHandler,
-    JournalQuestsHandler,
-    JournalDialoguesHandler,
-    CombatLogHandler,
-    TadpoleHandler,
-    SelectionFlyOutHandler,
-    RewardHandler,
-    SavePopupHandler,
-    HonourHandler,
-    ConnectivityHandler,
-    SignUpHandler,
-    FirstTimeSetupHandler,
-    HDRHandler,
-    GammaHandler,
-    ReportHandler,
-    PartyLineHandler,
-    LobbyHandler,
-    TutorialHandler,
-    BookHandler,
-    MapHandler,
-}
-
--- ============================================================================
--- Panel routing (active handler tracking)
--- ============================================================================
-
--- activePanelHandler and lastFocusedDCType are forward-declared near
--- the top of this file (before DispatchTooltip) so that DispatchTooltip's
--- closure captures the same locals that the routing functions set.
-
--- Previous handler: saved when an overlay panel (Container, etc.)
--- takes over from the base panel (CharacterPanel, Trade, etc.).
--- Restored when the overlay disappears (widget set shrinks).
-local previousPanelHandler = nil
-
--- Widget address (hex pointer string) of the widget the active handler
--- was activated against.  C++ emits snapshot.widgetAddrs (parallel to
--- snapshot.widgetDCTypes) so we can verify by identity, not DC type.
--- DC types lie for handlers whose top-level widget is generic
--- (ls.Widget) but whose nested content carries the distinctive DC
--- (ActiveRoll, SpellBook, etc.).  Widget addresses don't lie.
-local activePanelHandlerWidgetAddr   = nil
-local previousPanelHandlerWidgetAddr = nil
-
-
--- DC types that should only activate when the user explicitly focuses
--- or selects an element inside them (focusedElement/selectedElement),
--- never from widget scans or widgetDCTypes arrays.  These are HUD
--- elements that are always visible but only interactive when the user
--- navigates into them (e.g., LT for party).
-local DISCOVERY_ONLY_DC_TYPES = {
-    ["gui::DCPartyLine"] = true,
-    ["ls.DCPartyLine"]   = true,
-}
-
--- Widget name overrides: when an in-game widget has a generic
--- runtime DC (ls.Widget) so DC-type routing alone can't dispatch
--- it, register it here by its x:Name.  Same mechanism Menus.lua
--- uses for shortcutsMenu sharing gui::DCGameMenu with PauseMenu --
--- here it's used because the widget has no specialized DC at all.
+-- Per-handler registration list.  The dispatcher in
+-- Client/Dispatcher.lua reads these entries to resolve which handler
+-- owns a snapshot.  Each entry's openWhen declares the signals that
+-- identify the panel; dcTypes are matched against widget DCs AND
+-- focused/selected element DCs (for per-item ViewModels like
+-- VMSpellBook, VMRangeStat, etc.).
 --
--- Confirmed via debug log "WIDGET EVENT: dcType=ls.Widget
--- name=JournalCombatLog_c" that Combat Log uses ls.Widget at
--- runtime; no DC key would match.
-local WIDGET_NAME_HANDLERS = {
-    ["JournalCombatLog_c"] = CombatLogHandler,
-    -- PartyLineActive_c: the expanded party panel that opens on LT.
-    -- Shares ls.DCPartyLine with PartyLine_c (HUD portrait row), so
-    -- the DC alone can't disambiguate.  PartyLine_c is in
-    -- DISCOVERY_ONLY_DC_TYPES because it's HUD noise; this name
-    -- override lets PartyLineActive_c bypass that filter and
-    -- activate PartyLineHandler properly when the user opens the
-    -- party panel.
-    ["PartyLineActive_c"]  = PartyLineHandler,
-    -- SpellBook_c: the widget itself doesn't carry ls.VMSpellBook --
-    -- that DC is only on an inner DataContext element.  So the
-    -- widget-DC routing path can't recognize SpellBook from the
-    -- widgetAdded event; routing has to wait for a focused element
-    -- to surface ls.VMSpellBook, which races against Menus' default
-    -- MainMenu fallback and loses on cold loads.  Name-based
-    -- routing closes the race: on the widgetAdded event itself we
-    -- recognize SpellBook_c and route to WorldUI deterministically,
-    -- regardless of cache state.
-    ["SpellBook_c"]        = SpellBookHandler,
+-- Defaults: activateMode = "auto", canStack = false.  Override on
+-- entries that need different behavior:
+--   - PartyLine uses activateMode="explicit" because it's the always-
+--     loaded HUD portrait row; pickup must NOT auto-activate it.
+--     Explicit activation comes from a widgetAdded event on
+--     PartyLineActive_c (the LT-opened party panel).
+--   - Panels that commonly have overlays opening on top (Container,
+--     Examine, Compare, etc. opening over CharacterPanel) set
+--     canStack=true so the underlying panel resumes when the overlay
+--     closes.  Panels that don't typically host overlays leave
+--     canStack=false (default) -- harmless if overridden either way,
+--     but precise registration documents intent.
+local registeredPanelHandlers = {
+    -- Character sheet / inventory.  Bottom of most overlay stacks
+    -- (containers and examines pop on top of it), so canStack=true.
+    {
+        name    = "CharacterPanel",
+        handler = CharacterPanelHandler,
+        canStack = true,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCCharacterPanels"] = true,
+                ["ls.DCCharacterPanels"]   = true,
+            },
+        },
+    },
+    -- Spell book.  Outer widget DC is generic (ls.Widget); the
+    -- identifying signal is ls.VMSpellBook on focused/selected
+    -- elements, plus the SpellBook_c widget x:Name.
+    {
+        name    = "SpellBook",
+        handler = SpellBookHandler,
+        canStack = true,
+        openWhen = {
+            widgetNames = { ["SpellBook_c"] = true },
+            dcTypes = {
+                ["gui::VMSpellBook"] = true,
+                ["ls.VMSpellBook"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Trade",
+        handler = TradeHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCTrade"] = true,
+                ["ls.DCTrade"]   = true,
+            },
+        },
+    },
+    -- Container inventory (bags, pouches).  Common overlay over
+    -- CharacterPanel.
+    {
+        name    = "Container",
+        handler = ContainerHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCContainerInventory"] = true,
+                ["ls.DCContainerInventory"]   = true,
+            },
+        },
+    },
+    -- Examine / inspect.  Widget DC is generic ls.Widget, so the
+    -- identifying signal is per-item VMs (VMRangeStat, VMResistance)
+    -- on the focused element.
+    {
+        name    = "Examine",
+        handler = ExamineHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCExamine"]    = true,
+                ["ls.DCExamine"]      = true,
+                ["gui::VMRangeStat"]  = true,
+                ["ls.VMRangeStat"]    = true,
+                ["gui::VMResistance"] = true,
+                ["ls.VMResistance"]   = true,
+            },
+        },
+    },
+    {
+        name    = "ActiveRoll",
+        handler = ActiveRollHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCActiveRoll"] = true,
+                ["ls.DCActiveRoll"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Reaction",
+        handler = ReactionHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCReactionDecision"] = true,
+                ["ls.DCReactionDecision"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Alchemy",
+        handler = AlchemyHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCAlchemy"] = true,
+                ["ls.DCAlchemy"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Combine",
+        handler = CombineHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCCombine"] = true,
+                ["ls.DCCombine"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Donate",
+        handler = DonateHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCDonate"] = true,
+                ["ls.DCDonate"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Pickpocket",
+        handler = PickpocketHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCPickpocket"] = true,
+                ["ls.DCPickpocket"]   = true,
+            },
+        },
+    },
+    {
+        name    = "LearnSpells",
+        handler = LearnSpellsHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCLearnSpells"] = true,
+                ["ls.DCLearnSpells"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Camp",
+        handler = CampHandler,
+        canStack = true,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCMakeCamp"] = true,
+                ["ls.DCMakeCamp"]   = true,
+            },
+        },
+    },
+    {
+        name    = "JournalQuests",
+        handler = JournalQuestsHandler,
+        canStack = true,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCJournalQuests"] = true,
+                ["ls.DCJournalQuests"]   = true,
+            },
+        },
+    },
+    {
+        name    = "JournalDialogues",
+        handler = JournalDialoguesHandler,
+        canStack = true,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCJournalDialogues"] = true,
+                ["ls.DCJournalDialogues"]   = true,
+            },
+        },
+    },
+    -- Inspiration: DC type confirmed via the keyboard sibling
+    -- JournalInspiration.xaml which declares
+    -- ls:UIWidget.ContextName="JournalInspiration" and
+    -- d:DesignInstance {x:Type ls:DCJournalInspiration}.  The
+    -- controller variant JournalInspiration_c.xaml omits the redeclare
+    -- but inherits the same DC via the state machine binding (same
+    -- pattern as all other journal _c variants).
+    {
+        name    = "JournalInspiration",
+        handler = JournalInspirationHandler,
+        canStack = true,
+        openWhen = {
+            widgetNames = { ["JournalInspiration_c"] = true },
+            dcTypes = {
+                ["gui::DCJournalInspiration"] = true,
+                ["ls.DCJournalInspiration"]   = true,
+            },
+        },
+    },
+    -- Tutorials: ls:UIWidget.ContextName="JournalTutorial" with
+    -- d:DesignInstance {x:Type ls:JournalTutorial} -- DC type is
+    -- ls.JournalTutorial (note: NOT a DC* prefix; this one is named
+    -- after the VM directly).
+    {
+        name    = "JournalTutorials",
+        handler = JournalTutorialsHandler,
+        canStack = true,
+        openWhen = {
+            widgetNames = { ["JournalTutorials_c"] = true },
+            dcTypes = {
+                ["gui::JournalTutorial"] = true,
+                ["ls.JournalTutorial"]   = true,
+            },
+        },
+    },
+    -- Combat log.  Outer widget has generic ls.Widget DC; identify
+    -- by widget x:Name only.
+    {
+        name    = "CombatLog",
+        handler = CombatLogHandler,
+        openWhen = {
+            widgetNames = { ["JournalCombatLog_c"] = true },
+        },
+    },
+    {
+        name    = "Tadpole",
+        handler = TadpoleHandler,
+        openWhen = {
+            -- widgetNames is the stable liveness signal: the
+            -- TadpolePowersTree_c widget has an x:Name in the XAML
+            -- and stays in snapshot.allWidgetNames as long as the
+            -- panel is loaded.  dcTypes is also listed but it can
+            -- transiently report empty in allWidgetDCTypes when the
+            -- DC swap fires (cutscene-overlay events trigger this
+            -- every couple seconds), which would falsely deactivate
+            -- this handler if widgetNames weren't there as backstop.
+            widgetNames = { ["TadpolePowersTree_c"] = true },
+            dcTypes = {
+                ["gui::DCTadpolePowersTree"] = true,
+                ["ls.DCTadpolePowersTree"]   = true,
+            },
+        },
+    },
+    {
+        name    = "SelectionFlyOut",
+        handler = SelectionFlyOutHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCSelectionFlyOut"] = true,
+                ["ls.DCSelectionFlyOut"]   = true,
+                ["gui::DCActiveSearch"]    = true,
+                ["ls.DCActiveSearch"]      = true,
+            },
+        },
+    },
+    {
+        name    = "Reward",
+        handler = RewardHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCRewardPanel"] = true,
+                ["ls.DCRewardPanel"]   = true,
+            },
+        },
+    },
+    {
+        name    = "SavePopup",
+        handler = SavePopupHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCNewSavegamePopup"] = true,
+                ["ls.DCNewSavegamePopup"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Honour",
+        handler = HonourHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCProofOfHonour"] = true,
+                ["ls.DCProofOfHonour"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Connectivity",
+        handler = ConnectivityHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCConnectivityMenu"] = true,
+                ["ls.DCConnectivityMenu"]   = true,
+            },
+        },
+    },
+    {
+        name    = "SignUp",
+        handler = SignUpHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCSignUp"] = true,
+                ["ls.DCSignUp"]   = true,
+            },
+        },
+    },
+    {
+        name    = "FirstTimeSetup",
+        handler = FirstTimeSetupHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCFirstTimeSetup"] = true,
+                ["ls.DCFirstTimeSetup"]   = true,
+            },
+        },
+    },
+    {
+        name    = "HDR",
+        handler = HDRHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCHDRCalibration"] = true,
+                ["ls.DCHDRCalibration"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Gamma",
+        handler = GammaHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCGammaCalibration"] = true,
+                ["ls.DCGammaCalibration"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Report",
+        handler = ReportHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCReport"] = true,
+                ["ls.DCReport"]   = true,
+            },
+        },
+    },
+    -- Party line: HUD portrait row that's always loaded.  Auto-pickup
+    -- must NOT activate it -- only an explicit widgetAdded event for
+    -- the PartyLineActive_c widget (the LT-opened party panel) does.
+    {
+        name         = "PartyLine",
+        handler      = PartyLineHandler,
+        activateMode = "explicit",
+        openWhen = {
+            -- PartyLineActive_c is the navigable LT panel.  PartyLine_c
+            -- (the HUD row) shares the DC but uses a different x:Name;
+            -- name-based registration distinguishes them.  An explicit
+            -- widgetAdded event on PartyLineActive_c activates this
+            -- handler; nothing else does.
+            widgetNames = { ["PartyLineActive_c"] = true },
+            dcTypes = {
+                ["gui::DCPartyLine"] = true,
+                ["ls.DCPartyLine"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Lobby",
+        handler = LobbyHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCLobby"] = true,
+                ["ls.DCLobby"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Tutorial",
+        handler = TutorialHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCTutorial"] = true,
+                ["ls.DCTutorial"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Book",
+        handler = BookHandler,
+        canStack = true,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCBook"] = true,
+                ["ls.DCBook"]   = true,
+            },
+        },
+    },
+    {
+        name    = "Map",
+        handler = MapHandler,
+        openWhen = {
+            dcTypes = {
+                ["gui::DCJournalMap"] = true,
+                ["ls.JournalMap"]     = true,
+            },
+        },
+    },
 }
 
---- IsWorldDCType: returns true if the given DC type belongs to an
---- in-game panel handled by WorldUI.
---- @param dcType string  The DataContext type from a widget.
---- @return boolean
-local function IsWorldDCType(dcType)
-    if not dcType then return false end
-    if DISCOVERY_ONLY_DC_TYPES[dcType] then return false end
-    return DC_TYPE_HANDLERS[dcType] ~= nil
-end
+-- ============================================================================
+-- Dispatcher
+-- ============================================================================
+--
+-- The dispatcher in Client/Dispatcher.lua handles handler lifecycle:
+-- liveness checks, widget-event activation, pickup, overlay stacking
+-- (canStack), explicit-only activation (activateMode), reset.  All the
+-- old per-module ad-hoc state (activePanelHandler, previousPanelHandler,
+-- activePanelHandlerWidgetAddr, activePanelHandlerDCType, DC_TYPE_HANDLERS,
+-- WIDGET_NAME_HANDLERS, DISCOVERY_ONLY_DC_TYPES, ALL_PANEL_HANDLERS) is
+-- replaced by registeredPanelHandlers + Dispatcher.Create.
 
---- IsWorldWidgetName: returns true if the given widget x:Name
---- belongs to an in-game panel handled by WorldUI via widget-name
---- routing (used when the widget has a generic ls.Widget DC).
---- EventRouter consults this for generic-DC widget events to
---- decide whether to forward to WorldUI even when routeToWorld is
---- currently false (e.g. opening Combat Log from the shortcuts
---- radial while ShortcutsMenuHandler is the active Menus handler).
---- @param widgetName string  The widget x:Name from a widget event.
---- @return boolean
-local function IsWorldWidgetName(widgetName)
-    if not widgetName then return false end
-    return WIDGET_NAME_HANDLERS[widgetName] ~= nil
-end
+local Dispatcher = BG3Access.Client.Dispatcher
 
-
---- HandlePanelWidgetAdded: called by EventRouter when a WorldUI panel
---- widget appears.  Updates the active handler and calls its hook.
---- Saves the previous handler so overlays can restore it on close.
---- @param widgetData table  The widget data from the snapshot.
-local function HandlePanelWidgetAdded(widgetData)
-    if not widgetData or not widgetData.dcType then return end
-
-    -- Skip discovery-only DC types: these are HUD widgets that fire
-    -- on every scan but should only activate when focus enters them.
-    -- Discovery-only DC types are HUD elements that share a DC with
-    -- a real navigable panel (ls.DCPartyLine: PartyLine_c is the
-    -- always-visible HUD portrait row, while PartyLineActive_c is
-    -- the LT-opened party panel that should activate as a panel
-    -- handler).  Skip the DC filter when the widget x:Name matches
-    -- a known active panel name -- the name disambiguates the two
-    -- cases that the DC type alone cannot.
-    if DISCOVERY_ONLY_DC_TYPES[widgetData.dcType]
-        and not (widgetData.elemName
-            and WIDGET_NAME_HANDLERS[widgetData.elemName]) then
-        return
-    end
-
-    -- Resolve handler: DC type first (the common case), then
-    -- widget x:Name (for in-game widgets with generic ls.Widget
-    -- DCs that can't be routed by type alone, OR for widgets that
-    -- share a DC with a discovery-only HUD element and need the
-    -- name to disambiguate).
-    local newHandler = nil
-    if widgetData.elemName
-        and WIDGET_NAME_HANDLERS[widgetData.elemName] then
-        newHandler = WIDGET_NAME_HANDLERS[widgetData.elemName]
-    end
-    if not newHandler then
-        newHandler = DC_TYPE_HANDLERS[widgetData.dcType]
-    end
-    if not newHandler then return end
-
-    if newHandler ~= activePanelHandler then
+local worldUIDispatcher_Create = Dispatcher.Create({
+    name = "WorldUI",
+    handlers = registeredPanelHandlers,
+    -- Skip dispatch entirely while a radial menu is open.  Radial
+    -- slot changes are handled by HandleRadialSlot, not panel
+    -- discovery; otherwise PartyLine or other background DC types
+    -- would activate a panel handler during radial use.
+    skipWhen = function(snapshot)
+        return inRadial == true
+    end,
+    onActivate = function(entry)
         -- Close detail/compare views when active handler changes
         -- (overlay took over, tab switch, etc.) so their d-pad
         -- subscriptions don't persist into the new context.
         CloseDetailView(true)
         CloseCompareView(true)
-        if activePanelHandler then
-            -- Save for restoration when overlay closes.
-            -- Do NOT reset the previous handler -- its state (tabHintSpoken,
-            -- lastSpokenTab, etc.) must be preserved intact so the hint
-            -- doesn't re-speak when the overlay closes and the handler is
-            -- restored.
-            previousPanelHandler = activePanelHandler
-            previousPanelHandlerWidgetAddr = activePanelHandlerWidgetAddr
-        end
-        activePanelHandler = newHandler
-        -- Anchor the handler to this specific widget's address.  Used
-        -- by close detection to verify presence by identity, not by
-        -- DC type.
-        activePanelHandlerWidgetAddr = widgetData.widgetRootId
-        Log.Info("Active panel: " .. activePanelHandler.name
-            .. " (dc=" .. widgetData.dcType
-            .. " widget=" .. tostring(activePanelHandlerWidgetAddr) .. ")")
-    end
+    end,
+    onDeactivate = function(entry)
+        -- Same teardown as onActivate.  Detail / compare views
+        -- assume an active handler context.
+        CloseDetailView(true)
+    end,
+})
+-- Assign to the forward-declared upvalue so closures earlier in
+-- this file (DispatchTooltip etc.) can query the dispatcher.
+worldUIDispatcher = worldUIDispatcher_Create
 
-    activePanelHandler.HandleWidgetAdded(widgetData)
+--- IsWorldDCType: thin wrapper exposing the dispatcher's DC-type
+--- registration check.  Returns false for the PartyLine HUD DC types
+--- since PartyLine uses activateMode="explicit" -- those DC types
+--- don't trigger world routing on their own (the explicit signal
+--- would be a widgetAdded event for PartyLineActive_c).
+local function IsWorldDCType(dcType)
+    if not dcType then return false end
+    -- PartyLine HUD DC: skip the DC check.  PartyLineActive_c (the
+    -- LT panel) gets routed via widget-name match through
+    -- IsWorldWidgetName / HandlePanelWidgetAdded; the bare DC alone
+    -- shouldn't flip routing to world.
+    if dcType == "gui::DCPartyLine" or dcType == "ls.DCPartyLine" then
+        return false
+    end
+    return worldUIDispatcher:IsRegisteredDCType(dcType)
 end
 
---- HandlePanelWidgetRootChanged: called by EventRouter when the widget
---- root changes while a WorldUI panel is active.
-local function HandlePanelWidgetRootChanged()
-    if activePanelHandler then
-        activePanelHandler.ResetNavigation()
-    end
-end
-
---- RoutePanelSnapshot: called by EventRouter for all snapshots when
---- a WorldUI panel is active.
---- @param snapshot table  The full TickSnapshot from C++.
-local function RoutePanelSnapshot(snapshot)
-    -- Radial is active (RT shortcuts or RB action radial).  Radial slot
-    -- changes are handled by HandleRadialSlot via EventRouter, not by
-    -- panel discovery.  Skip discovery to avoid PartyLine or other
-    -- background DC types activating a panel handler during radial use.
-    if inRadial then return end
-
-    if not activePanelHandler then
-        -- Attempt handler discovery from snapshot data before falling
-        -- back to Menus.  This handles panels whose widget DC type is
-        -- generic (ls.Widget) but whose selected/focused element DC type
-        -- identifies the panel (e.g., ls.VMSpellBook on the tab).
-        local discoveredHandler = nil
-        if snapshot.focusedElement and snapshot.focusedElement.dcType then
-            discoveredHandler = DC_TYPE_HANDLERS[
-                snapshot.focusedElement.dcType]
+--- IsWorldWidgetName: returns true if any registered handler claims
+--- this widget x:Name in its openWhen.widgetNames set.
+local function IsWorldWidgetName(widgetName)
+    if not widgetName or widgetName == "" then return false end
+    for _, entry in ipairs(registeredPanelHandlers) do
+        local criterion = entry.openWhen
+        if criterion and criterion.widgetNames
+            and criterion.widgetNames[widgetName] then
+            return true
         end
-        -- Selected element: tab ListBoxItems carry the panel DC type
-        -- (e.g., ls.VMSpellBook) even when the focused element is a
-        -- child action (ls.VMActionGroup, ls.VMCharacterAction).
-        if not discoveredHandler
-            and snapshot.selectedElement
-            and snapshot.selectedElement.dcType then
-            discoveredHandler = DC_TYPE_HANDLERS[
-                snapshot.selectedElement.dcType]
-        end
-        -- Widget added on this tick: check widgetDCTypes for a
-        -- non-discovery type first.  widgetData.dcType may have been
-        -- overwritten by a background widget (PartyLine_c processed
-        -- last by C++) so it cannot be trusted directly.
-        if not discoveredHandler
-            and snapshot.widgetAdded and snapshot.widgetDCTypes then
-            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-                if not DISCOVERY_ONLY_DC_TYPES[widgetDCType] then
-                    discoveredHandler = DC_TYPE_HANDLERS[widgetDCType]
-                    if discoveredHandler then break end
-                end
-            end
-        end
-        -- If no non-discovery handler found but a widget event this
-        -- tick has a discovery type, allow it only when no HANDLED
-        -- non-discovery type exists in widgetDCTypes.  Unhandled HUD
-        -- types like gui::DCOverlay, gui::DCCombatants are always
-        -- present and must not block genuine LT opens (PartyLineActive_c
-        -- is the only HANDLED new widget, alongside unhandled HUD noise).
-        if not discoveredHandler
-            and snapshot.widgetAdded and snapshot.widgetEvents then
-            local discoveryEvent = nil
-            for _, widgetEvent in ipairs(snapshot.widgetEvents) do
-                if widgetEvent.dcType
-                    and DISCOVERY_ONLY_DC_TYPES[widgetEvent.dcType] then
-                    discoveryEvent = widgetEvent
-                    break
-                end
-            end
-            if discoveryEvent then
-                local hasHandledNonDiscovery = false
-                if snapshot.widgetDCTypes then
-                    for _, widgetDCType in ipairs(
-                            snapshot.widgetDCTypes) do
-                        if not DISCOVERY_ONLY_DC_TYPES[widgetDCType]
-                            and DC_TYPE_HANDLERS[widgetDCType] then
-                            hasHandledNonDiscovery = true
-                            break
-                        end
-                    end
-                end
-                if not hasHandledNonDiscovery then
-                    discoveredHandler = DC_TYPE_HANDLERS[
-                        discoveryEvent.dcType]
-                end
-            end
-        end
-        -- Fallback: check all widget DC types from this tick, but
-        -- skip discovery-only types (always-present HUD widgets).
-        if not discoveredHandler and snapshot.widgetDCTypes then
-            for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
-                if not DISCOVERY_ONLY_DC_TYPES[widgetDCType] then
-                    discoveredHandler = DC_TYPE_HANDLERS[widgetDCType]
-                    if discoveredHandler then break end
-                end
-            end
-        end
-        if discoveredHandler then
-            activePanelHandler = discoveredHandler
-            -- Anchor to the widget that carried the identifying DC.
-            -- Prefer focused, then selected, then the first matching
-            -- widget in widgetDCTypes (fallback for widget-level
-            -- discovery).  widgetRootId is set on every FocusEventData.
-            activePanelHandlerWidgetAddr = nil
-            if snapshot.focusedElement
-                and snapshot.focusedElement.widgetRootId
-                and snapshot.focusedElement.widgetRootId ~= "" then
-                activePanelHandlerWidgetAddr =
-                    snapshot.focusedElement.widgetRootId
-            elseif snapshot.selectedElement
-                and snapshot.selectedElement.widgetRootId
-                and snapshot.selectedElement.widgetRootId ~= "" then
-                activePanelHandlerWidgetAddr =
-                    snapshot.selectedElement.widgetRootId
-            elseif snapshot.widgetDCTypes and snapshot.widgetAddrs then
-                for widgetIndex, widgetDCType in ipairs(
-                        snapshot.widgetDCTypes) do
-                    if DC_TYPE_HANDLERS[widgetDCType]
-                            == discoveredHandler then
-                        activePanelHandlerWidgetAddr =
-                            snapshot.widgetAddrs[widgetIndex]
-                        break
-                    end
-                end
-            end
-            Log.Info("Active panel (discovered): "
-                .. activePanelHandler.name
-                .. " widget=" .. tostring(activePanelHandlerWidgetAddr))
-            -- Handler just activated -- deliver snapshot and return.
-            -- Skip close detection on this snapshot: widgetDCTypes
-            -- cache is stale (built early in tick before the widget
-            -- became visible) and would falsely deactivate the handler.
-            activePanelHandler.HandleSnapshot(snapshot)
-            return
-        else
-            -- No WorldUI panel handler found.  Check if the snapshot
-            -- contains a menu-worthy DC type (e.g., gui::DCGameMenu
-            -- from the shortcuts menu).  Menus on separate visual
-            -- layers don't generate widget events so they reach here
-            -- with routeToWorld still true.  Only fall back to Menus
-            -- when a genuine menu signal is present.  Without this
-            -- guard, HUD widget text (Overlay, Actions, etc.) would
-            -- be spoken as menu content when returning to the world
-            -- after closing any panel.
-            local Menus = BG3Access.Client.Menus
-            if Menus then
-                local hasMenuSignal = false
-                -- Check focused element dcType.
-                if snapshot.focusedElement
-                    and snapshot.focusedElement.dcType
-                    and Menus.IsMenuDCType(
-                        snapshot.focusedElement.dcType) then
-                    hasMenuSignal = true
-                end
-                -- Check selected element dcType.
-                if not hasMenuSignal
-                    and snapshot.selectedElement
-                    and snapshot.selectedElement.dcType
-                    and Menus.IsMenuDCType(
-                        snapshot.selectedElement.dcType) then
-                    hasMenuSignal = true
-                end
-                -- Check widget DC types from the scan.
-                if not hasMenuSignal and snapshot.widgetDCTypes then
-                    for _, widgetDCType in ipairs(
-                            snapshot.widgetDCTypes) do
-                        if Menus.IsMenuDCType(widgetDCType) then
-                            hasMenuSignal = true
-                            break
-                        end
-                    end
-                end
-                if hasMenuSignal then
-                    Log.Info("RoutePanelSnapshot: menu DC type "
-                        .. "detected, falling back to Menus")
-                    Menus.RouteSnapshot(snapshot)
-                else
-                    Log.Debug("RoutePanelSnapshot: no panel or "
-                        .. "menu handler, suppressing HUD noise")
-                end
-            end
-            return
-        end
-    end
-
-    -- Event-driven handler lifetime: the only close trigger is C++
-    -- firing widgetRemoved with a widget address matching our anchor.
-    -- No polling of widgetAddrs, no inference from "anchor not present"
-    -- -- the tracked-widget array is noisy for specific widgets (BG3
-    -- rebuilds pointers / transient visibility flips), so using it as
-    -- a presence oracle produces false-positive closes.  widgetRemoved
-    -- is an explicit event and fires exactly when a widget genuinely
-    -- goes invisible.
-    if snapshot.widgetRemoved and snapshot.removedWidgetData then
-        local removedAddr = snapshot.removedWidgetData.widgetRootId
-        if removedAddr and removedAddr ~= "" then
-            if removedAddr == activePanelHandlerWidgetAddr then
-                -- Overlay close: try to restore the previous panel
-                -- handler IF its widget is actually still alive.
-                -- The widget-removed event fires unreliably when a
-                -- panel closes (sibling widget removal can be the
-                -- only signal we see), so previousPanelHandler may
-                -- be pointing at a stale address whose widget
-                -- vanished without us being told.  Verify by
-                -- walking snapshot.widgetAddrs for the address.
-                -- If gone, clear instead of restore -- restoring a
-                -- dead handler causes it to swallow events meant
-                -- for whichever panel actually opens next (e.g.
-                -- examine-close-then-LT routes PartyLine focus
-                -- events through stale CharacterPanel and reads
-                -- "10/10" as if it were a character sheet item).
-                local previousAlive = false
-                if previousPanelHandler
-                    and previousPanelHandlerWidgetAddr
-                    and snapshot.widgetAddrs then
-                    for _, addrStr in ipairs(snapshot.widgetAddrs) do
-                        if addrStr == previousPanelHandlerWidgetAddr then
-                            previousAlive = true
-                            break
-                        end
-                    end
-                end
-
-                if previousPanelHandler and previousAlive then
-                    Log.Info("Overlay closed, restoring: "
-                        .. previousPanelHandler.name)
-                    activePanelHandler.ResetState()
-                    activePanelHandler = previousPanelHandler
-                    activePanelHandlerWidgetAddr =
-                        previousPanelHandlerWidgetAddr
-                    previousPanelHandler = nil
-                    previousPanelHandlerWidgetAddr = nil
-                else
-                    if previousPanelHandler then
-                        Log.Info("Overlay closed but previous panel "
-                            .. "widget is gone, clearing both: "
-                            .. activePanelHandler.name .. " + "
-                            .. previousPanelHandler.name)
-                        previousPanelHandler.ResetState()
-                        previousPanelHandler = nil
-                        previousPanelHandlerWidgetAddr = nil
-                    else
-                        Log.Info("Panel closed, deactivating: "
-                            .. activePanelHandler.name
-                            .. " widget="
-                            .. tostring(activePanelHandlerWidgetAddr))
-                    end
-                    CloseDetailView(true)
-                    activePanelHandler.ResetState()
-                    activePanelHandler = nil
-                    activePanelHandlerWidgetAddr = nil
-                    return
-                end
-            elseif removedAddr == previousPanelHandlerWidgetAddr then
-                -- The underlying panel's widget is gone (e.g. user
-                -- navigated away while an overlay was active).  Drop
-                -- the saved previous handler so we don't try to
-                -- restore to a panel that no longer exists.
-                Log.Info("Previous panel widget removed, clearing: "
-                    .. previousPanelHandler.name)
-                previousPanelHandler.ResetState()
-                previousPanelHandler = nil
-                previousPanelHandlerWidgetAddr = nil
-            end
-        end
-    end
-
-    -- Track focused element dcType for customTooltipFn context.
-    if snapshot.focusedElement and snapshot.focusedElement.dcType then
-        lastFocusedDCType = snapshot.focusedElement.dcType
-    end
-    activePanelHandler.HandleSnapshot(snapshot)
-end
-
---- ResetAllPanelHandlers: called on GameStateChanged or when switching
---- away from WorldUI panels.  Resets all handler state.
-local function ResetAllPanelHandlers()
-    -- Close detail view silently (no "closed" announcement during teardown).
-    CloseDetailView(true)
-    for handlerIndex = 1, #ALL_PANEL_HANDLERS do
-        ALL_PANEL_HANDLERS[handlerIndex].ResetState()
-    end
-    activePanelHandler = nil
-    activePanelHandlerWidgetAddr = nil
-    previousPanelHandler = nil
-    previousPanelHandlerWidgetAddr = nil
-end
-
---- TryActivateFromSnapshot: attempt to discover and activate a panel
---- handler from snapshot data.  Called by EventRouter's late detection
---- when the widget DC type was generic (ls.Widget) and no handler was
---- activated through the normal widget event path.  All detection logic
---- lives here so EventRouter stays a dumb router.
---- @param snapshot table  The full TickSnapshot from C++.
---- @return boolean  True if a handler was activated.
-local function TryActivateFromSnapshot(snapshot)
-    local panelDCType = nil
-    -- Check focused element dcType.
-    if snapshot.focusedElement and snapshot.focusedElement.dcType then
-        if DC_TYPE_HANDLERS[snapshot.focusedElement.dcType] then
-            panelDCType = snapshot.focusedElement.dcType
-        end
-    end
-    -- Check selected element dcType: tab ListBoxItems carry the panel
-    -- DC type (e.g., ls.VMSpellBook) even when the focused element is
-    -- a child (ls.VMActionGroup, ls.VMCharacterAction).
-    if not panelDCType
-        and snapshot.selectedElement
-        and snapshot.selectedElement.dcType then
-        if DC_TYPE_HANDLERS[snapshot.selectedElement.dcType] then
-            panelDCType = snapshot.selectedElement.dcType
-        end
-    end
-    -- Widget added on this tick: freshly opened panel, allow all
-    -- types.  Iterate all widget events so we don't miss a handled
-    -- panel DC type that fired alongside a generic widget event.
-    if not panelDCType
-        and snapshot.widgetAdded and snapshot.widgetEvents then
-        for _, widgetEvent in ipairs(snapshot.widgetEvents) do
-            if widgetEvent.dcType
-                and DC_TYPE_HANDLERS[widgetEvent.dcType] then
-                panelDCType = widgetEvent.dcType
-                break
-            end
-        end
-    end
-    -- Fallback: map the focused element's widget root to a known
-    -- panel DC type via widgetAddrs / widgetDCTypes (parallel arrays
-    -- in the snapshot).
-    --
-    -- This replaces the prior "scan widgetDCTypes, pick the first
-    -- known panel type" behaviour which hijacked routing the instant
-    -- the user opened the pause menu after a skill check: PauseMenu
-    -- activated, then the very next focus tick saw DCActiveRoll still
-    -- in widgetDCTypes (C++ widget scan hadn't yet noticed the
-    -- ActiveRoll widget went invisible) and Strategy 4 happily flipped
-    -- routeToWorld back to true, starving the pause menu of everything
-    -- past "Resume".
-    --
-    -- The correct gate is: only activate a panel whose widget the
-    -- user's focus is actually INSIDE.  focusedElement.widgetRootId
-    -- identifies the containing widget; pairing that with widgetAddrs
-    -- / widgetDCTypes gives us that widget's DC type.  If the focus
-    -- moved to a pause-menu button, the widget root is the pause menu
-    -- widget and no world-panel DC type matches -- correct.
-    -- Pair widgetRootId with the parallel widget arrays to find the
-    -- containing widget's DC type AND x:Name.  We track both so a
-    -- generic-DC widget (e.g. JournalCombatLog_c whose runtime DC is
-    -- ls.Widget) can still be routed via WIDGET_NAME_HANDLERS even
-    -- when no widgetAdded event fired this tick.
-    local widgetXName = nil
-    if not panelDCType
-        and snapshot.focusedElement
-        and snapshot.focusedElement.widgetRootId
-        and snapshot.focusedElement.widgetRootId ~= ""
-        and snapshot.widgetDCTypes
-        and snapshot.widgetAddrs then
-        local focusedWidgetRootId =
-            snapshot.focusedElement.widgetRootId
-        for widgetIndex, widgetAddr in ipairs(snapshot.widgetAddrs) do
-            if widgetAddr == focusedWidgetRootId then
-                local widgetDCType = snapshot.widgetDCTypes[widgetIndex]
-                if widgetDCType
-                    and not DISCOVERY_ONLY_DC_TYPES[widgetDCType]
-                    and DC_TYPE_HANDLERS[widgetDCType] then
-                    panelDCType = widgetDCType
-                end
-                -- Capture x:Name in parallel so we can fall back to
-                -- widget-name routing when the DC is generic.  The
-                -- snapshot.widgetNames array lands here from the C++
-                -- side via the same SEH-protected pass that already
-                -- populates widgetDCTypes / widgetAddrs.
-                if snapshot.widgetNames then
-                    widgetXName = snapshot.widgetNames[widgetIndex]
-                end
-                break
-            end
-        end
-    end
-    if panelDCType then
-        local syntheticWidgetData = {
-            dcType = panelDCType,
-            elemName = widgetXName
-                or (snapshot.focusedElement
-                    and snapshot.focusedElement.widgetRootId)
-                or nil,
-        }
-        HandlePanelWidgetAdded(syntheticWidgetData)
-        return activePanelHandler ~= nil
-    end
-    -- Widget-name fallback: when DC is generic (or DC routing didn't
-    -- match a registered handler) but the widget x:Name is in
-    -- WIDGET_NAME_HANDLERS, synthesise a widgetAdded for the
-    -- name-based handler.  This is what activates Combat Log when
-    -- it opens via the shortcuts radial without firing a fresh
-    -- widget event.
-    if widgetXName and WIDGET_NAME_HANDLERS[widgetXName] then
-        local syntheticWidgetData = {
-            dcType = "ls.Widget",
-            elemName = widgetXName,
-        }
-        HandlePanelWidgetAdded(syntheticWidgetData)
-        return activePanelHandler ~= nil
     end
     return false
 end
 
+
+--- HandlePanelWidgetAdded: forwards widget events to the dispatcher.
+--- The dispatcher's match logic prefers widget x:Name (so PartyLineActive_c
+--- routes to PartyLine even though the DC matches multiple registrations)
+--- and falls back to DC type.  activateMode="explicit" handlers (PartyLine)
+--- only activate via this path, never via pickup.
+local function HandlePanelWidgetAdded(widgetData)
+    if not widgetData or not widgetData.dcType then return end
+    Log.Debug("[BG3A_BC] phase=worldui_widget_added dc="
+        .. tostring(widgetData.dcType)
+        .. " name=" .. tostring(widgetData.elemName or "?")
+        .. " widget=" .. tostring(widgetData.widgetRootId or "?"))
+    worldUIDispatcher:HandleWidgetAdded(widgetData)
+end
+
+--- HandlePanelWidgetRootChanged: forwards to dispatcher.  The
+--- dispatcher's RouteSnapshot Step 1 (liveness) handles the case
+--- where the new root indicates the handler's widget is gone --
+--- the openWhen check naturally fails when the widget no longer
+--- claims the focus.  No special re-anchoring logic needed.
+local function HandlePanelWidgetRootChanged(newWidgetRootId)
+    worldUIDispatcher:HandleWidgetRootChanged()
+end
+
+--- RoutePanelSnapshot: called by EventRouter for all snapshots when
+--- routing is in WorldUI.  Delegates to the dispatcher; if no handler
+--- ends up dispatched (no panel is open in the snapshot), checks
+--- whether a menu DC is present and falls back to Menus.RouteSnapshot.
+--- That fallback is WorldUI-Menus boundary logic -- not part of
+--- handler dispatch -- so it stays here, not in Dispatcher.lua.
+--- @param snapshot table  The full TickSnapshot from C++.
+local function RoutePanelSnapshot(snapshot)
+    Log.Debug("[BG3A_BC] phase=worldui_route_begin handler="
+        .. (worldUIDispatcher:GetActiveHandler()
+            and worldUIDispatcher:GetActiveEntry().name or "nil"))
+
+    -- Track focused DC for tooltip context (used by DispatchTooltip).
+    if snapshot.focusedElement and snapshot.focusedElement.dcType then
+        lastFocusedDCType = snapshot.focusedElement.dcType
+    end
+
+    -- Dispatcher does liveness, pickup, and dispatch in one call.  If
+    -- a handler is current after this returns, the snapshot was
+    -- delivered.  If not, we fall through to the Menus boundary check.
+    worldUIDispatcher:RouteSnapshot(snapshot)
+
+    if worldUIDispatcher:GetActiveHandler() then return end
+
+    -- No panel handler active.  Check whether the snapshot carries
+    -- a menu DC type (e.g. gui::DCGameMenu from the shortcuts menu).
+    -- Menus on separate visual layers don't fire panel widgetAdded
+    -- events, so they reach here with routeToWorld still true.  Only
+    -- fall back to Menus when a genuine menu signal is present;
+    -- without this guard, HUD widget text (Overlay, Actions, etc.)
+    -- would be spoken as menu content when returning to the world
+    -- after closing any panel.
+    local Menus = BG3Access.Client.Menus
+    if not Menus then return end
+
+    local hasMenuSignal = false
+    if snapshot.focusedElement and snapshot.focusedElement.dcType
+        and Menus.IsMenuDCType(snapshot.focusedElement.dcType) then
+        hasMenuSignal = true
+    end
+    if not hasMenuSignal and snapshot.selectedElement
+        and snapshot.selectedElement.dcType
+        and Menus.IsMenuDCType(snapshot.selectedElement.dcType) then
+        hasMenuSignal = true
+    end
+    if not hasMenuSignal and snapshot.widgetDCTypes then
+        for _, widgetDCType in ipairs(snapshot.widgetDCTypes) do
+            if Menus.IsMenuDCType(widgetDCType) then
+                hasMenuSignal = true
+                break
+            end
+        end
+    end
+    if hasMenuSignal then
+        Log.Info("RoutePanelSnapshot: menu DC type detected, "
+            .. "falling back to Menus")
+        Menus.RouteSnapshot(snapshot)
+    end
+end
+
+--- ResetAllPanelHandlers: forwards to dispatcher, plus close detail
+--- and compare views (their d-pad subscriptions assume a panel
+--- context).  Called on GameStateChanged.
+local function ResetAllPanelHandlers()
+    CloseDetailView(true)
+    CloseCompareView(true)
+    worldUIDispatcher:Reset()
+end
+
+--- TryActivateFromSnapshot: forwards to the dispatcher's pickup pass.
+--- Returns true if a handler is active after the call (either was
+--- already current or got activated by pickup).  Called by EventRouter
+--- to detect "this snapshot belongs in WorldUI" without yet
+--- dispatching -- the dispatch happens in RoutePanelSnapshot once
+--- EventRouter has flipped routing.
+local function TryActivateFromSnapshot(snapshot)
+    return worldUIDispatcher:TryPickup(snapshot)
+end
+
 --- GetActivePanelHandler: returns the currently active panel handler.
---- @return table|nil  The active handler instance, or nil.
+--- @return table|nil
 local function GetActivePanelHandler()
-    return activePanelHandler
+    return worldUIDispatcher:GetActiveHandler()
 end
 
 -- ============================================================================
@@ -3962,7 +5237,8 @@ local function ResetState()
     -- Radial state.
     radialHintSpoken = false
     inRadial = false
-    -- Tooltip state.
+    -- Tooltip state (also clears radialHandlerState's spokenRoles
+    -- cross-off + lastSpokenFullText).
     ResetTooltipState()
     -- Panel state.
     ResetAllPanelHandlers()
@@ -3978,6 +5254,8 @@ BG3Access.Client.WorldUI = {
     HandleRadialOpen           = HandleRadialOpen,
     ClearRadialFocus           = ClearRadialFocus,
     HandleRadialSlot           = HandleRadialSlot,
+    IsRadialOpen               = IsRadialOpen,
+    GetRadialDetailHandler     = GetRadialDetailHandler,
     -- Panel routing
     IsWorldDCType              = IsWorldDCType,
     IsWorldWidgetName          = IsWorldWidgetName,

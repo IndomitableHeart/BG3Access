@@ -120,6 +120,28 @@ local function HandleCombatStarted(eventData)
     pendingRoundAnnouncement = nil
     SpeakCombatInterrupt("Combat started")
 
+    -- Force GPS fully off on combat start.  SuspendForCombat:
+    --   - sets gpsMode = OFF (so ticks don't run proximity / hazard
+    --     scans during enemy turns, and AutoWalk's "arrived" event
+    --     can't re-enter Exploration mode mid-combat)
+    --   - calls ClearGPSState which clears autoWalkActive, the entity
+    --     list (entityListOpen=false), tracking target, all latch
+    --     state -- so resume-after-combat starts from a clean slate
+    --   - stays silent (combat already has Initiative + first-turn
+    --     announcement playing; an extra "GPS off" alert would drown
+    --     them out)
+    -- Without this, an AutoWalk that was in flight when combat
+    -- started would, on arrival, fire EnterExplorationMode and
+    -- re-enable proximity scans during the enemy's first turn.
+    -- Falls back to CloseEntityList (older API) for safety on
+    -- older WorldNav versions that don't export SuspendForCombat.
+    local WorldNav = BG3Access.Client.WorldNav
+    if WorldNav and WorldNav.SuspendForCombat then
+        WorldNav.SuspendForCombat()
+    elseif WorldNav and WorldNav.CloseEntityList then
+        WorldNav.CloseEntityList()
+    end
+
     -- Queue the initiative summary IMMEDIATELY so it lands in the
     -- speech queue before Osiris fires TurnStarted (which arrives
     -- ~100ms later from the server relay).  Empirically the
@@ -134,7 +156,7 @@ local function HandleCombatStarted(eventData)
     if initiativeText then
         SpeakCombatQueued(initiativeText)
     else
-        Ext.Timer.WaitFor(150, function()
+        BG3Access.Client.Scheduler.RunAfterMs(150, function()
             if not inCombat then return end
             local fallbackText = BuildInitiativeAnnouncement()
             if fallbackText then
@@ -216,9 +238,16 @@ local function HandleDied(eventData)
         end
     end
     if eventData.isPartyMember then
+        -- Party-member down is urgent: interrupt anything in
+        -- progress so the player hears "Tav is down" immediately.
         SpeakCombatInterrupt(characterName .. " is down")
     else
-        SpeakCombatInterrupt(characterName .. " died")
+        -- Enemy death is informational and arrives RIGHT after the
+        -- killing-blow announcement (e.g. "...0 of 15 remaining").
+        -- Using interrupt cuts off the kill-blow speech mid-sentence.
+        -- Queue instead so the kill-blow finishes, then "X died"
+        -- naturally follows.
+        SpeakCombatQueued(characterName .. " died")
     end
 end
 
@@ -669,6 +698,43 @@ local function FormatHpSuffix(defenderHp, defenderMaxHp)
         .. tostring(defenderMaxHp) .. " remaining"
 end
 
+--- Verbose-tier dice breakdown for damage rolls.  Server populates
+--- eventData.damageRolls from hitDesc.Damage.DamageRolls -- a per-
+--- damage-type, per-instance array of {damageType, diceCount,
+--- diceSize, modifier, naturalRoll, total, isNegative}.  Returns
+--- nil when the array is empty (status ticks, surface ticks, and
+--- other pre-rolled / static damage paths) OR when no entry has
+--- real dice (modifier-only entries skip aloud since "rolled 0 on
+--- 0 dice plus 2" reads worse than the simple damage phrase).
+---
+--- Format examples (used as a clause inserted before the existing
+--- "for 4 slashing damage" phrase):
+---   "rolled 2 on 1d4 plus 2"           single instance, +mod
+---   "rolled 8 on 1d10"                  single instance, no mod
+---   "rolled 5 on 1d6 minus 1"           single instance, -mod
+---   "rolled 5 on 1d8 plus 3, plus rolled 2 on 1d4"   multi-type
+local function BuildDamageRollPhrase(damageRolls)
+    if not damageRolls or #damageRolls == 0 then return nil end
+    local instances = {}
+    for _, roll in ipairs(damageRolls) do
+        local hasDice = (roll.diceCount or 0) > 0 and roll.diceSize
+        if hasDice then
+            local part = "rolled " .. tostring(roll.naturalRoll or 0)
+                .. " on " .. tostring(roll.diceCount)
+                .. "d" .. tostring(roll.diceSize)
+            local modifier = tonumber(roll.modifier) or 0
+            if modifier > 0 then
+                part = part .. " plus " .. tostring(modifier)
+            elseif modifier < 0 then
+                part = part .. " minus " .. tostring(-modifier)
+            end
+            instances[#instances + 1] = part
+        end
+    end
+    if #instances == 0 then return nil end
+    return table.concat(instances, ", plus ")
+end
+
 --- Speak a standard attack hit (CauseType Attack / Offhand).
 --- Includes roll breakdown when available.
 local function SpeakAttackHit(eventData)
@@ -719,6 +785,24 @@ local function SpeakAttackHit(eventData)
     end
 
     if damageAmount > 0 then
+        -- Verbose-tier dice breakdown.  Inserted as its own clause
+        -- BEFORE the damage clause so the speech reads:
+        --   "...hit Devourer, rolled 2 on 1d4 plus 2, for 4 slashing
+        --    damage, 6 of 15 remaining"
+        -- At brief / normal verbosity the dice phrase is omitted
+        -- and the clause sequence stays as it was: "...hit X, for 4
+        -- slashing damage, ...".  Skipped when damageRolls is empty
+        -- (status / surface ticks, static damage) so a Burning tick
+        -- still reads "Burning, dealt 2 fire damage..." without a
+        -- dice prefix it doesn't have.
+        local verbosity = SpeechData.GetVerbosity
+            and SpeechData.GetVerbosity() or "normal"
+        if verbosity == "verbose" then
+            local dicePhrase = BuildDamageRollPhrase(eventData.damageRolls)
+            if dicePhrase then
+                parts[#parts + 1] = dicePhrase
+            end
+        end
         local damageText = FormatCombatDamage(
             damageAmount, eventData.damagePhrase)
         if damageText ~= "" then
@@ -753,6 +837,61 @@ local function SpeakAttackHit(eventData)
     end
 
     if lethal then
+        parts[#parts + 1] = targetName .. " is down"
+    end
+
+    SpeakCombatQueued(table.concat(parts, ", "))
+end
+
+--- Speak a bonus-damage instance: the second-or-later attack-like
+--- damage event in a burst (Sneak Attack, Smite, Hex, magic-weapon
+--- proc).  The primary attack event already announced attacker +
+--- to-hit roll + main damage, so the bonus event reads as a
+--- continuation: "plus 5 piercing from Sneak Attack".  When the
+--- source spell name isn't resolvable, falls back to "plus 5
+--- piercing damage" so the player still hears it landed.
+---
+--- Verbose tier still emits the dice breakdown for the bonus die
+--- ("rolled 5 on 1d6") inside the same clause so the player can
+--- hear the actual roll.
+---
+--- HP suffix and lethal/down announcements still attach to this
+--- event when it's the burst's last (server marked it on the
+--- final event).
+local function SpeakBonusHit(eventData)
+    local damageAmount = tonumber(eventData.damageAmount) or 0
+    if damageAmount == 0 then return end
+    local targetName = eventData.targetName or "Unknown"
+    local spellName = eventData.spellName or ""
+
+    local parts = { "plus" }
+
+    -- Verbose-tier dice breakdown lives between "plus" and the
+    -- damage phrase: "plus rolled 5 on 1d6 for 5 piercing damage".
+    local verbosity = SpeechData.GetVerbosity
+        and SpeechData.GetVerbosity() or "normal"
+    if verbosity == "verbose" then
+        local dicePhrase = BuildDamageRollPhrase(eventData.damageRolls)
+        if dicePhrase then
+            parts[#parts + 1] = dicePhrase
+        end
+    end
+
+    local damageText = FormatCombatDamage(
+        damageAmount, eventData.damagePhrase)
+    if damageText ~= "" then
+        if spellName ~= "" then
+            parts[#parts + 1] = damageText .. " from " .. spellName
+        else
+            parts[#parts + 1] = damageText
+        end
+    end
+
+    local hpSuffix = FormatHpSuffix(
+        tonumber(eventData.defenderHp),
+        tonumber(eventData.defenderMaxHp))
+    if hpSuffix ~= "" then parts[#parts + 1] = hpSuffix end
+    if eventData.lethal == true then
         parts[#parts + 1] = targetName .. " is down"
     end
 
@@ -858,6 +997,17 @@ local function HandleCombatHit(eventData)
         return
     end
 
+    -- Bonus damage: server marked this as a follow-up attack-like
+    -- event in a multi-event burst (Sneak Attack, Smite, magic-
+    -- weapon proc, Hex, Hunter's Mark).  The primary event already
+    -- announced the to-hit roll and main damage; speak this one as
+    -- a continuation clause.  Cache already marked by the primary,
+    -- so AttackedBy follow-ups stay suppressed.
+    if eventData.isBonusDamage == true then
+        SpeakBonusHit(eventData)
+        return
+    end
+
     -- Everything else goes through SpeakAttackHit: Attack, Offhand,
     -- AURA, InventoryItem, WorldItemThrow, None (misses), Unknown11.
     -- All of these correspond to a hit-resolution event whose
@@ -866,6 +1016,40 @@ local function HandleCombatHit(eventData)
     -- unconditionally for this branch.
     MarkCombatHitSpoken(attackerName, targetName)
     SpeakAttackHit(eventData)
+end
+
+--- Action declaration speech: "X cast Y on Z" or "X cast Y" (no
+--- target).  Server only relays this for non-party casters in active
+--- combat, so we never double up with the radial menu's "Tav cast
+--- Fire Bolt" announcement.  The follow-up damage / save event will
+--- arrive as a separate CombatHit / AttackedBy / RollFinished and
+--- speak the outcome -- two announcements per cast is intentional
+--- and matches the sighted experience (spell name pops + damage
+--- number floats).
+local function HandleSpellCastDeclared(eventData)
+    local casterName = eventData.casterName or "Unknown"
+    local spellName = eventData.spellName
+    local targetName = eventData.targetName
+
+    local text
+    if spellName and spellName ~= "" then
+        if targetName and targetName ~= "" then
+            text = casterName .. " cast " .. spellName
+                .. " on " .. targetName
+        else
+            text = casterName .. " cast " .. spellName
+        end
+    else
+        -- Spell name failed to resolve (rare -- prototype lookup
+        -- found nothing).  Fall back to a generic phrasing rather
+        -- than reading the raw "Target_Foo" prototype string.
+        if targetName and targetName ~= "" then
+            text = casterName .. " cast a spell on " .. targetName
+        else
+            text = casterName .. " cast a spell"
+        end
+    end
+    SpeakCombatQueued(text)
 end
 
 local function HandleAttackedBy(eventData)
@@ -1056,10 +1240,11 @@ local function PollForReveal(pendingEntry, rollUuid, rollerName,
         cleanup()
         return
     end
-    Ext.Timer.WaitFor(ROLL_PREVIEW_POLL_INTERVAL_MS, function()
-        PollForReveal(pendingEntry, rollUuid, rollerName,
-            nextElapsedMs)
-    end)
+    BG3Access.Client.Scheduler.RunAfterMs(ROLL_PREVIEW_POLL_INTERVAL_MS,
+        function()
+            PollForReveal(pendingEntry, rollUuid, rollerName,
+                nextElapsedMs)
+        end)
 end
 
 --- Handle the server's RollPreview event.  The event tells us
@@ -1084,10 +1269,11 @@ local function HandleRollPreview(eventData)
     if rollUuid ~= "" then
         pendingRollPreviews[rollUuid] = pendingEntry
     end
-    Ext.Timer.WaitFor(ROLL_PREVIEW_POLL_INTERVAL_MS, function()
-        PollForReveal(pendingEntry, rollUuid, rollerName,
-            ROLL_PREVIEW_POLL_INTERVAL_MS)
-    end)
+    BG3Access.Client.Scheduler.RunAfterMs(ROLL_PREVIEW_POLL_INTERVAL_MS,
+        function()
+            PollForReveal(pendingEntry, rollUuid, rollerName,
+                ROLL_PREVIEW_POLL_INTERVAL_MS)
+        end)
 end
 
 --- Cancel any pending preview poll for this roll.  Called from
@@ -1118,12 +1304,25 @@ local EVENT_HANDLERS = {
     StatusRemoved      = HandleStatusRemoved,
     AttackedBy         = HandleAttackedBy,
     MissedBy           = HandleMissedBy,
+    -- Action declaration relay (UsingSpellOnTarget / UsingSpell on
+    -- the server).  In BG3 every action -- including Main Hand
+    -- Attack, Claws, Help, Shove -- is a spell in the engine, so
+    -- this single hook covers the full surface.  Server gates to
+    -- non-party casters in active combat and dedups the parallel
+    -- UsingSpell+UsingSpellOnTarget pair the engine fires for each
+    -- targeted cast.  Closes the gap a blind player has compared
+    -- to a sighted player who sees the spell-name overlay.
+    SpellCastDeclared  = HandleSpellCastDeclared,
     RollFinished       = HandleRollFinished,
     RollPreview        = HandleRollPreview,
     -- HitResultEvent relay (server-side) fires once per combat
     -- attack resolution with the full roll + damage + HP picture.
     -- HandleCombatHit speaks the coherent announcement and
     -- suppresses the AttackedBy sub-damage fires that follow.
+    -- For multi-event chains (Fire Bolt + Burning), the server
+    -- emits one CombatHit per event, with HP suffix only on the
+    -- last event in the burst.  See FlushDamageBurst on the
+    -- server for the rationale.
     CombatHit          = HandleCombatHit,
     -- Concentration interrupted on a party member.  Pairs with the
     -- existing Constitution-save announcement to tell the user

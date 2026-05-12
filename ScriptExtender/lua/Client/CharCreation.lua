@@ -353,7 +353,7 @@ local ccState = {
     -- by :Speak(ccState, ...) for cross-call dedup after first entry).
     lastSpokenName           = nil,
     lastSpokenFullText       = nil,
-    lastSpokenTab            = nil,
+    currentTabContext            = nil,
     lastSpokenTitle          = nil,
     lastSpokenItemName       = nil,
     lastMainTab              = nil,
@@ -379,11 +379,9 @@ local ccState = {
     introButtonSuppression      = nil,
     introAxisSuppression        = nil,
     customBackstoryText         = nil,
-    -- CC tooltip dedup field.  DispatchTooltip routes via this to
-    -- collapse subset / superset waves.  Isolated from WorldUI's
-    -- tooltipState holder because the two contexts don't share namespace
-    -- and must reset independently on CC enter / exit.
-    lastTooltipSpeech           = nil,
+    -- CC tooltip dedup is now value-aware via spokenRoles cross-off
+    -- in FromTooltip (see SpeechData.lua ShouldSkipSpoken).  No
+    -- separate string-compare field needed.
     -- Post-cutscene return suppression.  When the origin-preview cutscene
     -- ends, Noesis rebuilds the CC UI and fires a burst of stale focus /
     -- selection events (every carousel item cycles through).  Without a
@@ -886,7 +884,7 @@ local function SpeakNamingScreen()
         characterName = "Tav"
     end
 
-    ccState.lastSpokenTab = "Naming"
+    ccState.currentTabContext = "Naming"
     ccState.lastMainTab = "Naming"
     namingScreenWasSpoken = true
 
@@ -1431,7 +1429,7 @@ end
 
 --- ResetCCNavigation: clear CC navigation dedup state only.
 local function ResetCCNavigation()
-    ccState.lastSpokenTab = nil
+    ccState.currentTabContext = nil
     ccState.lastSpokenTitle = nil
     ccState.lastSpokenName = nil
     ccState.lastSpokenItemName = nil
@@ -1443,7 +1441,7 @@ end
 local function ResetCCState()
     ccState.lastSpokenName = nil
     ccState.lastSpokenFullText = nil
-    ccState.lastSpokenTab = nil
+    ccState.currentTabContext = nil
     ccState.lastSpokenTitle = nil
     ccState.lastSpokenItemName = nil
     ccState.lastMainTab = nil
@@ -1461,7 +1459,6 @@ local function ResetCCState()
     ccState.firstEntrySpoken = false
     ccState.introAwaitingContinue = false
     ccState.customBackstoryText = nil
-    ccState.lastTooltipSpeech = nil
     ccState.awaitingPostCutsceneNav = false
     ccState.postCutsceneHintSpoken = false
     ccState.postCutsceneArmedAt = 0
@@ -1507,8 +1504,7 @@ local function CreateCCPageHandler(config)
         lastSpokenElemAddr   = nil,    -- stable element pointer (cycling detection)
         lastSpokenTitle      = nil,
         lastCarouselTick     = nil,
-        lastTooltipSpeech    = nil,    -- tooltip dedup (inline comparison)
-        spokenRoles          = {},     -- set of role names spoken (for tooltip cross-off)
+        spokenRoles          = {},     -- map of field key -> spoken value (for value-aware tooltip cross-off)
         tabHintsSpoken       = {},     -- keyed by tab name
         screenEntryJustSpoke = false,
         -- True after the "You acquire the following..." section label
@@ -1546,13 +1542,20 @@ local function CreateCCPageHandler(config)
 
     -- Record which roles were spoken (for tooltip cross-off).
     -- The tooltip handler skips any role that's already set here.
+    -- Records role keys into spokenRoles for value-aware tooltip
+    -- cross-off (per ShouldSkipSpoken in SpeechData.lua).
+    --   Core fields: stored value enables value-comparison cross-
+    --     off (state changes emit, identical values skip).
+    --   Properties: key encodes value so multi-instance labels each
+    --     have their own slot; stored value `true` = presence skip.
     local function RecordSpokenRoles(speechData)
         handlerState.spokenRoles = {}
-        for fieldName, _ in pairs(speechData.coreFields) do
-            handlerState.spokenRoles[fieldName] = true
+        for fieldName, fieldValue in pairs(speechData.coreFields) do
+            handlerState.spokenRoles[fieldName] = fieldValue
         end
         for _, prop in ipairs(speechData.properties) do
-            handlerState.spokenRoles["property:" .. prop.label] = true
+            handlerState.spokenRoles[
+                "property:" .. prop.label .. ":" .. prop.value] = true
         end
     end
 
@@ -1727,7 +1730,7 @@ local function CreateCCPageHandler(config)
         -- =============================================================
         -- Item extraction (shared by screen entry and item nav).
         -- =============================================================
-        local effectiveTabForExtraction = tabName or ccState.lastSpokenTab
+        local effectiveTabForExtraction = tabName or ccState.currentTabContext
         local itemName, itemValue, itemDescription
 
         -- Level-up summary items: factory infrastructure.
@@ -1859,7 +1862,7 @@ local function CreateCCPageHandler(config)
 
         -- Section header / tab-restate suppression.
         if itemName then
-            local effectiveTab = tabName or ccState.lastSpokenTab
+            local effectiveTab = tabName or ccState.currentTabContext
             local normalTab = effectiveTab
                 and Helpers.NormalizeForCompare(effectiveTab) or ""
             local normalItem = Helpers.NormalizeForCompare(itemName)
@@ -2138,20 +2141,16 @@ local function CreateCCPageHandler(config)
 
             if not next(tooltipData.coreFields)
                 and #tooltipData.properties == 0 then return end
-            -- No explicit verbosity: Format() falls back to the
-            -- module-global currentVerbosity so RS-Down cycling
-            -- affects CC tooltips the same as other speech.
-            local tooltipSpeech = tooltipData:Format()
-            if not tooltipSpeech or tooltipSpeech == "" then return end
-            if tooltipSpeech == handlerState.lastTooltipSpeech then
-                return
-            end
-            handlerState.lastTooltipSpeech = tooltipSpeech
-            Log.Info("CC TOOLTIP: " .. tooltipSpeech)
-            Ext.Tolk.Speak(tooltipSpeech, false)
-        end,
-        ResetTooltipDedup = function()
-            handlerState.lastTooltipSpeech = nil
+            -- Speak handles format / log / Tolk / spokenRoles
+            -- accumulation.  CC tooltips queue (don't interrupt the
+            -- item handler that just spoke); no state-change-
+            -- interrupt pattern in CC.  Dedup of duplicate waves
+            -- comes from value-aware spokenRoles cross-off in
+            -- FromTooltip -- if the wave is identical to what was
+            -- spoken before, FromTooltip returns empty and Speak
+            -- early-returns.  No string compare needed.
+            tooltipData:Speak(handlerState, false, nil, false,
+                "CC TOOLTIP")
         end,
         GetSectionLabelSpoken = function()
             return handlerState.sectionLabelSpoken
@@ -2218,7 +2217,7 @@ local CarouselDescHandler = CreateCCPageHandler({
             and focusedElement.dcType == "gui::DCCharacterCreation"
             and dcProps then
             local resolvedTab = effectiveTab or ccState.lastMainTab
-                or ccState.lastSpokenTab
+                or ccState.currentTabContext
             if resolvedTab then
                 local subTableKey =
                     CC_SELECTED_DESCRIPTION_KEYS[resolvedTab]
@@ -2959,7 +2958,7 @@ local function HandleCCSnapshot(snapshot)
             -- guardian speech doesn't fire prematurely.
             if hasRealDCType and hasGenuineNav then
                 ccState.pendingTransition = nil
-                ccState.lastSpokenTab = nil
+                ccState.currentTabContext = nil
                 Log.Debug("LOCKOUT: cleared (real focused element arrived)")
             else
                 return
@@ -2968,7 +2967,7 @@ local function HandleCCSnapshot(snapshot)
             if hasRealDCType then
                 ccState.pendingTransition = nil
                 ccState.lastMainTab = nil
-                ccState.lastSpokenTab = nil
+                ccState.currentTabContext = nil
                 ccState.inPostNamingCC = false
                 ccState.currentPage = nil
                 ccState.activePageHandler = nil
@@ -3184,7 +3183,7 @@ local function HandleCCSnapshot(snapshot)
         ccState.currentPage = pageName
         ccState.activePageHandler = ResolveHandlerForPage(pageName)
         isFirstEntry = true
-        ccState.lastSpokenTab = pageName
+        ccState.currentTabContext = pageName
     end
 
     -- =============================================================
@@ -3220,7 +3219,7 @@ local function HandleCCSnapshot(snapshot)
                 ccState.currentPage = pageName or "Origin"
                 ccState.activePageHandler = ResolveHandlerForPage(
                     ccState.currentPage)
-                ccState.lastSpokenTab = ccState.currentPage
+                ccState.currentTabContext = ccState.currentPage
             end
             local speech = firstEntrySpeech:Format()
             Log.Info("CC FIRST ENTRY SPEECH: " .. speech)
@@ -3268,13 +3267,9 @@ end
 local function DispatchTooltip(structuredTooltipData, snapshot)
     if not ccState.inCharacterCreation then return end
 
-    -- Reset dedup on navigation.
-    if snapshot.focusChanged or snapshot.selectionChanged then
-        if ccState.activePageHandler
-            and ccState.activePageHandler.ResetTooltipDedup then
-            ccState.activePageHandler.ResetTooltipDedup()
-        end
-    end
+    -- spokenRoles is reset by RecordSpokenRoles on each
+    -- screen-entry / item-nav speech, so cross-off naturally
+    -- starts fresh per focus.  No explicit reset needed here.
 
     if not structuredTooltipData then return end
 
