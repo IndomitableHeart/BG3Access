@@ -16,8 +16,49 @@
 
 local Log = BG3Access.Client.Log
 local SpeechData = BG3Access.Client.SpeechData
+-- DiceRolls owns all roll-related narration (attack-roll prefix in
+-- damage speech, standalone save / check outcomes, ActiveRoll widget
+-- reveal preview).  Loaded before Combat per the _Init order, so this
+-- reference is always populated when Combat.lua runs.
+local DiceRolls = BG3Access.Client.DiceRolls
+-- Cutscene owns audio-description playback in response to the
+-- server's Osi.MoviePlay / MovieFinished relay (BG3Access_Events
+-- carries MovieStarted / MovieFinished entries alongside combat
+-- events, dispatched through the same EVENT_HANDLERS table below).
+local Cutscene = BG3Access.Client.Cutscene
 
-local COMBAT_CHANNEL = "BG3Access_Combat"
+-- User-facing setting owned by Combat: per-swing damage announcements.
+-- The roll-detail toggle (diceRollDetailEnabled) lives in DiceRolls.lua
+-- since it gates more than just combat now.
+if BG3Access.Client.Settings then
+    BG3Access.Client.Settings.RegisterDefault(
+        "combatDamageEnabled", true, { true, false },
+        "Combat damage announcements", "verbositySettings")
+    -- Tier preset for the Global verbosity dial.  Damage stays on at
+    -- every tier (essential info for blind play).
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "combatDamageEnabled",
+        { brief = true, normal = true, verbose = true })
+end
+
+--- IsCombatDamageEnabled: convenience accessor for the per-attack
+--- hit-resolution speech gate.  Defaults to enabled when Settings
+--- isn't loaded yet (graceful fallback).
+local function IsCombatDamageEnabled()
+    local Settings = BG3Access.Client.Settings
+    if Settings and Settings.Get
+        and Settings.Get("combatDamageEnabled") == false then
+        return false
+    end
+    return true
+end
+
+-- Net channel for all server-relayed narration events: combat events
+-- AND dice rolls (BG3 fires rolls during exploration too, so the
+-- channel isn't combat-specific despite the historic name).  Combat.lua
+-- owns the listener registration; events get dispatched to either
+-- Combat handlers or DiceRolls handlers via EVENT_HANDLERS below.
+local EVENTS_CHANNEL = "BG3Access_Events"
 
 -- ---------------------------------------------------------------------------
 -- Combat state
@@ -330,272 +371,6 @@ local function BuildHitpointsSuffix(eventData)
         .. tostring(maxHp) .. " remaining"
 end
 
--- ---------------------------------------------------------------------------
--- Roll-detail cache + speech
---
--- The server relays every finished roll (attack / save / check)
--- via the "RollFinished" event.  Attack rolls fire microseconds
--- before their companion AttackedBy / MissedBy Osiris event, so we
--- cache them briefly and prepend the d20 breakdown to the existing
--- damage or miss announcement.  Saves / checks are standalone --
--- they don't have a follow-up Osiris event to merge into, so we
--- speak them directly.
---
--- Cache is keyed by (rollerName, subjectName) and expires after a
--- short window.  BG3 fires one roll then one hit/miss within a few
--- ticks, so the window is small -- 500ms is plenty.  The TTL
--- prevents stale roll data from leaking into a later attack from
--- the same attacker.
--- ---------------------------------------------------------------------------
-
-local ROLL_CACHE_TTL_MS = 500
-
-local attackRollCache = {}  -- "<attacker>|<defender>" -> {rollData, expiresAtMs}
-
-local function CacheAttackRoll(eventData)
-    local key = tostring(eventData.rollerName or "")
-        .. "|" .. tostring(eventData.subjectName or "")
-    attackRollCache[key] = {
-        data = eventData,
-        expiresAtMs = Ext.Utils.MonotonicTime() + ROLL_CACHE_TTL_MS,
-    }
-end
-
-local function ConsumeAttackRoll(attackerName, defenderName)
-    local key = tostring(attackerName or "")
-        .. "|" .. tostring(defenderName or "")
-    local cached = attackRollCache[key]
-    if not cached then return nil end
-    attackRollCache[key] = nil
-    if Ext.Utils.MonotonicTime() > cached.expiresAtMs then
-        return nil
-    end
-    return cached.data
-end
-
---- Returns true when the current verbosity level opts into roll
---- detail.  Brief mode keeps combat announcements terse by
---- skipping the d20 breakdown; normal and verbose include it.
-local function ShouldSpeakRollDetail()
-    local verbosity = SpeechData.GetVerbosity
-        and SpeechData.GetVerbosity() or "normal"
-    return verbosity ~= "brief"
-end
-
---- Format a "rolled N plus M" fragment that prepends to damage
---- and miss announcements.  Advantage / disadvantage gets a short
---- suffix.  Natural 20 / natural 1 become "critical hit" / "critical
---- miss" phrasing so the user hears the crit immediately.
-local function BuildRollPrefix(rollData)
-    local natural = tonumber(rollData.naturalRoll) or 0
-    local total = tonumber(rollData.total) or natural
-    local modifier = tonumber(rollData.modifier) or 0
-
-    local parts = {}
-    parts[#parts + 1] = "rolled " .. tostring(natural)
-    if modifier ~= 0 then
-        if modifier > 0 then
-            parts[#parts + 1] = "plus " .. tostring(modifier)
-        else
-            parts[#parts + 1] = "minus " .. tostring(-modifier)
-        end
-        parts[#parts + 1] = "total " .. tostring(total)
-    end
-    if natural == 20 then
-        parts[#parts + 1] = "critical hit"
-    elseif natural == 1 then
-        parts[#parts + 1] = "critical miss"
-    end
-    if rollData.advantage then
-        parts[#parts + 1] = "with advantage"
-    elseif rollData.disadvantage then
-        parts[#parts + 1] = "with disadvantage"
-    end
-    return table.concat(parts, ", ")
-end
-
---- Convert a PascalCase enum name to space-separated words so TTS
---- pronounces each word instead of reading the camel blob as one
---- token.  "SleightOfHand" -> "Sleight of Hand".  "AnimalHandling"
---- -> "Animal Handling".  "DeathSavingThrow" -> "Death Saving Throw".
---- Lowercases short linking words (Of / And / The) mid-phrase so the
---- result reads naturally rather than "Sleight Of Hand".
-local SMALL_WORDS = {
-    Of = "of", And = "and", The = "the",
-    In = "in", On = "on", To = "to",
-}
-
-local function HumanizeEnumName(name)
-    if not name or name == "" then return "" end
-    -- Insert spaces at lowercase -> uppercase boundaries, and also
-    -- at the end of capital runs followed by lowercase (handles
-    -- mixed cases like "DCArea" -> "DC Area"; harmless elsewhere).
-    local spaced = name
-        :gsub("(%l)(%u)", "%1 %2")
-        :gsub("(%u+)(%u%l)", "%1 %2")
-    spaced = spaced:gsub("(%S+)", function(word)
-        return SMALL_WORDS[word] or word
-    end)
-    return spaced
-end
-
---- Speak a standalone saving-throw outcome.  Format:
----   "<roller> rolled <natural> plus <mod>, total <N>,
----    <ability> save DC <DC>, passed/failed."
---- DC phrase omitted when the server reported no DC.
-local function HandleRollFinishedSave(eventData)
-    if not ShouldSpeakRollDetail() then return end
-    local rollerName = eventData.rollerName or "Unknown"
-    local abilityName = eventData.abilityName or ""
-    local dc = tonumber(eventData.dc)
-    local total = tonumber(eventData.total)
-        or tonumber(eventData.rollTotal)
-    local prefix = BuildRollPrefix(eventData)
-
-    -- Label resolution order:
-    --   1. Death saves are ability-less by design (straight d20 vs
-    --      DC 10), so rollTypeName="DeathSavingThrow" is the ONLY
-    --      signal -- abilityName comes through as "None".  Check
-    --      this first, unconditionally.
-    --   2. Ability-based save with a known ability name: "Wisdom
-    --      save", "Constitution save", etc.
-    --   3. No name available: omit the label rather than say
-    --      something generic like "saving throw" (user can infer
-    --      from context).
-    local saveLabel = nil
-    if eventData.rollTypeName == "DeathSavingThrow" then
-        saveLabel = "death saving throw"
-    elseif abilityName ~= "" and abilityName ~= "None" then
-        saveLabel = HumanizeEnumName(abilityName) .. " save"
-    end
-
-    local parts = { rollerName, prefix }
-    if saveLabel then
-        parts[#parts + 1] = saveLabel
-    end
-    if dc then
-        parts[#parts + 1] = "DC " .. tostring(dc)
-    end
-
-    -- Pass / fail callout when we have both a DC and a total.
-    -- Death saves use DC 10 as the game constant; other saves
-    -- carry an explicit DC from the spell / effect.  Server
-    -- relays `total` (= natural + modifier) when the roll is
-    -- computed, so "<total> >= <dc>" gives us the outcome
-    -- without needing the server to relay a pass/fail flag.
-    if dc and total then
-        if total >= dc then
-            parts[#parts + 1] = "passed"
-        else
-            parts[#parts + 1] = "failed"
-        end
-    end
-
-    -- Forced-by-party-spell context.  Server populates
-    -- forcingSpellName only when the standard party gate would
-    -- have skipped the relay (enemy-vs-enemy save) AND the save
-    -- target was just hit by a party spell cast (per the
-    -- pendingPartyCastTargets cache in BootstrapServer.lua).
-    -- Append "against <spell>" so the player knows which of their
-    -- spells just got resisted / soaked: "Goblin, rolled 14,
-    -- Wisdom save, DC 13, passed against Sleep" tells them their
-    -- Sleep didn't take this enemy.  Nil for normal party-side
-    -- rolls -- omit suffix entirely so no awkward "against nil".
-    if eventData.forcingSpellName
-        and eventData.forcingSpellName ~= "" then
-        parts[#parts + 1] = "against " .. eventData.forcingSpellName
-    end
-
-    -- Queue instead of interrupt.  A saving throw fired during
-    -- combat (concentration save, death save) is the DIRECT
-    -- consequence of the damage announcement that triggered it;
-    -- interrupting the damage to speak the save result cuts off
-    -- the cause mid-sentence.  Queue means the user hears:
-    --   "Intellect Devourer hit Tav for 8 damage, 0 of 10 remaining"
-    --   "Tav: Downed"
-    --   "Tav rolled 14, death saving throw, DC 10, passed"
-    -- in order, which is the natural cause-effect sequence.
-    SpeakCombatQueued(table.concat(parts, ", "))
-end
-
---- Speak a standalone skill / ability check outcome.  Same shape as
---- the save handler but uses skill name when available.
-local function HandleRollFinishedCheck(eventData)
-    if not ShouldSpeakRollDetail() then return end
-    local rollerName = eventData.rollerName or "Unknown"
-    local skillName = eventData.skillName or ""
-    local abilityName = eventData.abilityName or ""
-    local dc = tonumber(eventData.dc)
-    local total = tonumber(eventData.total)
-        or tonumber(eventData.rollTotal)
-    local prefix = BuildRollPrefix(eventData)
-
-    local parts = { rollerName, prefix }
-    if skillName ~= "" and skillName ~= "None" then
-        parts[#parts + 1] = HumanizeEnumName(skillName) .. " check"
-    elseif abilityName ~= "" and abilityName ~= "None" then
-        parts[#parts + 1] = HumanizeEnumName(abilityName) .. " check"
-    end
-    if dc then parts[#parts + 1] = "DC " .. tostring(dc) end
-
-    -- Pass / fail callout.  Same logic as saves -- total >= DC is
-    -- success.  Matches the on-screen "SUCCESS" / "FAILURE" text
-    -- the ActiveRoll reveal reads sighted players (which we also
-    -- speak via RollPreview at reveal moment).
-    if dc and total then
-        if total >= dc then
-            parts[#parts + 1] = "passed"
-        else
-            parts[#parts + 1] = "failed"
-        end
-    end
-
-    -- Queue (not interrupt), same rationale as saves: a combat
-    -- check is typically adjacent to the event that triggered it;
-    -- interrupting cuts off the cause.  Out-of-combat checks drain
-    -- the queue immediately since nothing else is queued.
-    SpeakCombatQueued(table.concat(parts, ", "))
-end
-
--- Forward declaration so HandleRollFinished can call into the roll-
--- preview cancellation path even though the preview helpers are
--- defined later in the file.  Without this, Lua resolves the name
--- as a global at call time and throws "attempt to call a nil value
--- (global 'CancelPendingRollPreview')".  Assigned by the later
--- `CancelPendingRollPreview = function(...)` below.
-local CancelPendingRollPreview
-
-local function HandleRollFinished(eventData)
-    -- If the user pressed A before the preview's reveal delay
-    -- expired, cancel the pending preview: the full breakdown that
-    -- follows includes the natural, so the preview would just repeat
-    -- what we're about to say.
-    CancelPendingRollPreview(eventData.rollUuid)
-
-    local bucket = eventData.rollBucket or ""
-    if bucket == "attack" then
-        -- Cache for merge with AttackedBy / MissedBy.  No speech
-        -- here -- the subsequent Osiris handler does the speech
-        -- and prepends our cached roll data via ConsumeAttackRoll.
-        CacheAttackRoll(eventData)
-    elseif bucket == "save" then
-        HandleRollFinishedSave(eventData)
-    elseif bucket == "check" then
-        HandleRollFinishedCheck(eventData)
-    end
-end
-
---- Build the optional "rolled N plus M, total X" fragment that
---- prepends to damage / miss speech when roll detail is cached
---- AND verbosity allows it.  Returns a trailing period + space so
---- callers can concatenate directly, or an empty string.
-local function BuildRollPrefixFragment(attackerName, defenderName)
-    if not ShouldSpeakRollDetail() then return "" end
-    local rollData = ConsumeAttackRoll(attackerName, defenderName)
-    if not rollData then return "" end
-    return BuildRollPrefix(rollData) .. ".  "
-end
-
 -- Recently-spoken CombatHit pairs, used to suppress the redundant
 -- AttackedBy announcements that fire alongside a HitResultEvent.
 -- BG3 fires a separate AttackedBy Osiris event per damage sub-
@@ -751,8 +526,8 @@ local function SpeakAttackHit(eventData)
 
     -- Roll detail (crit hit / crit miss phrasing already included
     -- by BuildRollPrefix -- do NOT repeat in action clause).
-    if ShouldSpeakRollDetail() and hasRoll then
-        local rollPrefix = BuildRollPrefix({
+    if DiceRolls.IsDiceRollDetailEnabled() and hasRoll then
+        local rollPrefix = DiceRolls.BuildRollPrefix({
             naturalRoll  = eventData.naturalRoll,
             modifier     = eventData.modifier,
             total        = eventData.rollTotal,
@@ -785,19 +560,20 @@ local function SpeakAttackHit(eventData)
     end
 
     if damageAmount > 0 then
-        -- Verbose-tier dice breakdown.  Inserted as its own clause
-        -- BEFORE the damage clause so the speech reads:
+        -- Dice breakdown clause inserted before the damage phrase:
         --   "...hit Devourer, rolled 2 on 1d4 plus 2, for 4 slashing
         --    damage, 6 of 15 remaining"
-        -- At brief / normal verbosity the dice phrase is omitted
-        -- and the clause sequence stays as it was: "...hit X, for 4
-        -- slashing damage, ...".  Skipped when damageRolls is empty
-        -- (status / surface ticks, static damage) so a Burning tick
-        -- still reads "Burning, dealt 2 fire damage..." without a
-        -- dice prefix it doesn't have.
-        local verbosity = SpeechData.GetVerbosity
-            and SpeechData.GetVerbosity() or "normal"
-        if verbosity == "verbose" then
+        -- Gated by the dice-roll-detail toggle alone -- damage dice
+        -- are part of the roll detail the user opted into via the
+        -- diceRollDetailEnabled setting.  The Global verbosity dial
+        -- drives that toggle via its registered tier presets
+        -- (brief=false / normal=false / verbose=true), so cycling
+        -- Global verbosity has the expected effect, but the toggle
+        -- itself is authoritative at speech time.  Skipped when
+        -- damageRolls is empty (status / surface ticks have no
+        -- dice) so a Burning tick stays as "Burning, dealt 2 fire
+        -- damage..." with no dice prefix.
+        if DiceRolls.IsDiceRollDetailEnabled() then
             local dicePhrase = BuildDamageRollPhrase(eventData.damageRolls)
             if dicePhrase then
                 parts[#parts + 1] = dicePhrase
@@ -866,11 +642,12 @@ local function SpeakBonusHit(eventData)
 
     local parts = { "plus" }
 
-    -- Verbose-tier dice breakdown lives between "plus" and the
-    -- damage phrase: "plus rolled 5 on 1d6 for 5 piercing damage".
-    local verbosity = SpeechData.GetVerbosity
-        and SpeechData.GetVerbosity() or "normal"
-    if verbosity == "verbose" then
+    -- Dice breakdown clause lives between "plus" and the damage
+    -- phrase: "plus rolled 5 on 1d6 for 5 piercing damage".
+    -- Toggle-authority model: gated by diceRollDetailEnabled alone,
+    -- the Global verbosity dial drives the toggle indirectly via
+    -- tier presets.
+    if DiceRolls.IsDiceRollDetailEnabled() then
         local dicePhrase = BuildDamageRollPhrase(eventData.damageRolls)
         if dicePhrase then
             parts[#parts + 1] = dicePhrase
@@ -978,6 +755,7 @@ end
 --- the primary announcement AND let the two Osiris follow-ups
 --- fire -- you'd hear the miss announced three times.
 local function HandleCombatHit(eventData)
+    if not IsCombatDamageEnabled() then return end
     local attackerName = eventData.attackerName or "Unknown"
     local targetName = eventData.targetName or "Unknown"
     local causeType = eventData.causeType or ""
@@ -1053,6 +831,7 @@ local function HandleSpellCastDeclared(eventData)
 end
 
 local function HandleAttackedBy(eventData)
+    if not IsCombatDamageEnabled() then return end
     local attackerName = eventData.attackerName or "Unknown"
     local defenderName = eventData.defenderName or "Unknown"
     local damageAmount = eventData.damageAmount or 0
@@ -1065,7 +844,7 @@ local function HandleAttackedBy(eventData)
         return
     end
 
-    local rollPrefix = BuildRollPrefixFragment(attackerName, defenderName)
+    local rollPrefix = DiceRolls.BuildRollPrefixFragment(attackerName, defenderName)
 
     if damageAmount > 0 then
         local damageText = attackerName .. " "
@@ -1087,6 +866,7 @@ local function HandleAttackedBy(eventData)
 end
 
 local function HandleMissedBy(eventData)
+    if not IsCombatDamageEnabled() then return end
     local attackerName = eventData.attackerName or "Unknown"
     local defenderName = eventData.defenderName or "Unknown"
 
@@ -1098,196 +878,9 @@ local function HandleMissedBy(eventData)
         return
     end
 
-    local rollPrefix = BuildRollPrefixFragment(attackerName, defenderName)
+    local rollPrefix = DiceRolls.BuildRollPrefixFragment(attackerName, defenderName)
     SpeakCombatQueued(attackerName .. " " .. rollPrefix
         .. "missed " .. defenderName)
-end
-
--- Pending preview polls keyed by RollUuid.  The server fires the
--- preview immediately when the roll is computed (server-side, which
--- is instant on Y-press), but sighted players don't see the number
--- until the dice animation plays and the ResultHolder template
--- becomes visible -- triggered by the ActiveRoll widget's Tag DP
--- transitioning to "RevealResultAnimation" (see
--- ResultCountTemplateStyle in DiceAnimation.xaml:3009 and the
--- DieRollAnimation AnimDone handler in ActiveRoll_c.xaml:1637-1639).
--- That's the exact moment the number appears on screen, regardless
--- of which outcome template (success / fail / crit) plays -- each
--- has a different storyboard duration, so any fixed delay is wrong
--- for some subset of rolls.
---
--- The legacy C++ Ext.UI.SubscribeDPChanged hook that could have
--- given us this signal directly was deleted from the extender.
--- Poll the widget's Tag property at a tight cadence instead: bounded
--- to the animation window (cap at ~3s), and the entry is consumed
--- on either Tag reveal or the subsequent commit A-press.
-local pendingRollPreviews = {}
-
--- Poll interval for widget Tag reads during the reveal wait.  100ms
--- is fast enough that the user doesn't perceive the gap between the
--- visual reveal and the speech; slow enough that the cost is
--- negligible (~20 reads max over a 2s animation).
-local ROLL_PREVIEW_POLL_INTERVAL_MS = 100
-
--- Safety cap so a stuck / missing ActiveRoll widget doesn't leave a
--- poll running indefinitely.  NOT sized to the animation duration:
--- the server's OnChange fires at screen entry (BG3 computes the
--- roll immediately -- Y-press just triggers the visual reveal), so
--- the poll begins long BEFORE the user has pressed Y, and must
--- survive however long the user spends browsing bonuses.  Sized to
--- "longer than any reasonable browse session" so the timeout only
--- fires on a genuinely stuck widget, and on timeout we bail
--- SILENTLY -- speaking a preview when the reveal never happened
--- would be worse than saying nothing (the commit path will still
--- speak the full breakdown on A-press).
-local ROLL_PREVIEW_MAX_WAIT_MS = 60000
-
--- Outcome text the reveal template puts on screen as TextBlocks.
--- BG3 displays one of these four translated strings at the moment
--- the number appears; we match literally (case-insensitive) to
--- identify which outcome rendered.  See SuccessResultTemplate and
--- FailResultTemplate in DiceAnimation.xaml (textBlockResult).
-local OUTCOME_TEXTS = {
-    ["CRITICAL SUCCESS"] = "critical success",
-    ["CRITICAL FAILURE"] = "critical failure",
-    ["SUCCESS"]          = "success",
-    ["FAILURE"]          = "failure",
-}
-
---- Scan the ActiveRoll widget's rendered TextBlocks for the reveal
---- content: the displayed die face (bare 1-20 integer) and the
---- outcome label.  Returns (dieFace, outcomeLabel) with either
---- or both as nil if not yet rendered.  The XAML places both
---- inside the ActiveRoll widget subtree, so reading from the
---- widget root picks them up regardless of template depth.
----
---- Critically, this reads what is ACTUALLY DISPLAYED on screen --
---- no server-side component tracking, no guessing about
---- advantage/disadvantage.  Whatever number the user would see if
---- they were sighted is the number we speak.
-local function ReadActiveRollReveal()
-    local findOk, activeRollElem = pcall(
-        Ext.UI.FindNameInWidget, "ActiveRoll")
-    if not findOk or not activeRollElem then
-        return nil, nil
-    end
-    local readOk, entries = pcall(
-        Ext.UI.ReadElementStructuredTextBlocks, activeRollElem)
-    if not readOk or not entries or #entries == 0 then
-        return nil, nil
-    end
-    local dieFace = nil
-    local outcomeLabel = nil
-    for _, entry in ipairs(entries) do
-        local text = entry.text or ""
-        if not dieFace and text:match("^%d+$") then
-            local value = tonumber(text)
-            if value and value >= 1 and value <= 20 then
-                dieFace = value
-            end
-        end
-        if not outcomeLabel then
-            local mapped = OUTCOME_TEXTS[text:upper()]
-            if mapped then outcomeLabel = mapped end
-        end
-        if dieFace and outcomeLabel then break end
-    end
-    return dieFace, outcomeLabel
-end
-
---- Speak the reveal.  Matches the sighted experience: number + outcome.
-local function SpeakRollReveal(rollerName, dieFace, outcomeLabel)
-    local parts = { rollerName, "rolled " .. tostring(dieFace) }
-    if outcomeLabel then
-        parts[#parts + 1] = outcomeLabel
-    end
-    SpeakCombatInterrupt(table.concat(parts, ", "))
-end
-
---- Poll the ActiveRoll widget for the reveal text.  Fires every
---- POLL_INTERVAL ms until either:
----   (a) Both number and outcome text are visible on screen, then
----       speak and stop.  This is the normal path.
----   (b) commit (HandleRollFinished) cancels the poll, speak the
----       full breakdown via RollFinished instead.
----   (c) MAX_WAIT elapses without either signal; bail silently
----       (skill check was canceled, widget torn down, etc).
----
---- We require BOTH number and outcome before speaking so we don't
---- announce "rolled 14" at the frame the dice land but before the
---- "SUCCESS" / "FAILURE" text fades in.
-local function PollForReveal(pendingEntry, rollUuid, rollerName,
-                             elapsedMs)
-    local function cleanup()
-        if rollUuid ~= "" then pendingRollPreviews[rollUuid] = nil end
-    end
-    if pendingEntry.canceled then
-        cleanup()
-        return
-    end
-    local dieFace, outcomeLabel = ReadActiveRollReveal()
-    if dieFace and outcomeLabel then
-        pendingEntry.canceled = true
-        cleanup()
-        SpeakRollReveal(rollerName, dieFace, outcomeLabel)
-        return
-    end
-    local nextElapsedMs = elapsedMs + ROLL_PREVIEW_POLL_INTERVAL_MS
-    if nextElapsedMs >= ROLL_PREVIEW_MAX_WAIT_MS then
-        -- Timed out.  Bail silently.  The commit-side RollFinished
-        -- still fires its full breakdown on A-press.
-        pendingEntry.canceled = true
-        cleanup()
-        return
-    end
-    BG3Access.Client.Scheduler.RunAfterMs(ROLL_PREVIEW_POLL_INTERVAL_MS,
-        function()
-            PollForReveal(pendingEntry, rollUuid, rollerName,
-                nextElapsedMs)
-        end)
-end
-
---- Handle the server's RollPreview event.  The event tells us
---- "a roll is in flight, start watching the ActiveRoll widget for
---- the visual reveal."  We IGNORE the server's NaturalRoll field
---- -- it's populated on the first OnChange fire and may be a
---- preliminary die for advantage / disadvantage rolls that gets
---- overridden later.  The widget's rendered text carries the real
---- final die and outcome, so we read from there.
-local function HandleRollPreview(eventData)
-    if not ShouldSpeakRollDetail() then return end
-    local rollBucket = eventData.rollBucket or ""
-    -- Attack rolls merge roll detail into AttackedBy / MissedBy via
-    -- BuildRollPrefixFragment at damage time -- skip the reveal
-    -- preview path for those.
-    if rollBucket == "attack" then return end
-
-    local rollerName = eventData.rollerName or "Unknown"
-    local rollUuid = eventData.rollUuid or ""
-
-    local pendingEntry = { canceled = false }
-    if rollUuid ~= "" then
-        pendingRollPreviews[rollUuid] = pendingEntry
-    end
-    BG3Access.Client.Scheduler.RunAfterMs(ROLL_PREVIEW_POLL_INTERVAL_MS,
-        function()
-            PollForReveal(pendingEntry, rollUuid, rollerName,
-                ROLL_PREVIEW_POLL_INTERVAL_MS)
-        end)
-end
-
---- Cancel any pending preview poll for this roll.  Called from
---- HandleRollFinished so a fast A-press beats the reveal poll and
---- we skip the preview (the full commit-side breakdown covers it,
---- so the bare "rolled N" preview would just be redundant).
---- Assigned to the forward-declared local at the top of the file.
-CancelPendingRollPreview = function(rollUuid)
-    if not rollUuid or rollUuid == "" then return end
-    local pendingEntry = pendingRollPreviews[rollUuid]
-    if pendingEntry then
-        pendingEntry.canceled = true
-        pendingRollPreviews[rollUuid] = nil
-    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -1313,8 +906,11 @@ local EVENT_HANDLERS = {
     -- targeted cast.  Closes the gap a blind player has compared
     -- to a sighted player who sees the spell-name overlay.
     SpellCastDeclared  = HandleSpellCastDeclared,
-    RollFinished       = HandleRollFinished,
-    RollPreview        = HandleRollPreview,
+    -- Dice-roll events live in DiceRolls.lua (the channel itself
+    -- carries both combat and non-combat events; routing splits
+    -- them here at the dispatcher).
+    RollFinished       = DiceRolls.HandleRollFinished,
+    RollPreview        = DiceRolls.HandleRollPreview,
     -- HitResultEvent relay (server-side) fires once per combat
     -- attack resolution with the full roll + damage + HP picture.
     -- HandleCombatHit speaks the coherent announcement and
@@ -1329,6 +925,13 @@ local EVENT_HANDLERS = {
     -- which spell just dropped.  See server BootstrapServer.lua
     -- ConcentrationChanged subscription.
     ConcentrationLost  = HandleConcentrationLost,
+    -- Cinematic / audio-description events (server relays
+    -- Osi.MoviePlay and Osi.MovieFinished through this channel
+    -- alongside combat events; routing handled by event.event
+    -- string).  Cutscene.lua looks up the AD track by movie name
+    -- and plays / stops Ext.Audio accordingly.
+    MovieStarted       = Cutscene.HandleMovieStarted,
+    MovieFinished      = Cutscene.HandleMovieFinished,
 }
 
 local function HandleCombatEvent(eventData)
@@ -1343,17 +946,19 @@ local function HandleCombatEvent(eventData)
     end
 end
 
--- Register net listener for combat events from server.
-Ext.RegisterNetListener(COMBAT_CHANNEL,
+-- Register net listener for the shared events channel (combat events
+-- AND dice rolls).  Dispatched to Combat.lua handlers or DiceRolls
+-- handlers per the EVENT_HANDLERS table above.
+Ext.RegisterNetListener(EVENTS_CHANNEL,
     function(channel, payload, userId)
         local parseOk, eventData = pcall(Ext.Json.Parse, payload)
         if not parseOk or type(eventData) ~= "table" then
-            Log.Error("Combat: bad event payload")
+            Log.Error("Events channel: bad event payload")
             return
         end
         local handleOk, handleErr = pcall(HandleCombatEvent, eventData)
         if not handleOk then
-            Log.Error("Combat event handler: " .. tostring(handleErr))
+            Log.Error("Events channel handler: " .. tostring(handleErr))
         end
     end)
 
@@ -1568,7 +1173,11 @@ end
 -- State management
 -- ---------------------------------------------------------------------------
 
---- Reset combat state.  Called on GameStateChanged.
+--- Reset combat state.  Called on GameStateChanged.  Also delegates
+--- to DiceRolls.ResetState so cached attack-roll data and pending
+--- preview polls clear at the same time (they used to live in this
+--- file, so resetting them was inline; now they're in the DiceRolls
+--- module and we call across).
 local function ResetState()
     inCombat = false
     currentTurnCharacterName = nil
@@ -1576,7 +1185,9 @@ local function ResetState()
     currentRound = 0
     pendingRoundAnnouncement = nil
     statusLastAnnounceTime = {}
-    attackRollCache = {}
+    if DiceRolls and DiceRolls.ResetState then
+        DiceRolls.ResetState()
+    end
 end
 
 --- Query: are we currently in combat?
@@ -1601,10 +1212,10 @@ Log.Debug("Combat module loaded")
 -- ============================================================================
 
 BG3Access.Client.Combat = {
-    IsInCombat        = IsInCombat,
+    IsInCombat         = IsInCombat,
     GetCurrentTurnName = GetCurrentTurnName,
-    GetCurrentRound   = GetCurrentRound,
-    ReadTurnOrder     = ReadTurnOrder,
-    SpeakTurnOrder    = SpeakTurnOrder,
-    ResetState        = ResetState,
+    GetCurrentRound    = GetCurrentRound,
+    ReadTurnOrder      = ReadTurnOrder,
+    SpeakTurnOrder     = SpeakTurnOrder,
+    ResetState         = ResetState,
 }

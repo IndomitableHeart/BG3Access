@@ -190,12 +190,179 @@ local TIER_RANK = {brief = 1, normal = 2, verbose = 3}
 -- Global verbosity.  Format() filters out fields/properties whose
 -- tier exceeds this.  Callers can override per-call by passing an
 -- explicit verbosity to Format(); when omitted, the global is used.
--- Cycled at runtime via the RS-Down controller chord (see
--- BG3Access.Client.CycleVerbosity below).
-local currentVerbosity = "verbose"
+--
+-- Storage: persists through Client/Settings.lua under the key
+-- "verbosity".  Settings.RegisterDefault below ensures the key is
+-- declared as soon as SpeechData loads (Settings is required first
+-- in _Init.lua).  Cycled by the SettingsMenu when the user opens it
+-- via RS-Down.
+local DEFAULT_VERBOSITY = "verbose"
+-- Order matches the natural least-to-most-verbose progression so
+-- the Settings menu's d-pad-right cycle reads brief -> normal ->
+-- verbose -> brief.  The options array doubles as the cycle order
+-- (Settings.CycleNext walks the list left-to-right and wraps).
+local VERBOSITY_OPTIONS = { "brief", "normal", "verbose" }
+if BG3Access.Client.Settings then
+    BG3Access.Client.Settings.RegisterDefault(
+        "verbosity", DEFAULT_VERBOSITY, VERBOSITY_OPTIONS,
+        "Global verbosity", "verbositySettings")
 
--- Global hint toggle.  When false, Format() omits hint fields.
-local hintsEnabled = true
+    -- Tooltip-detail toggles.  These gate individual property /
+    -- field categories at speech time (in Format()), uniformly
+    -- across every handler that produces structured speech
+    -- (equipment slots, inventory, loot containers, examine
+    -- panel, trade, pickpocket, spell book, etc.).  Each lives
+    -- in the Verbosity submenu so users see all "what gets
+    -- spoken" choices in one place; tier presets are wired
+    -- below so the Global verbosity dial cycles them as a group.
+    --
+    -- Naming convention:
+    --   * "speakItemX" -- gates a label that only ever appears
+    --     on items (Weight, Gold, Weapon properties).
+    --   * "speakX" (no prefix) -- gates a label that appears
+    --     across multiple contexts (Description / Cost shared
+    --     by items + spells; Dice / Duration / Frequency mostly
+    --     spells but also some status / spell-derived tooltips).
+    --   * Don't use "speakSpellX" for fields that ALSO appear
+    --     on items -- the toggle is by property LABEL, not by
+    --     source context.
+
+    -- Item-specific toggles.
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakItemWeight", true, { true, false },
+        "Item weight", "verbositySettings")
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakItemGold", true, { true, false },
+        "Item gold value", "verbositySettings")
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakWeaponProperties", true, { true, false },
+        "Weapon properties", "verbositySettings")
+
+    -- Shared toggles (items + spells + anything else with the
+    -- corresponding property label).
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakDescription", true, { true, false },
+        "Description", "verbositySettings")
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakCost", true, { true, false },
+        "Cost", "verbositySettings")
+
+    -- Spell-detail toggles.  Used primarily by SpellBook.lua's
+    -- customItemFn; the labels are gated by property name so any
+    -- other handler that produces a property with the same label
+    -- gets the same on/off treatment.
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakDice", true, { true, false },
+        "Dice breakdown", "verbositySettings")
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakDuration", true, { true, false },
+        "Duration", "verbositySettings")
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakFrequency", true, { true, false },
+        "Frequency", "verbositySettings")
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakRecharge", true, { true, false },
+        "Recharge", "verbositySettings")
+
+    -- Character sheet stat toggles.
+    --   speakBreakdown -- gates the "Breakdown" property emitted
+    --   by ability / skill / derived-stat tooltips.  Multiple
+    --   formatters (FormatVMAbilityTooltip, FormatVMStatTooltip,
+    --   etc.) all funnel into a "Breakdown" label so this single
+    --   toggle catches them.
+    --
+    --   speakBonus -- gates the "Save bonus: +N" and "Check bonus:
+    --   +N" properties emitted by FormatVMAbilityTooltip after it
+    --   normalizes Larian's original "Saving throws" / "Modifier"
+    --   properties (whose values bake the descriptive context
+    --   into the text, e.g. "+5 to Saving Throws").  Both labels
+    --   point to speakBonus in PROPERTY_TOGGLE_SETTINGS so the
+    --   single toggle silences both at speech time.
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakBreakdown", true, { true, false },
+        "Stat breakdown", "verbositySettings")
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakBonus", true, { true, false },
+        "Stat bonuses", "verbositySettings")
+
+    -- Screen navigation hints toggle.  Gates BOTH the navigationHint
+    -- core field (panel-entry "use bumpers to switch tabs" / "use
+    -- d-pad to browse" / etc.) AND the instructionHint core field
+    -- (in-context "A to confirm, B to cancel" footer-style hints).
+    -- Both flow through CORE_FIELD_TOGGLE_SETTINGS keyed to this one
+    -- toggle, so a single user setting silences all hint content
+    -- across every panel.  Useful once you've memorized the layouts
+    -- and the per-panel hints become noise.  Tier presets keep brief
+    -- terse (no hints) and normal/verbose informative.
+    BG3Access.Client.Settings.RegisterDefault(
+        "speakNavigationHints", true, { true, false },
+        "Screen navigation hints", "verbositySettings")
+
+    -- Tier presets for the Global verbosity dial.
+    -- Weight + Gold + Duration: Normal+ (factual info).
+    -- Description + Cost + Weapon properties + Dice + Frequency:
+    -- Verbose only.
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakItemWeight",
+        { brief = false, normal = true, verbose = true })
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakItemGold",
+        { brief = false, normal = true, verbose = true })
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakWeaponProperties",
+        { brief = false, normal = false, verbose = true })
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakDescription",
+        { brief = false, normal = false, verbose = true })
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakCost",
+        { brief = false, normal = false, verbose = true })
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakDice",
+        { brief = false, normal = false, verbose = true })
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakDuration",
+        { brief = false, normal = true, verbose = true })
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakFrequency",
+        { brief = false, normal = false, verbose = true })
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakRecharge",
+        { brief = false, normal = true, verbose = true })
+
+    -- Character sheet stat tier presets.
+    -- Brief = name + number only ("Strength 15").
+    -- Normal = + bonuses ("+1 to Strength Checks, +2 to Saving Throws").
+    -- Verbose = + breakdown ("15 Base, +2 from Class").
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakBreakdown",
+        { brief = false, normal = false, verbose = true })
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "speakBonus",
+        { brief = false, normal = true, verbose = true })
+
+    -- Intentionally NO tier presets for speakNavigationHints.  A
+    -- user who silences tooltip descriptions and stat breakdowns
+    -- via the Global verbosity dial may still want navigation
+    -- hints (or vice versa) -- "I know the menus" and "I know
+    -- which info I want" are independent preferences.  Leaving
+    -- speakNavigationHints off the preset list means the Global
+    -- verbosity cycle won't touch it; the user toggles it
+    -- explicitly via the Verbosity submenu.
+end
+
+--- ReadCurrentVerbosity: returns the live verbosity value from
+--- Settings, falling back to the hardcoded default if the Settings
+--- module hasn't loaded yet (init-order edge case).  Called wherever
+--- the previous code referenced `currentVerbosity`.
+local function ReadCurrentVerbosity()
+    local Settings = BG3Access.Client.Settings
+    if Settings and Settings.Get then
+        local value = Settings.Get("verbosity")
+        if value then return value end
+    end
+    return DEFAULT_VERBOSITY
+end
 
 -- Strip XML/markup tags.
 local function StripMarkupTags(text)
@@ -272,6 +439,11 @@ end
 --- Add a flexible property (spoken as "label: value").
 --- @param self table  The SpeechData object.
 --- @param label string  User-facing label (e.g., "Damage", "Range").
+---     Pass "" or nil only when the value is a self-explanatory
+---     sentence that genuinely cannot read with any prefix
+---     (extremely rare -- prefer picking a clean label).  Empty
+---     labels skip toggle gating, since PROPERTY_TOGGLE_SETTINGS
+---     keys off label.
 --- @param propertyValue string|nil  The value.  Nil/empty skipped.
 --- @param tier string|nil  "brief", "normal", or "verbose" (default "normal").
 local function AddProperty(self, label, propertyValue, tier)
@@ -547,16 +719,68 @@ local function Diff(self, other)
     return result
 end
 
+-- Per-property-label toggle map.  When Format() encounters a
+-- property whose label is in this table, the matching Settings
+-- toggle is the SOLE decider of whether to speak that property
+-- (the tier filter is bypassed -- "toggle authority" model).
+-- Lets users silence specific categories of detail without
+-- relying on Global verbosity as the only control.
+local PROPERTY_TOGGLE_SETTINGS = {
+    -- Item-only labels.
+    ["Weight"]            = "speakItemWeight",
+    ["Gold"]              = "speakItemGold",
+    ["Weapon properties"] = "speakWeaponProperties",
+    -- Shared labels (items + spells + sometimes status tooltips).
+    ["Cost"]              = "speakCost",
+    ["Dice"]              = "speakDice",
+    ["Bonus dice"]        = "speakDice",
+    ["Duration"]          = "speakDuration",
+    ["Frequency"]         = "speakFrequency",
+    ["Recharges"]         = "speakRecharge",
+    ["Breakdown"]         = "speakBreakdown",
+    ["Save bonus"]        = "speakBonus",
+    ["Check bonus"]       = "speakBonus",
+}
+
+-- Per-core-field toggle map.  Same idea but for the named core
+-- fields walked by the main field loop (description, etc.).
+-- navigationHint / instructionHint share the speakNavigationHints
+-- toggle: both fields carry hint-style content (LB/RB to switch
+-- tabs, A to confirm, etc.) and are toggled as a group from the
+-- Verbosity submenu.
+local CORE_FIELD_TOGGLE_SETTINGS = {
+    description     = "speakDescription",
+    navigationHint  = "speakNavigationHints",
+    instructionHint = "speakNavigationHints",
+}
+
+--- IsFeatureToggleEnabled: returns false ONLY when a Settings
+--- toggle exists for this key AND is explicitly set to false.
+--- Falls open (returns true) when Settings isn't loaded, the
+--- toggle isn't registered, or the value is anything other than
+--- the boolean false.  Centralized so the per-property and
+--- per-field checks share one defensive fallback.
+local function IsFeatureToggleEnabled(toggleKey)
+    if not toggleKey then return true end
+    local Settings = BG3Access.Client.Settings
+    if not Settings or not Settings.Get then return true end
+    return Settings.Get(toggleKey) ~= false
+end
+
 --- Format: assemble fields into a speech string in fixed order.
 --- Properties are inserted between status and description.
 --- @param self table  The SpeechData object.
 --- @param verbosity string|nil  "brief", "normal", or "verbose".
----     When nil, falls back to the module-global currentVerbosity
----     (set via SpeechData.SetVerbosity / CycleVerbosity).  Explicit
----     arg overrides the global per-call if callers ever need it.
+---     Resolution order (most specific wins):
+---       1. Explicit arg to Format() -- highest priority.
+---       2. Instance verbosityOverride (set at Create time, e.g.
+---          for character creation which pins to verbose).
+---       3. ReadCurrentVerbosity() -- the user's Global verbosity
+---          setting read live from Settings.
 --- @return string|nil  Assembled speech, or nil if empty.
 local function Format(self, verbosity)
-    verbosity = verbosity or currentVerbosity
+    verbosity = verbosity or self.verbosityOverride
+        or ReadCurrentVerbosity()
     local maxRank = TIER_RANK[verbosity] or 3
     local parts = {}
 
@@ -568,13 +792,25 @@ local function Format(self, verbosity)
             if fieldName == "title" or fieldName == "sectionLabel" then
                 -- Always included regardless of verbosity.
                 include = true
-            elseif fieldName == "navigationHint"
-                or fieldName == "instructionHint" then
-                -- Globally toggleable.
-                include = hintsEnabled
             else
-                local fieldRank = TIER_RANK[self.tiers[fieldName]] or 2
-                include = fieldRank <= maxRank
+                -- Toggle authority model: when a per-field toggle
+                -- is registered for this fieldName, the toggle is
+                -- the sole decider.  Otherwise, fall back to the
+                -- tier filter against the user's Global verbosity.
+                -- The Global verbosity dial drives toggles via its
+                -- registered tier presets (Settings.lua) rather
+                -- than competing with them at speech time.
+                -- navigationHint / instructionHint flow through
+                -- this path now too via CORE_FIELD_TOGGLE_SETTINGS
+                -- (speakNavigationHints).
+                local toggleKey = CORE_FIELD_TOGGLE_SETTINGS[fieldName]
+                if toggleKey then
+                    include = IsFeatureToggleEnabled(toggleKey)
+                else
+                    local fieldRank = TIER_RANK[self.tiers[fieldName]]
+                        or 2
+                    include = fieldRank <= maxRank
+                end
             end
             if include then
                 local cleaned = fieldValue:gsub("[%.%s]+$", "")
@@ -605,8 +841,23 @@ local function Format(self, verbosity)
             end)
             for _, sortedEntry in ipairs(sortedProps) do
                 local prop = sortedEntry.prop
-                local propRank = TIER_RANK[prop.tier] or 2
-                if propRank <= maxRank then
+                -- Toggle authority model: when a per-property toggle
+                -- is registered for this label, the toggle is the
+                -- sole decider.  Otherwise, fall back to the tier
+                -- filter against the user's Global verbosity.  The
+                -- Global verbosity dial drives toggles via its
+                -- registered tier presets (Settings.lua), not at
+                -- speech time -- so a toggle set to true cannot be
+                -- silently blocked by an unrelated tier setting.
+                local toggleKey = PROPERTY_TOGGLE_SETTINGS[prop.label]
+                local include
+                if toggleKey then
+                    include = IsFeatureToggleEnabled(toggleKey)
+                else
+                    local propRank = TIER_RANK[prop.tier] or 2
+                    include = propRank <= maxRank
+                end
+                if include then
                     -- Empty/nil label = render just the value as a
                     -- standalone phrase.  Used for self-explanatory
                     -- context text that doesn't need a field prefix
@@ -629,6 +880,28 @@ local function Format(self, verbosity)
 
     if #parts == 0 then return nil end
     return StripMarkupTags(table.concat(parts, ". "))
+end
+
+-- Speech protection window: when set, interrupt-mode Speak / Alert
+-- calls are downgraded to queue mode until the window expires.
+-- Used by Notifications.lua when tutorial popups speak so the
+-- multi-part announcement (title, body, dismiss hint) finishes
+-- playing instead of being cut off by the next widget's screen-
+-- entry speech firing a tick or two later.
+--
+-- Refreshing only EXTENDS the window (never shortens) so a series
+-- of queued protected speech calls keeps the window alive across
+-- the whole batch without needing per-call accounting.
+--
+-- DECLARED HERE (not next to SetProtectionWindow further down)
+-- because Speak / SpeakDelta / Alert below reference
+-- ShouldSuppressInterrupt -- Lua locals only exist from their
+-- declaration line forward, so this must precede first use.
+local protectionUntilMs = 0
+
+local function ShouldSuppressInterrupt()
+    if not Ext.Utils or not Ext.Utils.MonotonicTime then return false end
+    return Ext.Utils.MonotonicTime() < protectionUntilMs
 end
 
 --- SpeakDelta: speak only what changed vs a prior SpeechData,
@@ -682,6 +955,12 @@ local function SpeakDelta(self, handlerState, previousSpeechData,
     if not deltaAssembled or deltaAssembled == "" then return end
 
     local interrupt = isScreenEntry or (userInitiated == true)
+    -- Downgrade screen-entry interrupts (NOT user-initiated focus
+    -- speech) during a protection window so tutorial speech finishes.
+    if interrupt and not (userInitiated == true)
+        and ShouldSuppressInterrupt() then
+        interrupt = false
+    end
     Log.Info((logTag or "DELTA SPEAK")
         .. (interrupt and "" or " (append)")
         .. ": " .. deltaAssembled)
@@ -727,6 +1006,16 @@ local function Speak(self, handlerState, isScreenEntry, verbosity,
         interrupt = false
     end
 
+    -- Downgrade screen-entry interrupts (NOT user-initiated focus
+    -- speech) during a protection window so tutorial speech
+    -- finishes playing.  User-initiated focus events still
+    -- interrupt as normal because the player is actively
+    -- navigating and needs immediate feedback.
+    if interrupt and not (userInitiated == true)
+        and ShouldSuppressInterrupt() then
+        interrupt = false
+    end
+
     Log.Info((logTag or "SPEAK")
         .. (interrupt and "" or " (append)")
         .. ": " .. assembled)
@@ -758,13 +1047,23 @@ end
 -- ============================================================================
 
 --- Create a new SpeechData instance.
+--- @param verbosityOverride string|nil  Optional per-instance
+---     verbosity that bypasses the user's Global verbosity setting.
+---     Pass "verbose" / "normal" / "brief" to pin this instance at
+---     that tier regardless of the user's preference.  Used by
+---     contexts where the field-tier filter should be ignored --
+---     character creation is the canonical case: a user creating a
+---     character wants every detail spoken even if their global
+---     setting is Brief.  Pass nil (or omit) to follow the global
+---     setting as usual.
 --- @return table  SpeechData object with Add, AddProperty, HasField,
 ---     Delta, Diff, Format, Speak methods.
-Create = function()
+Create = function(verbosityOverride)
     return {
         coreFields = {},
         properties = {},
         tiers = {},
+        verbosityOverride = verbosityOverride,
         Add = Add,
         AddProperty = AddProperty,
         HasField = HasField,
@@ -791,6 +1090,48 @@ local SpeechDataModule = {}
 --- Create a new SpeechData instance.
 SpeechDataModule.Create = Create
 
+--- MarkSpokenValue: record an entry in a handler's spokenRoles
+--- without going through :Speak.  Used when a caller has spoken a
+--- field under one key but wants ShouldSkipSpoken to also dedup
+--- subsequent tooltip arrivals that map the same text to a
+--- different field name -- canonical case is the action-radial
+--- slot speech adding a value as "description" while the spell
+--- tooltip popup later emits the same text under a role mapped
+--- to "technicalDescription".  Value-based comparison still
+--- applies in ShouldSkipSpoken, so genuinely-different text in
+--- either field will still speak.
+---
+--- @param handlerState table  Handler's isolated state container
+---     (must have or accept a spokenRoles sub-table).
+--- @param key string  Dedup key (typically a core field name or
+---     "property:<label>").
+--- @param value string|boolean  String value (will be normalized
+---     for compare-time matching) OR the literal `true` for a
+---     wildcard skip regardless of value.
+function SpeechDataModule.MarkSpokenValue(handlerState, key, value)
+    if not handlerState or not key then return end
+    handlerState.spokenRoles = handlerState.spokenRoles or {}
+    if value == true then
+        handlerState.spokenRoles[key] = true
+    elseif type(value) == "string" then
+        handlerState.spokenRoles[key] = NormalizeForCompare(value)
+    end
+end
+
+--- SetProtectionWindow: arm the suppress-interrupt window for the
+--- next durationMs milliseconds.  Subsequent interrupt-mode speech
+--- (Alert with priority="interrupt", screen-entry Speak)
+--- downgrades to queue mode while the window is active.  Repeated
+--- calls extend, never shorten, the deadline.
+--- @param durationMs number|nil  Defaults to 8000 (8 seconds).
+function SpeechDataModule.SetProtectionWindow(durationMs)
+    if not Ext.Utils or not Ext.Utils.MonotonicTime then return end
+    local newUntil = Ext.Utils.MonotonicTime() + (durationMs or 8000)
+    if newUntil > protectionUntilMs then
+        protectionUntilMs = newUntil
+    end
+end
+
 --- SpeakAlert: standalone function for background events.
 --- Bypasses the SpeechData field system entirely.
 --- @param text string  The text to speak.
@@ -805,6 +1146,12 @@ function SpeechDataModule.Alert(text, priority)
         return
     end
     local interrupt = (priority == "interrupt")
+    -- Downgrade interrupt -> queue while protection window is active
+    -- so background events (combat speech, dice rolls, dialogue
+    -- previews) don't clobber a tutorial mid-playback.
+    if interrupt and ShouldSuppressInterrupt() then
+        interrupt = false
+    end
     Log.Info("ALERT"
         .. (interrupt and "" or " (queue)")
         .. ": " .. text)
@@ -829,6 +1176,13 @@ local TOOLTIP_ROLE_MAP = {
     TitleName          = {field = "name",        tier = "brief"},
     TitleText          = {field = "name",        tier = "brief"},
     TitleArea          = {field = "name",        tier = "brief"},
+    -- Note: "root" is NOT mapped here as a name.  It's claimed
+    -- further down for the description case (status / VMActionResource
+    -- / CharacterTooltip body text).  The LSEntityObject creature
+    -- tooltip ALSO uses role="root" for the entity name, but with
+    -- different semantics -- handled per-DC in CharSheet.lua's
+    -- customTooltipFn (strips matching-name root entries before
+    -- the formatter runs), not in this global map.
 
     -- Description variants -> description.  The XAML uses both
     -- TitleCase and camelCase variants of the same name across
@@ -914,15 +1268,24 @@ local TOOLTIP_ROLE_MAP = {
                               return (text:gsub(
                                   "^Equipped by%s+", ""))
                           end},
-    -- Weight and Gold are factual bookkeeping that the user typically
-    -- only wants when they're explicitly evaluating an item (compare
-    -- view, merchant decisions).  At normal tier, equipment-slot
-    -- navigation should be terse -- "what is this and what does it
-    -- do" -- not "what does it weigh".  Verbose tier exposes both.
+    -- Weight and Gold: factual bookkeeping that scales naturally
+    -- with verbosity.  Tier "normal" so they pass the verbosity
+    -- filter at Normal+, then the speakItemWeight / speakItemGold
+    -- toggles in Verbosity settings provide per-feature on/off
+    -- control.  Brief verbosity filters them out via tier; Normal /
+    -- Verbose let the toggles decide.
     weightText         = {field = "property", label = "Weight",
-                          tier = "verbose"},
+                          tier = "normal"},
     GoldContainer      = {field = "property", label = "Gold",
-                          tier = "verbose"},
+                          tier = "normal"},
+    -- TradePriceText: the Trade panel's per-item haggled price (gold
+    -- the trader will pay or charge after Attitude / Discount).  Bare
+    -- numeric value, distinct from the item's nominal Gold property.
+    -- Tier "normal" -- price is essential to a buy/sell decision and
+    -- belongs alongside the rest of the item info, not gated to
+    -- verbose tier.
+    TradePriceText     = {field = "property", label = "Trade price",
+                          tier = "normal"},
     -- ArmorText carries the AC value; the label "Armour Class" is
     -- duplicated in the separate armorDisplay TextBlock which
     -- equipment handlers should drop after FromTooltip.  Tier
@@ -938,11 +1301,18 @@ local TOOLTIP_ROLE_MAP = {
     DamageRange        = {field = "property", label = "Amount",
                           tier = "brief"},
     -- damageDisplayText: VMItem weapon tooltip's calculated damage
-    -- range.  Complements the DamageLabel dice notation (1d6+3) with
-    -- the computed min-max (4 to 9).  Value bakes the type word in
-    -- ("4 to 9 Damage"); strip it so "Range: 4 to 9" doesn't repeat
-    -- the Damage type: entry that follows.
-    damageDisplayText  = {field = "property", label = "Range",
+    -- range (the min-max numbers).  Complements the DamageLabel dice
+    -- notation (1d6+3) with the computed min-max (4 to 9).  Value
+    -- bakes the type word in ("4 to 9 Damage"); strip it so
+    -- "Damage range: 4 to 9" doesn't repeat the Damage type: entry
+    -- that follows.
+    --
+    -- Label is "Damage range" (NOT just "Range") because BG3 also
+    -- uses the word Range for the weapon's reach in feet/metres,
+    -- which renders here as a separate "Property: 60ft" entry.
+    -- Calling damageDisplayText "Range" made the spoken tooltip
+    -- ambiguous between "how much damage" and "how far it reaches".
+    damageDisplayText  = {field = "property", label = "Damage range",
                           tier = "normal",
                           transform = function(text)
                               return (text:gsub(
@@ -1570,46 +1940,20 @@ function SpeechDataModule.CollapseProperties(
     end
 end
 
-function SpeechDataModule.SetHintsEnabled(enabled)
-    hintsEnabled = enabled
-end
-
-function SpeechDataModule.GetHintsEnabled()
-    return hintsEnabled
-end
-
---- SetVerbosity: set the module-global verbosity level.  Validates
---- the level against TIER_RANK (accepts "brief", "normal",
---- "verbose"); ignores invalid input.
+--- SetVerbosity: set the verbosity level.  Validates the level
+--- against TIER_RANK (accepts "brief", "normal", "verbose"); ignores
+--- invalid input.  Writes through Settings so the change persists.
 function SpeechDataModule.SetVerbosity(level)
     if TIER_RANK[level] then
-        currentVerbosity = level
+        local Settings = BG3Access.Client.Settings
+        if Settings and Settings.Set then
+            Settings.Set("verbosity", level)
+        end
     end
 end
 
 function SpeechDataModule.GetVerbosity()
-    return currentVerbosity
-end
-
--- Next step in the CycleVerbosity rotation: most detail -> least
--- detail -> wrap.
-local VERBOSITY_NEXT = {
-    verbose = "normal",
-    normal  = "brief",
-    brief   = "verbose",
-}
-
---- CycleVerbosity: advance the module-global verbosity to the next
---- step in the cycle (verbose -> normal -> brief -> verbose) and
---- announce the new level via SpeechData.Alert.  Used by the RS-Down
---- controller chord in EventRouter.lua to let the user toggle
---- speech detail on demand without a settings UI.
-function BG3Access.Client.CycleVerbosity()
-    local nextLevel = VERBOSITY_NEXT[currentVerbosity] or "verbose"
-    currentVerbosity = nextLevel
-    local label = nextLevel:sub(1, 1):upper() .. nextLevel:sub(2)
-    Log.Info("Verbosity: " .. label)
-    SpeechDataModule.Alert("Verbosity " .. label, "interrupt")
+    return ReadCurrentVerbosity()
 end
 
 -- Deferred Log binding: Log module loads before SpeechData,

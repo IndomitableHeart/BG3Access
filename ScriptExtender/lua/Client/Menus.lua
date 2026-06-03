@@ -91,6 +91,12 @@ local function SubscribeControllerInput(dcProps)
     local lastPressedButton = nil
 
     controllerInputSubscription = Ext.Events.ControllerButtonInput:Subscribe(function(event)
+        -- BG3Access settings menu owns input while open.
+        local SettingsMenu = BG3Access.Client.SettingsMenu
+        if SettingsMenu and SettingsMenu.IsOpen
+            and SettingsMenu.IsOpen() then
+            return
+        end
         if not event.Pressed then return end
         local buttonName = tostring(event.Button)
         Log.Debug("Controller button: " .. buttonName)
@@ -120,6 +126,11 @@ local function SubscribeControllerInput(dcProps)
 
     local axisSpoken = {}
     controllerAxisSubscription = Ext.Events.ControllerAxisInput:Subscribe(function(event)
+        local SettingsMenu = BG3Access.Client.SettingsMenu
+        if SettingsMenu and SettingsMenu.IsOpen
+            and SettingsMenu.IsOpen() then
+            return
+        end
         local axisName = tostring(event.Axis)
         local dcKey = SDL_AXIS_TO_DC_KEY[axisName]
         if not dcKey then return end
@@ -713,16 +724,19 @@ local function CreateMenuHandler(config)
     --- ResetNavigation: partial reset for widget root change within
     --- the same handler (e.g., switching tabs in Options).
     --- Preserves tabHintSpoken so the hint doesn't re-speak.
+    ---
+    --- Does NOT clear screenEntryOverrides OR screenEntryJustSpoke
+    --- -- both are forward-looking state set during screen entry
+    --- that the very next snapshot (item-nav or new screen entry)
+    --- needs to consume.  ResetNavigation runs between screen entry
+    --- and first focus when the new widget root is detected --
+    --- clearing either would wipe state set milliseconds earlier
+    --- and defeat the design.  HandleSnapshot owns the one-shot
+    --- consumption of both.
     local function ResetNavigation()
         handlerState.currentTabContext = nil
         handlerState.lastSpokenTitle = nil
         handlerState.lastSpokenName = nil
-        handlerState.screenEntryJustSpoke = false
-        -- NOTE: screenEntryOverrides is NOT cleared here.  It is set
-        -- by onWidgetAdded (which fires BEFORE ResetNavigation on
-        -- tab switches) and consumed by HandleSnapshot on the same
-        -- tick.  Clearing it here would wipe the overrides before
-        -- the snapshot can use them.
     end
 
     --- ResetHint: reset tabHintSpoken so the hint speaks on next visit.
@@ -796,6 +810,27 @@ local MultiplayerHandler = CreateMenuHandler({
 
 local SaveLoadHandler = CreateMenuHandler({
     name = "SaveLoad",
+    -- Navigation hint, contextualized by save vs load (the screen
+    -- title is "Save Game" / "Load Game" and decides the verb).
+    -- Spoken once per visit (factory dedup via tabHintSpoken).
+    hintFn = function(screenTitle)
+        local lowerTitle = (screenTitle or ""):lower()
+        local isSave = lowerTitle:find("save") ~= nil
+        local actionLine
+        if isSave then
+            actionLine = "A on a save slot to save into it,"
+                .. " or A on an empty New Save slot to create"
+                .. " a new save."
+        else
+            actionLine = "A on a save to load it."
+        end
+        return "Up and down to browse campaigns."
+            .. " A on a campaign to expand or collapse its list"
+            .. " of saves. When expanded, up and down to browse"
+            .. " individual saves. " .. actionLine
+            .. " X to delete the selected campaign."
+            .. " B to go back."
+    end,
     -- Detect save vs. load context when the widget first appears.
     -- The widget title ("Save Game" vs. "Load Game") is in dcProps or
     -- namedTexts of the widget data.  Store the result on handlerState
@@ -1336,22 +1371,44 @@ end
 --- @param widgetData table  The widget data for the dialog overlay.
 --- @return boolean  True if the dialog was spoken, false otherwise.
 local function HandleDialogOverlay(snapshot, widgetData)
-    -- Save/Load pre-load suppression: navigating between save entries
-    -- causes the game to pre-load the delete confirmation MessageBox.
-    -- Suppress dialogs that co-occur with save-related focus changes.
-    -- All other contexts (pause menu, options, etc.) speak normally.
+    -- Save/Load pre-load suppression: navigating between save ROWS
+    -- (VMSavegame entries inside an expanded campaign) causes the
+    -- game to pre-load the delete-confirmation MessageBox even
+    -- though the user didn't press anything.  Suppress dialogs
+    -- that co-occur with save-row focus changes specifically.
+    --
+    -- VMPlaythroughHolder (campaign header) was previously in this
+    -- list, but pressing X on a campaign header is an INTENTIONAL
+    -- action that opens the "Delete all but latest" confirmation,
+    -- and X-press triggers a focusChanged on the same tick (widget
+    -- rebuild repositions focus).  Including VMPlaythroughHolder
+    -- caused the legitimate confirm dialog to be silently dropped.
+    -- Save-row pre-load is the only documented misfire; restrict
+    -- the suppression to that single case.
     if snapshot.focusChanged or snapshot.selectionChanged then
         local focusedDCType = snapshot.focusedElement
             and snapshot.focusedElement.dcType or ""
-        if focusedDCType:find("VMSavegame")
-            or focusedDCType:find("VMPlaythroughHolder") then
+        if focusedDCType:find("VMSavegame") then
             Log.Debug("Skipping pre-loaded dialog overlay"
-                .. " (save navigation: " .. focusedDCType .. ")")
+                .. " (save-row navigation: " .. focusedDCType .. ")")
             return false
         end
     end
 
     local _, bodyText, actionsText = Helpers.ExtractFromWidgetData(widgetData)
+    -- Early placeholder filter: Helpers.ExtractFromWidgetData can
+    -- return unresolved LocaString parameter tokens like "[1]" or
+    -- "[ForceUpdate]" when the game hasn't substituted the binding.
+    -- Nil those out BEFORE the namedTexts fallback runs, otherwise
+    -- the fallback (which is gated on `not bodyText`) is skipped
+    -- and we end up with no body AND no diagnostic.
+    if bodyText then
+        local trimmed = bodyText:match("^%s*(.-)%s*$") or bodyText
+        if trimmed == "" or trimmed:match("^%[%d+%]$")
+            or trimmed:find("%[ForceUpdate%]") then
+            bodyText = nil
+        end
+    end
     local titleText = nil
     if widgetData.dcProps then
         titleText = widgetData.dcProps.Title or widgetData.dcProps.TitleText
@@ -1366,31 +1423,141 @@ local function HandleDialogOverlay(snapshot, widgetData)
             end
         end
     end
-    -- Filter out unresolved LocaString parameter placeholders
-    -- (e.g. "[1]") that the game didn't substitute.
-    if bodyText and bodyText:match("^%[%d+%]$") then
-        bodyText = nil
+    -- Body namedTexts fallback (mirrors the title fallback above).
+    -- Helpers.ExtractFromWidgetData probes dcProps for common body
+    -- field names (Text, Description, Message, etc.) and bindings
+    -- by path -- but Larian's MessageBox template puts the body in
+    -- an x:Named TextBlock under the widget's NameScope, where it
+    -- shows up in namedTexts.  Match common message-body x:Name
+    -- patterns; skip anything that looks title-ish or actions-ish.
+    if not bodyText and widgetData.namedTexts then
+        for elementName, elementText in pairs(widgetData.namedTexts) do
+            local lower = elementName:lower()
+            local looksLikeBody = lower:find("message")
+                or lower:find("body")
+                or lower:find("description")
+                or lower:find("content")
+                or lower == "text"
+            local looksLikeOther = lower:find("title")
+                or lower:find("button")
+                or lower:find("action")
+                or lower:find("hint")
+            if looksLikeBody and not looksLikeOther
+                and elementText and elementText ~= "" then
+                local candidate = elementText:match("^%s*(.-)%s*$")
+                    or elementText
+                if candidate ~= "" and not candidate:match("^%[%d+%]$")
+                    and not candidate:find("%[ForceUpdate%]")
+                    and candidate ~= titleText then
+                    bodyText = elementText
+                    break
+                end
+            end
+        end
     end
+    -- Live-element fallback: some dialog templates name the body
+    -- TextBlock "Message" and bind it through a Larian formatter,
+    -- so the C++ namedTexts collector misses it but a fresh read
+    -- at call time picks it up.  Empirically this does NOT work
+    -- for the standard LSMessageBox / MessageBoxTemplate path --
+    -- FindNameInWidget("Message") returns nil there because the
+    -- TextBlock lives inside the ControlTemplate's NameScope,
+    -- which isn't exposed to the widget's outer NameScope.  Kept
+    -- as a cheap try anyway in case a non-templated dialog uses
+    -- the same x:Name.  No logging -- silent failure is expected.
+    if not bodyText and widgetData.dcType
+        and widgetData.dcType:find("MessageBox") then
+        local findOk, messageElement = pcall(
+            Ext.UI.FindNameInWidget, "Message")
+        if findOk and messageElement then
+            local readOk, entries = pcall(
+                Ext.UI.ReadElementStructuredTextBlocks, messageElement)
+            if readOk and entries then
+                for _, entry in ipairs(entries) do
+                    local text = entry.text
+                    if text and text ~= "" then
+                        local trimmed = text:match("^%s*(.-)%s*$") or text
+                        if trimmed ~= "" and not trimmed:match("^%[%d+%]$")
+                            and not trimmed:find("%[ForceUpdate%]")
+                            and trimmed ~= titleText then
+                            bodyText = text
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- Log when body extraction fell short.  Single line at Debug
+    -- because the limitation is understood (see NOTE below) -- this
+    -- is just a marker for future investigation if a new template
+    -- shows up that's NOT the LSMessageBox formatter case.
+    if not bodyText then
+        Log.Debug("DIALOG OVERLAY no body extracted"
+            .. " (dcType=" .. tostring(widgetData.dcType) .. ")")
+    end
+    -- Helper: assemble title/body/actions into a SpeechData and emit
+    -- via SpeechData.Alert (interrupt priority).  Shared between the
+    -- immediate path and the deferred-body path so speech ordering
+    -- and field-routing rules stay in one place.
+    --
+    -- bodyArg uses "sectionLabel" (not "description") deliberately:
+    -- "description" routes through the speakDescription toggle (the
+    -- one core field in CORE_FIELD_TOGGLE_SETTINGS), which would
+    -- silence the body when the user picks the Normal verbosity
+    -- preset.  sectionLabel is unconditionally emitted by Format()
+    -- regardless of tier or toggle, and is the right semantic slot
+    -- for "subtitle / state info under title" -- which is exactly
+    -- what a confirmation-dialog body is to its title.  For
+    -- title-less dialogs (just a prompt), it speaks as the sole
+    -- content slot before the instructionHint with the buttons.
+    local function emitDialogSpeech(
+        titleArg, bodyArg, actionsArg, logTag)
+        local dialogSpeech = SpeechData.Create()
+        if titleArg then
+            dialogSpeech:Add("title", titleArg, "brief")
+        end
+        if bodyArg then
+            dialogSpeech:Add("sectionLabel", bodyArg, "brief")
+        end
+        if actionsArg then
+            dialogSpeech:Add("instructionHint", actionsArg, "normal")
+        end
+        local speech = dialogSpeech:Format()
+        if not speech or speech == "" then return false end
+        Log.Info("DIALOG OVERLAY" .. logTag .. ": " .. speech)
+        SpeechData.Alert(speech, "interrupt")
+        return true
+    end
+
+    -- NOTE: when widgetData.dcProps.TextProperty comes back as a
+    -- raw formatter placeholder ("[1]" etc.) and FindNameInWidget
+    -- ("Message") returns nil, we currently fall through and speak
+    -- title + actions without the body.  Confirmed cases: the
+    -- save-load "Delete all but the latest save" prompt, where the
+    -- body interpolates campaign name and autosave name.  A 30-frame
+    -- deferred RunAfterFrames retry was tried -- the body still
+    -- doesn't appear via FindNameInWidget at any tested delay, and
+    -- the deferred read introduces a noticeable delay before any
+    -- speech.  Likely root cause: the body TextBlock lives inside
+    -- the LSMessageBox ControlTemplate's NameScope, which is NOT
+    -- exposed in the widget's outer NameScope that FindNameInWidget
+    -- walks.  A proper fix needs either (a) C++ exposure of a
+    -- "walk the widget Visual subtree and gather all rendered
+    -- TextBlocks" primitive that descends through template
+    -- boundaries, or (b) a way to read the formatter's resolved
+    -- arg list off the LSMessageBoxData DC.  Title + actions are
+    -- enough to indicate WHAT action the user is confirming,
+    -- which is the critical accessibility need; the specific
+    -- campaign/save names are nice-to-have.
     local parts = {}
     if titleText then table.insert(parts, titleText) end
     if bodyText then table.insert(parts, bodyText) end
     if actionsText then table.insert(parts, actionsText) end
     if #parts > 0 then
-        local dialogSpeech = SpeechData.Create()
-        if titleText then
-            dialogSpeech:Add("title", titleText, "brief")
-        end
-        if bodyText then
-            dialogSpeech:Add("description", bodyText, "brief")
-        end
-        if actionsText then
-            dialogSpeech:Add("instructionHint", actionsText, "normal")
-        end
-        local speech = dialogSpeech:Format()
-        Log.Info("DIALOG OVERLAY: " .. speech)
-        Ext.Tolk.Speak(speech, true)
-        -- Suppress the active Menus handler on this tick so the dialog
-        -- isn't immediately interrupted by the underlying menu.
+        emitDialogSpeech(titleText, bodyText, actionsText, "")
+        -- Suppress the active Menus handler on this tick so the
+        -- dialog isn't immediately interrupted by the underlying menu.
         dialogOverlayJustSpoke = true
         return true
     end
@@ -1408,6 +1575,14 @@ local function RouteSnapshot(snapshot)
     menusDispatcher:RouteSnapshot(snapshot)
 end
 
+--- CheckLiveness: run dispatcher's liveness check ONLY (no pickup,
+--- no dispatch).  EventRouter calls this above the focusedElement
+--- guard so handlers whose widget went away during a "no focus"
+--- window (radial dismiss with no HUD target) still get deactivated.
+local function CheckLiveness(snapshot)
+    menusDispatcher:CheckLiveness(snapshot)
+end
+
 --- ResetAllHandlers: forwards to dispatcher.
 local function ResetAllHandlers()
     menusDispatcher:Reset()
@@ -1418,11 +1593,15 @@ local function GetActiveHandler()
     return menusDispatcher:GetActiveHandler()
 end
 
---- GetActiveHandlerWidgetName: returns one of the active handler's
---- registered widget x:Names, or nil.  Used by EventRouter for
---- widget-removal matching.
-local function GetActiveHandlerWidgetName()
-    return menusDispatcher:GetActiveHandlerWidgetName()
+--- GetActiveHandlerWidgetNames: returns the set of the active
+--- handler's registered widget x:Names (table keyed by name with
+--- value true), or nil.  Used by EventRouter for widget-removal
+--- matching.  Set form supports any-match queries across multi-
+--- widget-name handlers (e.g. SaveLoad covers LoadGame_c AND
+--- SaveGame_c -- the previous single-name return picked one
+--- arbitrarily and mis-fired liveness checks).
+local function GetActiveHandlerWidgetNames()
+    return menusDispatcher:GetActiveHandlerWidgetNames()
 end
 
 --- DispatchTooltip: routes structured tooltip data to the active
@@ -1441,6 +1620,7 @@ end
 
 BG3Access.Client.Menus = {
     RouteSnapshot           = RouteSnapshot,
+    CheckLiveness           = CheckLiveness,
     HandleWidgetAdded       = HandleWidgetAdded,
     HandleDialogOverlay     = HandleDialogOverlay,
     HandleWidgetRootChanged = HandleWidgetRootChanged,
@@ -1449,7 +1629,7 @@ BG3Access.Client.Menus = {
     IsMenuWidgetName        = IsMenuWidgetName,
     ResetAllHandlers        = ResetAllHandlers,
     GetActiveHandler        = GetActiveHandler,
-    GetActiveHandlerWidgetName = GetActiveHandlerWidgetName,
+    GetActiveHandlerWidgetNames = GetActiveHandlerWidgetNames,
     UnsubscribeControllerInput = UnsubscribeControllerInput,
     DispatchTooltip         = DispatchTooltip,
 }

@@ -31,6 +31,121 @@ local Log = BG3Access.Client.Log
 local Helpers = BG3Access.Client.Helpers
 local SpeechData = BG3Access.Client.SpeechData
 
+-- User-facing settings owned by WorldNav, all in the GPS submenu.
+-- Order here = order in the menu (registration order within a
+-- category).  See Client/Settings.lua for the category declarations
+-- and Client/_Init.lua for module load order.
+if BG3Access.Client.Settings then
+    BG3Access.Client.Settings.RegisterDefault(
+        "hazardRadarEnabled", true, { true, false },
+        "Hazard radar", "gpsSettings")
+    BG3Access.Client.Settings.RegisterDefault(
+        "playerFacingEnabled", true, { true, false },
+        "Facing announcements", "gpsSettings")
+    -- Unified direction format -- controls how facing, guidance,
+    -- AND proximity announcements report direction.  Two options:
+    --
+    --   * cardinal -- 12-point WORLD-relative compass labels
+    --     ("north-northeast", "west", "south-southwest", etc.).
+    --     "Facing northeast" + "target at northeast" = aligned;
+    --     direct label matching.  Use this when the player wants
+    --     to compare facing and target labels for navigation.
+    --
+    --   * clockface -- 12-hour CAMERA-relative clock positions
+    --     ("12 o'clock", "8 o'clock", etc.).  "12 o'clock" means
+    --     "ahead of where the camera looks" regardless of world
+    --     orientation.  Push-stick-forward intuition; doesn't
+    --     allow label matching with the facing announcement.
+    --
+    -- Default cardinal: the matching capability is the more
+    -- valuable feature for blind navigation, and works on any
+    -- camera angle (BG3 doesn't enforce north-up).
+    BG3Access.Client.Settings.RegisterDefault(
+        "directionFormat", "cardinal",
+        { "cardinal", "clockface" },
+        "Direction format", "gpsSettings")
+    -- Navigation guidance mode -- chooses how the GPS communicates
+    -- direction during a guided route.
+    --
+    --   * audio -- spatial-audio beacon only.  Per-tick direction
+    --     speech ("3 o'clock", "north-northeast") is suppressed.
+    --     Contextual speech (hazards, arrival, stuck, route start)
+    --     still fires -- this only silences the running direction
+    --     announcements.  Best for players who can interpret
+    --     spatial audio reliably and want a quieter HUD.
+    --
+    --   * voice -- per-tick direction speech only.  The spatial-
+    --     audio beacon is fully silent (no item spawn, no ticks).
+    --     Best for players who prefer verbal cues or whose audio
+    --     setup doesn't give clean stereo separation.  Ship default.
+    --
+    -- "both" was previously offered for dev/testing A-B comparison
+    -- but has been removed -- two parallel signals add cognitive
+    -- load no production player needs.
+    BG3Access.Client.Settings.RegisterDefault(
+        "guidanceMode", "voice",
+        { "audio", "voice" },
+        "Guidance mode", "gpsSettings")
+    -- Routing behavior -- chooses what happens when the user A-presses
+    -- an entity in the routing list.
+    --
+    --   * automatic -- the mod plots the path, asks the server if any
+    --     enemies sit near the corridor, and either auto-walks (server
+    --     CharacterMoveTo) or shows the "enemies on route" warning
+    --     prompt.  Player is passive once the route starts.  Default,
+    --     preserves the prior single behavior so existing installs
+    --     see no change.
+    --
+    --   * manually guided -- the mod skips the hostile-check and prompt
+    --     entirely and starts manual guided navigation (voice + spatial
+    --     beacon).  Player walks via the left stick, making every step
+    --     decision themselves.  Enemies are surfaced as the player
+    --     approaches them via the proximity tier system; no pre-route
+    --     prompt because the player controls the pace.
+    --
+    -- Spoken values capitalize the first letter -- "Automatic" and
+    -- "Manually guided" both read cleanly.  Read via GetRoutingBehavior().
+    -- Per-value hint text lives in SettingsMenu's HINTS table; this
+    -- registration only declares storage + default + options.
+    BG3Access.Client.Settings.RegisterDefault(
+        "routingBehavior", "automatic",
+        { "automatic", "manually guided" },
+        "Routing behavior", "gpsSettings")
+    -- Routing list range (meters).  Bounds how far away things show
+    -- up in the routing list (RS-Left -> Routing).  Also bounds the
+    -- entity scan that feeds proximity announcements -- but proximity
+    -- only fires within the much tighter tier thresholds (3m / 8m),
+    -- so the routing range doesn't affect how chatty the mod is, only
+    -- what's reachable from the list.  Tighter values cut clutter in
+    -- the list ("only what's right around me"); wider values reach
+    -- further -- though above ~50m, BG3's own client streaming horizon
+    -- typically hasn't loaded the entities yet, so wider values are
+    -- safe but may not surface more.  10m steps from 20 to 100 give 9
+    -- D-pad positions; finer steps would make scrolling end-to-end
+    -- tedious.  Default 50 matches prior hardcoded behavior so
+    -- existing installs see no change.  See GetRoutingListRange()
+    -- below for the read-path helper and ScanEntities() for the
+    -- single computational use.
+    BG3Access.Client.Settings.RegisterDefault(
+        "routingListRange", 50,
+        { 20, 30, 40, 50, 60, 70, 80, 90, 100 },
+        "Routing list range", "gpsSettings")
+    -- Tier presets for the Global verbosity dial.  Hazard radar
+    -- stays on always (safety > chatter -- walking into deep water
+    -- blindly is bad).  Facing announcements off in Brief because
+    -- they fire on every direction change while walking -- the
+    -- chattiest single source; on starting at Normal where the
+    -- orientation context is useful.  playerFacingFormat and
+    -- guidanceDirectionFormat sit out of presets entirely -- they're
+    -- format choices, not scales.
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "hazardRadarEnabled",
+        { brief = true, normal = true, verbose = true })
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "playerFacingEnabled",
+        { brief = false, normal = true, verbose = true })
+end
+
 -- Bundled state for guidance speech dedup.  After the detour state
 -- machine was removed (auto-walk handles routing), only the spoken
 -- bearing remains.  Kept as a one-field table both for forward-
@@ -46,14 +161,99 @@ local NavState = {
 -- ============================================================================
 
 -- Path-following.
-local GPS_GUIDANCE_MOVEMENT   = 2.0   -- meters between guidance updates
+-- ============================================================================
+-- Config: module-level scalar / single-line-table constants consolidated
+-- into one table.  Lua chunks cap at 200 active locals; aggregating these
+-- frees up ~50 slots that would otherwise be one-local-per-constant.  See
+-- tools/consolidate_constants.py for the migration script.
+--
+-- Multi-line tables (CATEGORY_NAMES, CARDINAL_LABELS, MANUAL_HAZARDS, etc.)
+-- stay as their own locals -- they're already one slot each and moving them
+-- mechanically risks subtle bugs in their multi-line literal nesting.
+-- ============================================================================
+local Config = {
+    GPS_GUIDANCE_MOVEMENT = 2.0, -- meters between guidance updates
+    GPS_FALLBACK_MOVETO_MIN = 0.5,
+    GPS_FALLBACK_MOVETO_MAX = 3.5,
+    GPS_ENDPOINT_ARRIVAL_M = 0.8,
+    GPS_ENDPOINT_MAX_DISTANCE = 4.5,
+    GPS_CLOSE_ENOUGH_FLOOR = 2.0, -- Y tolerance below target
+    GPS_CLOSE_ENOUGH_CEIL = 2.0, -- Y tolerance above target
+    GPS_INTERACT_CLOSE_ENOUGH_MAX = 1.5,
+    GPS_PROGRESS_DELTA = 0.10, -- meters per position-check tick
+    GPS_STUCK_TICKS = 10, -- ~3.0s of no progress
+    GPS_STUCK_CLOSE_RANGE_PAD = 3.0,
+    GPS_REROUTE_STABILITY_TICKS = 3,
+    GPS_NO_PATH_CANCEL_TICKS = 10,
+    GPS_PROXIMITY_TIER1_ENTER_M = 3.0,
+    GPS_PROXIMITY_TIER1_EXIT_M = 5.0,
+    GPS_PROXIMITY_TIER2_ENTER_M = 8.0,
+    GPS_PROXIMITY_TIER2_EXIT_M = 12.0,
+    -- Routing list range lives in Settings (key "routingListRange",
+    -- default 50).  Use GetRoutingListRange() below to read it.
+    -- Kept out of Config so there's exactly one source of truth.
+    ENTITY_SCAN_MOVEMENT = 3.0, -- meters before rescanning
+    ROUTING_LIST_RANGE_FALLBACK = 50, -- only if Settings unavailable
+    GPS_PROXIMITY_POLL_M = 2.0,
+    POSITION_CHECK_MS = 300, -- between position checks
+    GPS_MODE_OFF = "off",
+    GPS_MODE_EXPLORATION = "exploration",
+    GPS_MODE_ROUTING = "routing",
+    ENTITY_MIN_DISTANCE = 1.0,
+    DEGREES_PER_CLOCK_HOUR = 30,
+    GPS_STUCK_GRACE_TICKS = 4,
+    FACING_STABLE_MS = 400,
+    FACING_MIN_INTERVAL_MS = 1500,
+    CLASSIFY_CHANNEL_REQUEST = "BG3Access_ClassifyRequest",
+    CLASSIFY_CHANNEL_RESPONSE = "BG3Access_ClassifyResponse",
+    PLAYER_COMPONENTS = {"ClientControl", "PartyMember", "Player"},
+    ZERO_VEC = {0, 0, 0},
+    GPS_HAZARD_INFLUENCE = 50000,
+    GPS_HAZARD_PROBE_RADIUS = 0.75,
+    GPS_HAZARD_INTERNODE_SAMPLE_M = 0.75,
+    GPS_LOOT_GOLD_THRESHOLD = 10,
+    DIAGNOSTIC_LIMIT = 12,
+    GPS_STRAIGHT_LINE_SAMPLE_M = 1.0,
+    GPS_STEERING_DISTANCE = 2.0,
+    GPS_HAZARD_WARNING_M = 12.0,
+    GPS_OFF_PATH_M = 4.0, -- perpendicular drift that invalidates path
+    GPS_TARGET_MOVED_M = 3.0, -- target delta that invalidates path
+    GPS_CLOSE_RANGE_STEERING_M = 5.0,
+    GPS_BEARING_MIN_SEGMENT_M = 0.1,
+    GPS_DETOUR_LEG_MAX_M = 6.0,
+    REROUTE_SHRINK_TOLERANCE = 1.5,
+    MIN_REROUTE_DELTA_M = 0.5,
+    -- Distance ahead along the path that the smoothed sample point
+    -- lands.  The sample is always ON the path (walkable), but the
+    -- straight-line bearing from the player to that sample can cut
+    -- through obstacles if the path winds around a wall within this
+    -- distance.  1.5m is short enough to follow the immediate path
+    -- segment (since path nodes are typically <1m apart) while still
+    -- being far enough that bearing doesn't jitter every node crossing.
+    -- Was 3.0m, which sampled ~5 nodes ahead in dense paths and
+    -- produced bearings that pointed THROUGH obstacles when the path
+    -- turned sharply within those 5 nodes.
+    GPS_BEARING_SAMPLE_M = 1.5,
+    AUTOWALK_REQUEST_CHANNEL = "BG3Access_AutoWalk",
+    AUTOWALK_TRACK_CHANNEL = "BG3Access_AutoWalk_TrackTarget",
+    AUTOWALK_RESULT_CHANNEL = "BG3Access_AutoWalkResult",
+    ARRIVAL_TOLERANCE_M = 5.0,
+    DISTANCES = { 6, 12, 18 },
+    AHEAD_CONE_RAD = math.pi / 8,
+    MIN_MOTION_M = 0.3,
+    REPEAT_MS = 30000,
+    MIN_INTERVAL_MS = 1000,
+    PROXIMITY_MIN_INTERVAL_MS = 1000,
+}
+
+-- GPS_GUIDANCE_MOVEMENT moved to Config table; see Config.GPS_GUIDANCE_MOVEMENT
 
 -- Fallback values for the BG3 engine config constants below, used
 -- only if Ext.ExtraData is unavailable at the time of first read.
 -- The real values are read lazily from Ext.ExtraData and cached so
 -- the mod always tracks whatever BG3 itself uses.
-local GPS_FALLBACK_MOVETO_MIN = 0.5
-local GPS_FALLBACK_MOVETO_MAX = 3.5
+-- GPS_FALLBACK_MOVETO_MIN moved to Config table; see Config.GPS_FALLBACK_MOVETO_MIN
+-- GPS_FALLBACK_MOVETO_MAX moved to Config table; see Config.GPS_FALLBACK_MOVETO_MAX
 
 -- Path-endpoint arrival.  When the target position is inside an
 -- unwalkable mesh (corpse, container, decoration), the pathfinder
@@ -64,8 +264,8 @@ local GPS_FALLBACK_MOVETO_MAX = 3.5
 -- as arrival: the pathfinder has done its best and this is the
 -- closest physical approach.  Kept as a safety net even though the
 -- move-to tolerances now match BG3's own.
-local GPS_ENDPOINT_ARRIVAL_M  = 0.8
-local GPS_ENDPOINT_MAX_DISTANCE = 4.5
+-- GPS_ENDPOINT_ARRIVAL_M moved to Config table; see Config.GPS_ENDPOINT_ARRIVAL_M
+-- GPS_ENDPOINT_MAX_DISTANCE moved to Config table; see Config.GPS_ENDPOINT_MAX_DISTANCE
 
 -- Resolved at first use from Ext.ExtraData.
 local cachedMoveToCloseEnoughMin = nil
@@ -86,7 +286,7 @@ local function GetMoveToCloseEnoughMin()
         cachedMoveToCloseEnoughMin = value
         return value
     end
-    return GPS_FALLBACK_MOVETO_MIN
+    return Config.GPS_FALLBACK_MOVETO_MIN
 end
 
 --- Return BG3's authoritative "move to target" maximum close-enough
@@ -107,15 +307,34 @@ local function GetMoveToCloseEnoughMax()
         cachedMoveToCloseEnoughMax = value
         return value
     end
-    return GPS_FALLBACK_MOVETO_MAX
+    return Config.GPS_FALLBACK_MOVETO_MAX
+end
+
+--- Return the user-selected routing list range in meters.  Reads the
+--- "routingListRange" setting (registered at module load above) and
+--- falls back to ROUTING_LIST_RANGE_FALLBACK (50) if Settings is
+--- unavailable for any reason.  Not cached -- the read is cheap
+--- (table lookup) and caching would force a settings-change listener
+--- to invalidate.  Used by ScanEntities (which feeds both the
+--- routing list and the proximity tier system) and the CHARSCAN
+--- debug print.
+local function GetRoutingListRange()
+    local settingsModule = BG3Access.Client.Settings
+    if settingsModule and settingsModule.Get then
+        local value = settingsModule.Get("routingListRange")
+        if type(value) == "number" then
+            return value
+        end
+    end
+    return Config.ROUTING_LIST_RANGE_FALLBACK
 end
 
 -- Pathfinder "close enough" Y tolerances.  The horizontal thresholds
 -- (Min/Max) are read at runtime from Ext.ExtraData via the
 -- GetMoveToCloseEnough* helpers above.  Y tolerances are not in
 -- ExtraData, so they stay hand-picked.
-local GPS_CLOSE_ENOUGH_FLOOR  = 2.0   -- Y tolerance below target
-local GPS_CLOSE_ENOUGH_CEIL   = 2.0   -- Y tolerance above target
+-- GPS_CLOSE_ENOUGH_FLOOR moved to Config table; see Config.GPS_CLOSE_ENOUGH_FLOOR
+-- GPS_CLOSE_ENOUGH_CEIL moved to Config table; see Config.GPS_CLOSE_ENOUGH_CEIL
 
 -- Two-phase pathfinding close-enough radii.  BG3's authoritative
 -- MoveToTargetCloseEnoughMax (3.5m) is "generic walk-to distance" --
@@ -139,7 +358,7 @@ local GPS_CLOSE_ENOUGH_CEIL   = 2.0   -- Y tolerance above target
 --                     player stops walking but may need to nudge
 --                     manually to interact.  Path-endpoint arrival
 --                     remains the last-resort fallback.
-local GPS_INTERACT_CLOSE_ENOUGH_MAX = 1.5
+-- GPS_INTERACT_CLOSE_ENOUGH_MAX moved to Config table; see Config.GPS_INTERACT_CLOSE_ENOUGH_MAX
 
 -- Stuck detection.  Every position check (POSITION_CHECK_MS = 300ms),
 -- we compare distance-to-target against the previous check.  If it
@@ -159,8 +378,8 @@ local GPS_INTERACT_CLOSE_ENOUGH_MAX = 1.5
 --     The longer window pairs with the looser progress threshold
 --     so genuine blockages still trip but cautious-walking pauses
 --     do not.
-local GPS_PROGRESS_DELTA      = 0.10  -- meters per position-check tick
-local GPS_STUCK_TICKS         = 10    -- ~3.0s of no progress
+-- GPS_PROGRESS_DELTA moved to Config table; see Config.GPS_PROGRESS_DELTA
+-- GPS_STUCK_TICKS moved to Config table; see Config.GPS_STUCK_TICKS
 -- Close-range exclusion radius for stuck detection.  When the player
 -- is within arrivalThreshold + GPS_STUCK_CLOSE_RANGE_PAD of the raw
 -- target position, stuck detection is disabled entirely -- that's
@@ -175,7 +394,7 @@ local GPS_STUCK_TICKS         = 10    -- ~3.0s of no progress
 -- approach.  Previously 1.5, which only covered a ~3m exclusion
 -- zone and fired a false "Path blocked" at 4.91m on the Mind
 -- Flayer Pod approach.
-local GPS_STUCK_CLOSE_RANGE_PAD = 3.0
+-- GPS_STUCK_CLOSE_RANGE_PAD moved to Config table; see Config.GPS_STUCK_CLOSE_RANGE_PAD
 
 -- Consecutive clean-path ticks required before the reroute
 -- announcement fires.  Guards against single-tick probe jitter
@@ -184,7 +403,7 @@ local GPS_STUCK_CLOSE_RANGE_PAD = 3.0
 -- 300ms = ~0.9s of stable clean state -- short enough that a real
 -- reroute still announces promptly, long enough that scan noise
 -- doesn't trigger false positives.
-local GPS_REROUTE_STABILITY_TICKS = 3
+-- GPS_REROUTE_STABILITY_TICKS moved to Config table; see Config.GPS_REROUTE_STABILITY_TICKS
 
 -- Consecutive no-path ticks required before auto-cancelling
 -- tracking.  10 ticks * 300ms = 3.0 seconds of consistent "no
@@ -192,7 +411,7 @@ local GPS_REROUTE_STABILITY_TICKS = 3
 -- that the player is not left wondering why GPS is dead, long
 -- enough that transient navmesh hiccups (a party member briefly
 -- blocking every route) do not falsely cancel a valid target.
-local GPS_NO_PATH_CANCEL_TICKS = 10
+-- GPS_NO_PATH_CANCEL_TICKS moved to Config table; see Config.GPS_NO_PATH_CANCEL_TICKS
 
 -- Proximity mode (Exploration tier announcements).
 --
@@ -217,37 +436,37 @@ local GPS_NO_PATH_CANCEL_TICKS = 10
 -- (GPS_PROXIMITY_MAX, GPS_PROXIMITY_MOVEMENT) are gone -- the
 -- new model has no "max per cycle" because each tier latch
 -- limits firing to actual transitions, not a fixed budget.
-local GPS_PROXIMITY_TIER1_ENTER_M = 3.0
-local GPS_PROXIMITY_TIER1_EXIT_M  = 5.0
-local GPS_PROXIMITY_TIER2_ENTER_M = 8.0
-local GPS_PROXIMITY_TIER2_EXIT_M  = 12.0
+-- GPS_PROXIMITY_TIER1_ENTER_M moved to Config table; see Config.GPS_PROXIMITY_TIER1_ENTER_M
+-- GPS_PROXIMITY_TIER1_EXIT_M moved to Config table; see Config.GPS_PROXIMITY_TIER1_EXIT_M
+-- GPS_PROXIMITY_TIER2_ENTER_M moved to Config table; see Config.GPS_PROXIMITY_TIER2_ENTER_M
+-- GPS_PROXIMITY_TIER2_EXIT_M moved to Config table; see Config.GPS_PROXIMITY_TIER2_EXIT_M
 
 -- Entity scanning.
-local ENTITY_SCAN_RADIUS      = 50    -- meters for entity scanning
-local ENTITY_SCAN_MOVEMENT    = 3.0   -- meters before rescanning
+-- Scan radius moved to Settings (key "routingListRange"); read via GetRoutingListRange()
+-- ENTITY_SCAN_MOVEMENT moved to Config table; see Config.ENTITY_SCAN_MOVEMENT
 
 -- Movement threshold for the proximity poller to run at all.
 -- Previously GPS_PROXIMITY_MOVEMENT; kept as its own constant so
 -- the proximity poll rate is decoupled from the scan rate.  At
 -- 2m we get frequent enough latch updates to catch transitions
 -- without running the whole scanner on every 300ms tick.
-local GPS_PROXIMITY_POLL_M    = 2.0
+-- GPS_PROXIMITY_POLL_M moved to Config table; see Config.GPS_PROXIMITY_POLL_M
 
 -- Timing (milliseconds).
-local POSITION_CHECK_MS       = 300   -- between position checks
+-- POSITION_CHECK_MS moved to Config table; see Config.POSITION_CHECK_MS
 
 -- GPS mode constants.  RS Left cycles Off -> Exploration -> Routing -> Off.
-local GPS_MODE_OFF            = "off"
-local GPS_MODE_EXPLORATION    = "exploration"
-local GPS_MODE_ROUTING        = "routing"
+-- GPS_MODE_OFF moved to Config table; see Config.GPS_MODE_OFF
+-- GPS_MODE_EXPLORATION moved to Config table; see Config.GPS_MODE_EXPLORATION
+-- GPS_MODE_ROUTING moved to Config table; see Config.GPS_MODE_ROUTING
 
 -- Minimum distance to include an entity in scan results.
 -- Filters out inventory items (worn/carried) which share the player's
 -- position, and the player entity itself.
-local ENTITY_MIN_DISTANCE     = 1.0
+-- ENTITY_MIN_DISTANCE moved to Config table; see Config.ENTITY_MIN_DISTANCE
 
 -- Clock direction: 30 degrees per hour.
-local DEGREES_PER_CLOCK_HOUR  = 30
+-- DEGREES_PER_CLOCK_HOUR moved to Config table; see Config.DEGREES_PER_CLOCK_HOUR
 
 -- Entity category names (order matches D-pad left/right cycling).
 -- Entity category names (order matches D-pad left/right cycling).
@@ -257,26 +476,98 @@ local DEGREES_PER_CLOCK_HOUR  = 30
 -- Empty categories stay in the cycle order and say "None" when
 -- visited rather than auto-skipping.
 local CATEGORY_NAMES          = {
-    "Companions",     -- party members (alive/downed/dead) - DISTANCE-UNBOUNDED
-    "NPCs",           -- alive non-party characters
-    "Doors",          -- doors, hatches, traversal
-    "Containers",     -- chests, crates, pods, corpses, lootables
-    "Quest items",    -- items flagged as story/quest-relevant
-    "Consumables",    -- potions, scrolls, grenades, utility
-    "Food",           -- trivial-heal consumables (<=3 HP)
-    "Herbs",          -- alchemy ingredients (harvestable plants)
-    "Equipment",      -- weapons, armor, wearables with a slot
-    "Loot",           -- valuables (gold value >= threshold)
-    "Books and keys", -- readable / letter / prayer / key items
-    "Miscellaneous",  -- fallback for anything else (scenery, props)
+    "Companions",       -- party members (alive/downed/dead) - DISTANCE-UNBOUNDED
+    "NPCs",             -- alive non-party characters
+    "Waypoints",        -- unlocked fast-travel shrines (named locations).
+                        -- Populated from Locations module, not the entity
+                        -- scanner; entries are "virtual" and routed by
+                        -- world position rather than entity reference.
+    "Discovered places", -- subregions the player has entered this session
+                        -- (Druid Grove, Goblin Camp, etc.).  Virtual
+                        -- entries too -- position is wherever the player
+                        -- was the last time they crossed in.
+    "Doors",            -- doors, hatches, traversal
+    "Containers",       -- chests, crates, pods, corpses, lootables
+    "Quest items",      -- items flagged as story/quest-relevant
+    "Consumables",      -- potions, scrolls, grenades, utility
+    "Food",             -- trivial-heal consumables (<=3 HP)
+    "Herbs",            -- alchemy ingredients (harvestable plants)
+    "Equipment",        -- weapons, armor, wearables with a slot
+    "Loot",             -- valuables (gold value >= threshold)
+    "Books and keys",   -- readable / letter / prayer / key items
+    "Miscellaneous",    -- fallback for anything else (scenery, props)
 }
+
+-- Per-category enable/disable toggles.  Registered as one boolean
+-- setting per CATEGORY_NAMES entry under a "Routing list categories"
+-- subcategory in the GPS settings submenu.  Defaults all on (preserves
+-- current behavior); turn one off to make that category invisible to
+-- the entity-list cycle entirely (it's skipped, not "shown as None").
+-- Setting key derived from the category name: lowercase + spaces
+-- replaced with underscores ("Books and keys" -> "books_and_keys").
+local function CategorySettingKey(categoryName)
+    return "routingCategory_"
+        .. categoryName:lower():gsub(" ", "_")
+end
+
+if BG3Access.Client.Settings then
+    BG3Access.Client.Settings.RegisterCategory(
+        "gpsRoutingCategoriesSettings",
+        "Routing list categories",
+        "gpsSettings")
+    for _, categoryName in ipairs(CATEGORY_NAMES) do
+        BG3Access.Client.Settings.RegisterDefault(
+            CategorySettingKey(categoryName),
+            true, { true, false },
+            categoryName, "gpsRoutingCategoriesSettings")
+    end
+end
+
+--- IsCategoryEnabled: cached read of the per-category toggle.
+--- Returns true if the setting module is unavailable (safest default).
+local function IsCategoryEnabled(categoryName)
+    local Settings = BG3Access.Client.Settings
+    if not Settings or not Settings.Get then return true end
+    local value = Settings.Get(CategorySettingKey(categoryName))
+    -- Default-true: a missing / nil setting means "not yet set" which
+    -- happens for users with an older settings file before this feature.
+    if value == nil then return true end
+    return value == true
+end
+
+--- NextEnabledCategoryIndex: starting from `start`, step in `direction`
+--- (+1 next / -1 previous) and return the index of the first enabled
+--- category.  Wraps at the end.  Returns nil if NO categories are
+--- enabled (caller should treat that as "do nothing").
+local function NextEnabledCategoryIndex(start, direction)
+    local idx = start
+    for _ = 1, #CATEGORY_NAMES do
+        idx = idx + direction
+        if idx > #CATEGORY_NAMES then idx = 1 end
+        if idx < 1 then idx = #CATEGORY_NAMES end
+        if IsCategoryEnabled(CATEGORY_NAMES[idx]) then
+            return idx
+        end
+    end
+    return nil  -- nothing enabled
+end
+
+--- FirstEnabledCategoryIndex: return the lowest-numbered enabled
+--- category, or nil if none enabled.  Used by OpenEntityList to pick
+--- the starting category instead of always index 1.
+local function FirstEnabledCategoryIndex()
+    for idx, categoryName in ipairs(CATEGORY_NAMES) do
+        if IsCategoryEnabled(categoryName) then return idx end
+    end
+    return nil
+end
 
 -- ============================================================================
 -- State
 -- ============================================================================
 
 -- GPS state.
-local gpsMode                = GPS_MODE_OFF  -- RS-Left cycles Off/Exploration/Routing
+local gpsMode                = Config.GPS_MODE_OFF  -- RS-Left cycles Off/Exploration/Routing
 local trackingTarget         = nil    -- {handle, name, position, entity}
 local autoWalkActive         = nil    -- {targetName, targetPosition} while engine-driven walk in flight
 local currentPath            = nil    -- array of {[1]=x, [2]=y, [3]=z}
@@ -306,6 +597,16 @@ local lastProximityUpdateMs  = 0      -- throttle: ms timestamp of last
                                        -- and stall the game.
 local tier1Latched           = {}     -- {entityKey = true}
 local tier2Latched           = {}     -- {entityKey = true}
+
+-- Set of entity keys whose entity carried the HasExclamationDialog
+-- tag at the previous scan.  Maintained per-scan so we can diff
+-- against the current scan and announce "X wants to talk" exactly
+-- once for entities that newly acquired the tag (companion got a
+-- banter ready, quest-giver got a new dialogue line).  Mirrors the
+-- floating "!" icon sighted players see appear over the NPC head.
+-- Reset on mode entry so the user gets a fresh "what's actionable"
+-- recap each time they enter Exploration / Routing.
+local previousWantsToTalkSet = {}     -- {entityKey = true}
 
 -- Stuck detection state.  Reset on target change / progress.
 local stuckTickCount         = 0
@@ -364,7 +665,7 @@ local noPathTickCount        = 0
 local trackingTicks          = 0
 -- Position-check ticks before stuck detection becomes active.
 -- 4 ticks * 300ms = 1.2 seconds of grace before stuck can fire.
-local GPS_STUCK_GRACE_TICKS  = 4
+-- GPS_STUCK_GRACE_TICKS moved to Config table; see Config.GPS_STUCK_GRACE_TICKS
 
 -- Entity scanning state.
 local scannedCategories      = {}     -- {NPCs={...}, Doors={...}, ...}
@@ -398,6 +699,21 @@ local routingHintSpoken      = false
 -- Tick timing.
 local lastPositionCheckTime  = 0
 
+-- Player facing announcement state.  The player's facing direction
+-- (derived from the camera-to-player vector) is read every tick and
+-- compared against the last announced cardinal label.  When the
+-- cardinal slot changes AND has been stable for FACING_STABLE_MS,
+-- the new direction is announced.  Throttled by
+-- FACING_MIN_INTERVAL_MS so a slow continuous turn doesn't spam.
+-- Suppressed during auto-walk (the GPS speaks turn-by-turn already)
+-- and while a menu has an active handler.
+local lastFacingLabel        = nil
+local pendingFacingLabel     = nil
+local pendingFacingSinceMs   = 0
+local lastFacingAnnounceMs   = 0
+-- FACING_STABLE_MS moved to Config table; see Config.FACING_STABLE_MS
+-- FACING_MIN_INTERVAL_MS moved to Config table; see Config.FACING_MIN_INTERVAL_MS
+
 -- ============================================================================
 -- Server-side Template Data Cache
 -- ============================================================================
@@ -429,8 +745,8 @@ local lastPositionCheckTime  = 0
 --   TemplateName       = string,
 -- }
 
-local CLASSIFY_CHANNEL_REQUEST  = "BG3Access_ClassifyRequest"
-local CLASSIFY_CHANNEL_RESPONSE = "BG3Access_ClassifyResponse"
+-- CLASSIFY_CHANNEL_REQUEST moved to Config table; see Config.CLASSIFY_CHANNEL_REQUEST
+-- CLASSIFY_CHANNEL_RESPONSE moved to Config table; see Config.CLASSIFY_CHANNEL_RESPONSE
 
 local entityClassifyCache    = {}  -- entityUuid -> {fields}
 local classifyRequestPending = false
@@ -447,7 +763,7 @@ local function RequestEntityClassification(uuids)
     Log.Info(string.format(
         "Classify request: sending %d UUIDs to server", #uuids))
     pcall(Ext.ClientNet.PostMessageToServer,
-        CLASSIFY_CHANNEL_REQUEST, payload)
+        Config.CLASSIFY_CHANNEL_REQUEST, payload)
 end
 
 --- Look up cached classification data for an entity by UUID.
@@ -476,11 +792,71 @@ local scannedEntitiesRaw = {}
 -- further down in the Entity Scanning section.
 local ClassifyScannedEntities
 
+-- Hostile-on-route check + warning prompt: everything lives on this
+-- single state table so the section adds ONE module-level local
+-- rather than 17.  Lua caps a chunk at 200 active locals; without
+-- the table consolidation, WorldNav.lua blows that limit and refuses
+-- to parse with "too many local variables".  Tuning constants,
+-- mutable state, and methods all bundle in here together.  See the
+-- "Hostile-on-route check + warning prompt" section near the bottom
+-- of the file for the actual implementations -- this is just the
+-- forward-declared container so callers earlier in the file
+-- (ClearGPSState, ResetState) can reach the cleanup methods.
+
+-- GPS spatial-audio beacon forward declaration.  Same pattern as
+-- hostileWarning below -- the table is populated near the bottom of
+-- the file (search "GPS navigation beacon"), but earlier callers
+-- (UpdateTrackingState, CancelTrackingTarget, EnterOffMode) need to
+-- reach gpsBeacon.Stop / gpsBeacon.Start.  Without this forward
+-- declaration, Lua's lexical-scoping resolves `gpsBeacon` to a global
+-- in those functions' upvalues -> nil index error at runtime.
+local gpsBeacon = {}
+
+local hostileWarning = {
+    -- Tuning constants.
+    --
+    -- PROXIMITY_M sets how close (in meters) a hostile must be to
+    -- any path segment to trigger the warning.  Tuning history:
+    --   12 -- initial guess.  Looked fine in isolation but the
+    --        check ran client-side then, and the client scanner
+    --        was missing the relevant hostiles entirely, so we
+    --        never validated the threshold against real-world
+    --        encounter geometry.
+    --   25 -- bumped after we moved the check server-side.  Catches
+    --        the in-the-wreckage scenario (e.g. Dirt Mound on
+    --        Ravaged Beach -- intellect devourers aggro during the
+    --        walk), but over-warns on routes that pass near the
+    --        SAME hostile cluster without actually triggering them
+    --        (e.g. Ancient Sigil Circle waypoint walk goes around
+    --        the same devourers safely).
+    --   15 -- current.  Close to the upper end of typical BG3 aggro
+    --        radii (most enemies aggro at 6-12m; alert / scripted
+    --        ones extend to ~15m).  Should catch real "going-to-
+    --        trigger-combat" cases while letting safe-distance
+    --        passes through.  May need further tuning if specific
+    --        encounters slip past.
+    PROXIMITY_M       = 15,
+    CHECK_PATH_MIN_M  = 5,     -- paths shorter than this skip the check (small moves unlikely to engage).
+    CHECK_TIMEOUT_MS  = 2000,  -- give up on server response after this long.
+    PROMPT_TIMEOUT_MS = 30000, -- auto-cancel an unanswered warning prompt after this long.
+    CHECK_CHANNEL     = "BG3Access_HostileCheck",
+    RESULT_CHANNEL    = "BG3Access_HostileCheckResult",
+    -- Mutable state (initialized nil; populated by the methods).
+    pendingCheck      = nil,
+    pendingPrompt     = nil,
+    nextQueryId       = 0,
+    -- Methods (assigned in the section near the bottom of the file).
+    ClearPendingCheck  = nil,
+    ClearPendingPrompt = nil,
+    DispatchSelection  = nil,
+    ShowPrompt         = nil,
+}
+
 --- Net message listener: receives template data from the server,
 --- populates the cache, and re-runs classification on the raw
 --- scanned entities so categories are now based on authoritative
 --- template data instead of heuristic fallbacks.
-Ext.RegisterNetListener(CLASSIFY_CHANNEL_RESPONSE,
+Ext.RegisterNetListener(Config.CLASSIFY_CHANNEL_RESPONSE,
     function(channel, payload, userId)
         local ok, results = pcall(Ext.Json.Parse, payload)
         if not ok or type(results) ~= "table" then
@@ -636,7 +1012,7 @@ end
 local function RadiansToClockHour(angleRadians)
     local degrees = (angleRadians * 180 / math.pi) % 360
     if degrees < 0 then degrees = degrees + 360 end
-    local hour = math.floor(degrees / DEGREES_PER_CLOCK_HOUR + 0.5) % 12
+    local hour = math.floor(degrees / Config.DEGREES_PER_CLOCK_HOUR + 0.5) % 12
     if hour == 0 then hour = 12 end
     return hour
 end
@@ -660,7 +1036,7 @@ end
 --                   member" anchor when ClientControl points at a corpse.
 --   Player        - eoc::PlayerComponent (tag) - generic "is a player
 --                   character" tag.  Last-resort fallback.
-local PLAYER_COMPONENTS = {"ClientControl", "PartyMember", "Player"}
+-- PLAYER_COMPONENTS moved to Config table; see Config.PLAYER_COMPONENTS
 
 --- Returns true when the entity is alive (Hp > 0) or has no Health
 --- component.  Used to filter out dead candidates in GetPlayerEntity.
@@ -702,7 +1078,7 @@ local function GetPlayerEntity()
     -- IsPlayer / PlayerController are fallbacks for the rare cases
     -- (loading transitions, post-KO frames) where ClientControl
     -- returns nothing or a dead entity.
-    for _, componentName in ipairs(PLAYER_COMPONENTS) do
+    for _, componentName in ipairs(Config.PLAYER_COMPONENTS) do
         local ok, candidates = pcall(
             Ext.Entity.GetAllEntitiesWithComponent, componentName)
         if ok and candidates then
@@ -722,10 +1098,10 @@ end
 --- Materialize a vec3 userdata into a plain Lua table {x, y, z}.
 --- BG3SE vec3 from entity components are userdata; Ext.Math.Sub
 --- with a zero vector converts them into indexable tables.
-local ZERO_VEC = {0, 0, 0}
+-- ZERO_VEC moved to Config table; see Config.ZERO_VEC
 
 local function MaterializeVec3(vec3Userdata)
-    return Ext.Math.Sub(vec3Userdata, ZERO_VEC)
+    return Ext.Math.Sub(vec3Userdata, Config.ZERO_VEC)
 end
 
 --- Get an entity's world position as a plain {x, y, z} table.
@@ -844,6 +1220,132 @@ local function ComputeClockDirection(playerPosition, targetPosition)
     return clockHour, distance
 end
 
+-- 12-point WORLD-relative cardinal labels.  Indexed by bucket 1..12
+-- where bucket 1 = north (0 degrees world), bucket 2 = north-
+-- northeast (30 degrees), etc., clockwise.  Same axis convention as
+-- the original 8-point CARDINAL_LABELS: +Z = north.
+--
+-- Full words ("north-northeast") rather than abbreviations ("NNE")
+-- because TTS engines often pronounce abbreviations letter-by-letter
+-- ("en-en-ee") which is confusing.
+local CARDINAL12_LABELS_WORLD = {
+    "north",            "north-northeast",  "east-northeast",
+    "east",             "east-southeast",   "south-southeast",
+    "south",            "south-southwest",  "west-southwest",
+    "west",             "west-northwest",   "north-northwest",
+}
+
+--- WorldBearingToCardinal12: map a world-space bearing (radians) to
+--- a 12-point cardinal label.  Snap to nearest with 15-degree offset
+--- so a bearing of exactly 30 degrees reads as "north-northeast"
+--- (the label centered on 30) rather than landing on the boundary.
+local function WorldBearingToCardinal12(bearingRadians)
+    if not bearingRadians then return nil end
+    local degrees = (bearingRadians * 180 / math.pi) % 360
+    if degrees < 0 then degrees = degrees + 360 end
+    local bucket = math.floor((degrees + 15) / 30) % 12
+    return CARDINAL12_LABELS_WORLD[bucket + 1]
+end
+
+--- GetDirectionFormat: cached read of the unified direction-format
+--- setting.  Returns "clockface" or "cardinal" -- never nil.
+local function GetDirectionFormat()
+    local Settings = BG3Access.Client.Settings
+    if Settings and Settings.Get then
+        return Settings.Get("directionFormat") or "cardinal"
+    end
+    return "cardinal"
+end
+
+--- GetGuidanceMode: cached read of the navigation guidance mode
+--- setting.  Returns "audio" or "voice" -- never nil, never any
+--- other string.  Default "voice" if the setting isn't available.
+--- Stale "both" values that might still exist in pre-removal saved
+--- settings files are normalized to "voice" here so playthroughs
+--- don't go silent (both beacon and voice would be off if a stored
+--- "both" leaked through to the enabled-checks below).
+local function GetGuidanceMode()
+    local Settings = BG3Access.Client.Settings
+    local mode = "voice"
+    if Settings and Settings.Get then
+        local stored = Settings.Get("guidanceMode")
+        if stored == "audio" or stored == "voice" then
+            mode = stored
+        end
+    end
+    return mode
+end
+
+--- GuidanceAudioEnabled: true when the user's mode wants spatial-
+--- audio beacon firing.
+local function GuidanceAudioEnabled()
+    return GetGuidanceMode() == "audio"
+end
+
+--- GuidanceVoiceEnabled: true when the user's mode wants per-tick
+--- direction speech firing.  Does NOT gate contextual speech
+--- (hazards, arrival, stuck) -- those are always informative
+--- regardless of audio/voice choice.
+local function GuidanceVoiceEnabled()
+    return GetGuidanceMode() == "voice"
+end
+
+--- GetRoutingBehavior: read the routingBehavior setting.  Returns
+--- "automatic" or "manually guided" -- never nil.  Default "automatic"
+--- if the setting isn't available (preserves the prior single
+--- behavior).  Consulted by hostileWarning.DispatchSelection to decide
+--- whether to run the hostile-check pipeline (automatic) or skip
+--- straight to manual guided navigation (manually guided).
+local function GetRoutingBehavior()
+    local Settings = BG3Access.Client.Settings
+    if Settings and Settings.Get then
+        return Settings.Get("routingBehavior") or "automatic"
+    end
+    return "automatic"
+end
+
+--- FormatDirection: unified direction speech for facing / guidance /
+--- proximity.  Returns either "8 o'clock" (clockface mode) or
+--- "north-northeast" (cardinal mode) for the bearing from player
+--- to target.  Single source of truth so the user can pick one
+--- format in settings and have every direction announcement match.
+---
+--- For "facing" use cases where the bearing is the player's body
+--- yaw (not a target lookup), use FormatBearingDirection below.
+local function FormatDirection(playerPosition, targetPosition)
+    if not playerPosition or not targetPosition then return nil end
+    local format = GetDirectionFormat()
+    if format == "cardinal" then
+        local worldBearing = BearingXZ(playerPosition, targetPosition)
+        return WorldBearingToCardinal12(worldBearing)
+    end
+    -- Clockface: camera-relative clock hour.
+    local clockHour = ComputeClockDirection(playerPosition, targetPosition)
+    if clockHour then return tostring(clockHour) .. " o'clock" end
+    return nil
+end
+
+--- FormatBearingDirection: like FormatDirection but takes a raw
+--- bearing (radians) instead of two positions.  Used by the player-
+--- facing announcer, which derives its bearing from the character's
+--- rotation quaternion rather than from a target lookup.  Player
+--- position is still needed for clockface mode (computes the
+--- camera reference angle).
+local function FormatBearingDirection(bearingRadians, playerPosition)
+    if not bearingRadians then return nil end
+    local format = GetDirectionFormat()
+    if format == "cardinal" then
+        return WorldBearingToCardinal12(bearingRadians)
+    end
+    -- Clockface: subtract camera reference, quantize to 12 hours.
+    if not playerPosition then return nil end
+    local referenceAngle = GetCameraReferenceAngle(playerPosition)
+    if not referenceAngle then return nil end
+    local relativeAngle = bearingRadians - referenceAngle
+    local clockHour = RadiansToClockHour(relativeAngle)
+    return tostring(clockHour) .. " o'clock"
+end
+
 -- 8-point cardinal compass for proximity announcements.  Unlike
 -- ComputeClockDirection (camera-relative -- "12 o'clock = where the
 -- camera faces right now"), this is WORLD-relative -- "north" stays
@@ -861,6 +1363,92 @@ local CARDINAL_LABELS = {
     "north", "northeast", "east", "southeast",
     "south", "southwest", "west", "northwest",
 }
+
+-- ComputePlayerFacingLabel: cardinal direction the player character is
+-- currently facing, derived from the entity's rotation quaternion (NOT
+-- from the camera).  BG3's camera sits at a fixed isometric angle and
+-- only translates to track the player; even with "camera rotates with
+-- character" enabled the rotation lags the character through a turn,
+-- so deriving facing from the camera produces wrong / stale readings.
+--
+-- Source: entity.Transform.Transform.RotationQuat -- the world-space
+-- rotation of the character mesh, exposed as a 4-component value via
+-- the documented BG3SE entity bridge.  We compute the world-forward
+-- vector by applying the quaternion's rotation to the model-forward
+-- unit vector (0, 0, -1).  BG3's character meshes follow the standard
+-- OpenGL / GLM convention where model space looks down its -Z axis;
+-- rotating (0, 0, +1) instead points out the character's back, which
+-- gives readings 180 degrees off from reality.
+--
+-- Rotating (0, 0, -1) is equivalent to negating the third column of
+-- the quaternion's rotation matrix:
+--
+--     worldForward.x = -2 * (xz + wy)
+--     worldForward.z = -(1 - 2 * (x*x + y*y)) = 2 * (x*x + y*y) - 1
+--
+-- where (x, y, z, w) are the quaternion components.  The yaw bearing
+-- is then atan2(worldForward.x, worldForward.z), in the same
+-- +Z=north / +X=east axis convention BearingXZ uses throughout this
+-- file.  Pure scalar arithmetic -- no Ext.Math calls.
+--
+-- Component indexing convention: glm::quat (the C++ source type for
+-- RotationQuat) exposes .x .y .z .w as members 0..3 in memory.  When
+-- BG3SE marshals it to Lua it lands as an indexable 4-tuple where
+-- [1]=x, [2]=y, [3]=z, [4]=w.  If a future test shows the indices are
+-- (w, x, y, z) instead, swap the assignments below; the math formula
+-- stays the same.
+
+--- ReadPlayerFacingBearing: world-space yaw bearing (radians) the
+--- player character is currently facing, derived from the entity's
+--- rotation quaternion.  Returns nil if the read fails.  Pure math;
+--- no UI / settings dependency.
+local function ReadPlayerFacingBearing(playerEntity)
+    if not playerEntity then return nil end
+    local ok, bearing = pcall(function()
+        if not playerEntity.Transform then return nil end
+        local rotationQuat = playerEntity.Transform.Transform.RotationQuat
+        if not rotationQuat then return nil end
+        local qx = rotationQuat[1]
+        local qy = rotationQuat[2]
+        local qz = rotationQuat[3]
+        local qw = rotationQuat[4]
+        if not qx or not qy or not qz or not qw then return nil end
+        -- World-forward = quaternion rotation applied to (0, 0, -1).
+        local forwardX = -2 * (qx * qz + qw * qy)
+        local forwardZ = 2 * (qx * qx + qy * qy) - 1
+        return math.atan(forwardX, forwardZ)
+    end)
+    if ok then return bearing end
+    return nil
+end
+
+--- ComputePlayerFacingLabel: cardinal direction OR clock-face hour
+--- describing where the player character is currently pointed.  The
+--- choice between formats is the "playerFacingFormat" setting (GPS
+--- submenu): "cardinal" -> "north" / "northeast" / etc. (world-fixed);
+--- "clockface" -> "12 o'clock" / "3 o'clock" / etc. (camera-relative,
+--- consistent with GPS routing speech).
+---
+--- Cardinal mode is map-aware: "north" means world-north regardless
+--- of camera orientation.  Useful when paired with the minimap.
+---
+--- Clock-face mode is camera-aware: "12 o'clock" means "where the
+--- camera is currently looking".  Matches GPS guidance ("Door at 12
+--- o'clock, 4 meters"), so a user already familiar with that
+--- convention gets consistent speech.
+---
+--- @param playerEntity any  The player entity (for RotationQuat).
+--- @param playerPosition table  {x, y, z} -- needed in clockface
+---     mode to compute the camera reference angle.
+local function ComputePlayerFacingLabel(playerEntity, playerPosition)
+    local facingBearing = ReadPlayerFacingBearing(playerEntity)
+    if not facingBearing then return nil end
+    -- Unified format via FormatBearingDirection.  Same source of
+    -- truth used by guidance / proximity, so "Facing northeast"
+    -- and "target at northeast" can be matched as identical labels
+    -- when the user picks cardinal mode.
+    return FormatBearingDirection(facingBearing, playerPosition)
+end
 
 local function ComputeCardinalDirection(playerPosition, targetPosition)
     local targetBearing = BearingXZ(playerPosition, targetPosition)
@@ -1001,7 +1589,7 @@ local hazardousSurfaceCache = nil
 --   500000 -- too strong; accumulation overflow risk
 --   50000  -- current; strong enough to beat all realistic detours,
 --             safe from int32 accumulation overflow
-local GPS_HAZARD_INFLUENCE = 50000
+-- GPS_HAZARD_INFLUENCE moved to Config table; see Config.GPS_HAZARD_INFLUENCE
 
 -- Cached SurfacePathInfluences array derived from hazardousSurfaceCache.
 -- Assigned to AiPath.SurfacePathInfluences on every TryPathfind call
@@ -1303,7 +1891,7 @@ local function GetHazardAvoidanceInfluences()
             table.insert(influences, {
                 SurfaceType = hazardLabel,
                 IsCloud = isCloud,
-                Influence = GPS_HAZARD_INFLUENCE,
+                Influence = Config.GPS_HAZARD_INFLUENCE,
             })
         end
     end
@@ -1326,7 +1914,7 @@ local function GetHazardAvoidanceInfluences()
         Log.Info(string.format(
             "Hazard avoidance influences built: %d entries "
                 .. "(influence=%d per tile): %s",
-            #influences, GPS_HAZARD_INFLUENCE,
+            #influences, Config.GPS_HAZARD_INFLUENCE,
             table.concat(labels, ", ")))
     end
     return influences
@@ -1402,7 +1990,7 @@ end
 -- sits on a burning tile and the warning comes 0.0m too late.
 -- Also helps with small fire patches that fall between path nodes
 -- when path smoothing produces sparse node spacing.
-local GPS_HAZARD_PROBE_RADIUS = 0.75
+-- GPS_HAZARD_PROBE_RADIUS moved to Config table; see Config.GPS_HAZARD_PROBE_RADIUS
 
 -- Inter-node sample spacing for path hazard scans.  Path smoothing
 -- can leave segments with nodes >1m apart.  Rather than trust that
@@ -1410,7 +1998,7 @@ local GPS_HAZARD_PROBE_RADIUS = 0.75
 -- along the segment at this interval between rings.  Each sample
 -- still gets a full 0.75m radius probe, so the effective corridor
 -- around the path is a sausage of radius 0.75m with no gaps.
-local GPS_HAZARD_INTERNODE_SAMPLE_M = 0.75
+-- GPS_HAZARD_INTERNODE_SAMPLE_M moved to Config table; see Config.GPS_HAZARD_INTERNODE_SAMPLE_M
 
 -- Precomputed 8-point ring offsets (unit circle, 45 degree steps).
 -- Scaled by GPS_HAZARD_PROBE_RADIUS when sampling.  Built once at
@@ -1421,8 +2009,8 @@ local HAZARD_RING_OFFSETS = (function()
     for hour = 0, 7 do
         local angle = hour * math.pi / 4
         table.insert(ringOffsets, {
-            math.cos(angle) * GPS_HAZARD_PROBE_RADIUS,
-            math.sin(angle) * GPS_HAZARD_PROBE_RADIUS,
+            math.cos(angle) * Config.GPS_HAZARD_PROBE_RADIUS,
+            math.sin(angle) * Config.GPS_HAZARD_PROBE_RADIUS,
         })
     end
     return ringOffsets
@@ -1503,7 +2091,39 @@ end
 -- into the Loot category rather than Miscellaneous.  Read from the
 -- entity's ValueComponent.Value, which is a universal component
 -- field available without stats probing.
-local GPS_LOOT_GOLD_THRESHOLD = 10
+-- GPS_LOOT_GOLD_THRESHOLD moved to Config table; see Config.GPS_LOOT_GOLD_THRESHOLD
+
+--- GetEntityLevelName: returns the level (region) the entity belongs
+--- to as a string, or nil if unreadable.  Powered by ls::LevelComponent
+--- (entity.Level.LevelName) -- a direct component field, no Osi call.
+---
+--- Critical because Ext.Entity.GetAllEntitiesWithComponent returns
+--- characters / objects across EVERY currently loaded level in the
+--- simulation, not just the player's current region.  World XZ
+--- coordinates are NOT globally unique: an entity in a different
+--- region can land at the same numeric (x, z) as something next to
+--- the player.  Without level filtering, our entity scan surfaces
+--- "Boo" 96m away (he's actually in another zone whose coordinates
+--- overlap the player's), the hostile check reports enemies on the
+--- path that are actually walls-apart-in-a-different-level, and
+--- CharacterMoveTo to those off-region targets reports arrival
+--- instantly because no path can be built across the boundary.
+---
+--- Callers compare against the host's level name; mismatches are
+--- skipped.  Returns nil on read failure so callers can choose to
+--- fail open (don't filter, surface the candidate anyway).
+local function GetEntityLevelName(entity)
+    if not entity then return nil end
+    local name = nil
+    pcall(function()
+        local levelComp = entity.Level
+        if levelComp and levelComp.LevelName then
+            name = tostring(levelComp.LevelName)
+        end
+    end)
+    if name == "" then return nil end
+    return name
+end
 
 --- Probe an entity for a specific component.  Returns the component
 --- object when present, nil otherwise.  Wraps the GetComponent call
@@ -1606,7 +2226,10 @@ local function CategoriseEntity(entity, displayName)
         if not isDead then
             isDead = IsDeadCharacter(entity)
         end
-        if isDead then return "Containers" end
+        -- Dead characters route to Containers (looting) but also
+        -- carry isCorpse=true so proximity speech can prepend "Dead"
+        -- and the player knows it's a body, not a live threat.
+        if isDead then return "Containers", true end
         return "NPCs"
     end
 
@@ -1646,7 +2269,10 @@ local function CategoriseEntity(entity, displayName)
         if srvData.has_IsCharacter then
             local isDead = srvData.has_Death
                 or srvData.has_DeathState
-            if isDead then return "Containers" end
+            -- Server-classified dead character -- same isCorpse tag
+            -- as the Phase 1 path above so the proximity speech can
+            -- distinguish corpses from live entities.
+            if isDead then return "Containers", true end
             return "NPCs"
         end
 
@@ -1767,7 +2393,7 @@ local function CategoriseEntity(entity, displayName)
             local okValue, itemValue = SafeReadField(
                 valueComponent, "Value")
             if okValue and type(itemValue) == "number"
-                and itemValue >= GPS_LOOT_GOLD_THRESHOLD then
+                and itemValue >= Config.GPS_LOOT_GOLD_THRESHOLD then
                 return "Loot"
             end
         else
@@ -1777,7 +2403,7 @@ local function CategoriseEntity(entity, displayName)
                 local okValue, itemValue = SafeReadField(
                     valComp, "Value")
                 if okValue and type(itemValue) == "number"
-                    and itemValue >= GPS_LOOT_GOLD_THRESHOLD then
+                    and itemValue >= Config.GPS_LOOT_GOLD_THRESHOLD then
                     return "Loot"
                 end
             end
@@ -1833,9 +2459,19 @@ local function ScanEntities(playerPosition)
     -- CategoriseEntity to route entries to the Companions category
     -- even when per-entity PartyMember probes return nil.
     partyMemberHandleSet = {}
-    local radiusSquared = ENTITY_SCAN_RADIUS * ENTITY_SCAN_RADIUS
-    local minDistSquared = ENTITY_MIN_DISTANCE * ENTITY_MIN_DISTANCE
+    local scanRadius = GetRoutingListRange()
+    local radiusSquared = scanRadius * scanRadius
+    local minDistSquared = Config.ENTITY_MIN_DISTANCE * Config.ENTITY_MIN_DISTANCE
     local seenHandles = {}
+
+    -- Read the host's current level once.  Entities from other
+    -- loaded levels share the global IsCharacter / GameObjectVisual
+    -- component pool but live in regions whose XZ coordinates can
+    -- collide with ours.  Filter those out so the routing list,
+    -- proximity announcements, and hostile check all see only
+    -- entities that are actually in our region.  Falls open (no
+    -- filter) when the host's level can't be read.
+    local hostLevelName = GetEntityLevelName(GetPlayerEntity())
 
     -- Component queries that work on the client.  ServerItem,
     -- ServerCharacter, and ItemTemplate all return 0 or error on
@@ -1854,7 +2490,21 @@ local function ScanEntities(playerPosition)
                 local entityKey = tostring(entity)
                 if not seenHandles[entityKey] then
                     seenHandles[entityKey] = true
-                    if not IsInsideInventory(entity) then
+                    -- Region filter: drop entities that live in a
+                    -- different level than the host.  Cheap pre-
+                    -- gate (one FixedString compare) before the more
+                    -- expensive position read + distance math.
+                    local skipForLevel = false
+                    if hostLevelName then
+                        local entityLevelName =
+                            GetEntityLevelName(entity)
+                        if entityLevelName
+                            and entityLevelName ~= hostLevelName then
+                            skipForLevel = true
+                        end
+                    end
+                    if not skipForLevel
+                        and not IsInsideInventory(entity) then
                         local entityPosition = GetEntityPosition(entity)
                         if entityPosition then
                             local distSquared = DistanceSquaredXZ(
@@ -1901,7 +2551,7 @@ local function ScanEntities(playerPosition)
     -- Total cost: 3 component reads per scan, regardless of party size.
     -- If any link in the chain fails (atypical states), we fall back
     -- to "no party-distance-bypass" -- the first pass still picks up
-    -- party members within the 50m scan radius.
+    -- party members within the configured scan radius.
     local partyMembersDiscovered = {}
     pcall(function()
         local seedOk, seedEntities = pcall(
@@ -1989,7 +2639,7 @@ function ClassifyScannedEntities()
     -- function runs the client has already received and cached the
     -- server's response -- no need to wait for a fresh request.
     local diagnosticLogged = 0
-    local DIAGNOSTIC_LIMIT = 12
+    -- DIAGNOSTIC_LIMIT moved to Config table; see Config.DIAGNOSTIC_LIMIT
     local SUSPECT_NAME_PATTERNS = {
         -- Doors / traversal
         "door", "hatch", "ladder",
@@ -2003,8 +2653,71 @@ function ClassifyScannedEntities()
         "spiderweb", "pouch",
     }
 
+    -- Inject virtual entries for named locations.  These don't go
+    -- through CategoriseEntity (no ECS entity to query) -- they're
+    -- routed directly to "Waypoints" and "Discovered places".
+    -- Distance is computed from the player's current scan position
+    -- so they sort naturally alongside real entities within each
+    -- category list.  Waypoints in unloaded levels arrive with
+    -- position=nil from the server; we skip those for the routing
+    -- list (they aren't navigable via the GPS path system) but they
+    -- could be surfaced later via a separate fast-travel UI that
+    -- uses TeleportToWaypoint directly.
+    local Locations = BG3Access.Client.Locations
+    if Locations and lastScanPosition then
+        if Locations.GetWaypointsInCurrentLevel then
+            local waypointEntries =
+                Locations.GetWaypointsInCurrentLevel()
+            for _, waypoint in ipairs(waypointEntries) do
+                if waypoint.position then
+                    local distSquared = DistanceSquaredXZ(
+                        lastScanPosition, waypoint.position)
+                    table.insert(categories["Waypoints"], {
+                        entityKey   = "waypoint:" .. waypoint.slug,
+                        name        = waypoint.displayName
+                            or waypoint.slug,
+                        position    = waypoint.position,
+                        distance    = math.sqrt(distSquared),
+                        entity      = nil,
+                        virtualKind = "waypoint",
+                        slug        = waypoint.slug,
+                        triggerGuid = waypoint.triggerGuid,
+                        itemGuid    = waypoint.itemGuid,
+                    })
+                end
+            end
+        end
+        if Locations.GetDiscoveredSubregions then
+            local subregionEntries =
+                Locations.GetDiscoveredSubregions()
+            for _, subregion in ipairs(subregionEntries) do
+                if subregion.position then
+                    local distSquared = DistanceSquaredXZ(
+                        lastScanPosition, subregion.position)
+                    table.insert(categories["Discovered places"], {
+                        entityKey   = "subregion:" .. subregion.slug,
+                        name        = subregion.displayName
+                            or subregion.slug,
+                        position    = subregion.position,
+                        distance    = math.sqrt(distSquared),
+                        entity      = nil,
+                        virtualKind = "subregion",
+                        slug        = subregion.slug,
+                    })
+                end
+            end
+        end
+    end
+
     for _, entry in ipairs(scannedEntitiesRaw) do
-        local category = CategoriseEntity(entry.entity, entry.name)
+        local category, isCorpse = CategoriseEntity(
+            entry.entity, entry.name)
+        -- Stash the corpse flag on the entry so proximity speech
+        -- can prepend "Dead" without re-running the classification.
+        -- nil for live entities; true only for character-derived
+        -- corpses (party Companions are NOT flagged -- their dead
+        -- state is communicated separately as "downed").
+        entry.isCorpse = isCorpse or false
         if category and categories[category] then
             table.insert(categories[category], entry)
         end
@@ -2012,7 +2725,7 @@ function ClassifyScannedEntities()
         -- Diagnostic: if this entity's name matches a suspect
         -- pattern AND it didn't classify into NPCs/Doors, log its
         -- components so we can see why.
-        if diagnosticLogged < DIAGNOSTIC_LIMIT
+        if diagnosticLogged < Config.DIAGNOSTIC_LIMIT
             and category ~= "NPCs"
             and category ~= "Doors" then
             local lowerName = entry.name:lower()
@@ -2069,6 +2782,81 @@ function ClassifyScannedEntities()
             end
         end
     end
+
+    -- Flag entries whose entity has the HasExclamationDialog tag --
+    -- the "!" icon sighted players see above NPC heads when there's
+    -- new dialogue available.  Tag component lookup is a single
+    -- pcall'd GetComponent per entry; we restrict the probe to live
+    -- character categories (Companions, NPCs) since the tag is only
+    -- defined for characters.  Building currentWantsToTalkSet during
+    -- the same loop lets the diff below avoid a second iteration.
+    local currentWantsToTalkSet = {}
+    local newlyTaggedEntries    = {}
+    for _, listName in ipairs({ "Companions", "NPCs" }) do
+        for _, entry in ipairs(categories[listName] or {}) do
+            if entry.entity and GetEntityComponent(
+                entry.entity, "HasExclamationDialog") then
+                entry.wantsToTalk = true
+                currentWantsToTalkSet[entry.entityKey] = true
+                if not previousWantsToTalkSet[entry.entityKey] then
+                    table.insert(newlyTaggedEntries, entry)
+                end
+            end
+        end
+    end
+
+    -- One-shot announcement for entities that newly acquired the
+    -- tag.  Mirrors the visual event of an "!" appearing -- this is
+    -- the closest accessibility analogue.  Combat gate matches the
+    -- proximity-tier gate at the top of ProcessProximityUpdate so
+    -- combat speech stays focused on targets / dice rolls.  Speaks
+    -- non-interrupt so it stacks with whatever's playing instead of
+    -- chopping off an in-flight readout.
+    local talkPlayerEntity = GetPlayerEntity()
+    local talkInCombat = talkPlayerEntity
+        and IsInCombat(talkPlayerEntity)
+    if not talkInCombat then
+        for _, entry in ipairs(newlyTaggedEntries) do
+            local distance = entry.distance or 0
+            -- Distance gate: only announce entities within Tier 2
+            -- range (the same earshot threshold proximity-tier
+            -- speech uses).  Companions are distance-unbounded in
+            -- the scan so they can be located via the entity list
+            -- at any range -- but blurting "Shadowheart wants to
+            -- talk" while she's 24m away across camp is noise.
+            -- The entity-list browse still shows the "Wants to
+            -- talk" decoration so the user can discover her on
+            -- demand without waiting to walk into earshot.
+            if distance <= Config.GPS_PROXIMITY_TIER2_ENTER_M then
+                local talkSpeech = SpeechData.Create()
+                talkSpeech:Add("name", entry.name, "brief")
+                talkSpeech:Add("status", "wants to talk", "brief")
+                -- Within Tier 1 (3m) the player is effectively on
+                -- top of the entity -- distance + bearing is noise.
+                -- Tier 1 < d <= Tier 2: include both.
+                if distance > Config.GPS_PROXIMITY_TIER1_ENTER_M
+                    and lastScanPosition then
+                    talkSpeech:AddProperty("Distance",
+                        math.floor(distance + 0.5) .. " meters",
+                        "brief")
+                    local directionLabel = FormatDirection(
+                        lastScanPosition, entry.position)
+                    if directionLabel then
+                        talkSpeech:AddProperty("Direction",
+                            directionLabel, "normal")
+                    end
+                end
+                Log.Info("WantsToTalk: " .. entry.name)
+                Ext.Tolk.Speak(talkSpeech:Format(), false)
+            else
+                Log.Debug("WantsToTalk: " .. entry.name
+                    .. " out of range ("
+                    .. math.floor(distance + 0.5) .. "m), silent")
+            end
+        end
+    end
+
+    previousWantsToTalkSet = currentWantsToTalkSet
 
     -- Sort each category by distance.
     for _, categoryName in ipairs(CATEGORY_NAMES) do
@@ -2189,7 +2977,30 @@ end
 --- function every tick, dynamic hazards that appear mid-walk
 --- (Cloudkill cast, Grease ignited to Fire, Hellfire pool spawned)
 --- are automatically avoided on the very next path compute.
-local function TryPathfind(playerEntity, targetPosition, closeEnoughMax)
+--- TryPathfind: run the engine's A* pathfinder from playerEntity to
+--- targetPosition, returning a list of waypoint nodes or nil.
+---
+--- applyAvoidance controls whether we layer our own hazard influence
+--- weights on top of the engine's defaults via ApplyHazardAvoidance.
+--- The rule:
+---
+---   * Guided walks (StartTracking, RecalculatePath) -- pass true
+---     (or omit; default).  We're producing the path the user will
+---     walk themselves, so a safer detour is genuinely useful.
+---   * Auto-walk previews + hostile-check corridors -- pass FALSE.
+---     The engine will drive the character via Osi.CharacterMoveTo,
+---     which uses the engine's own baseline weights (NOT our
+---     SurfacePathInfluences).  Computing a hazard-avoidant path on
+---     our side just produces a hypothetical route the engine won't
+---     actually take -- which makes distance previews wrong ("19m"
+---     spoken vs. ~192m computed) and hostile-check corridors miss
+---     enemies sitting next to the engine's shorter actual path.
+---
+--- Default true to preserve behavior for callers that don't know
+--- about the distinction yet.
+local function TryPathfind(playerEntity, targetPosition, closeEnoughMax,
+        applyAvoidance)
+    if applyAvoidance == nil then applyAvoidance = true end
     local ok, result = pcall(function()
         local aiPath = Ext.Level.BeginPathfindingImmediate(
             playerEntity, targetPosition)
@@ -2209,15 +3020,17 @@ local function TryPathfind(playerEntity, targetPosition, closeEnoughMax)
         pcall(function()
             aiPath.CloseEnoughMin     = closeEnoughMin
             aiPath.CloseEnoughMax     = closeEnoughMax
-            aiPath.CloseEnoughFloor   = GPS_CLOSE_ENOUGH_FLOOR
-            aiPath.CloseEnoughCeiling = GPS_CLOSE_ENOUGH_CEIL
+            aiPath.CloseEnoughFloor   = Config.GPS_CLOSE_ENOUGH_FLOOR
+            aiPath.CloseEnoughCeiling = Config.GPS_CLOSE_ENOUGH_CEIL
             aiPath.InteractionRange   = closeEnoughMax
         end)
 
         -- Native hazard-avoidance weighting.  Must be set BEFORE
         -- FindPath so the weight function is consulted during the
         -- A* search, not after.  Setting it afterward is a no-op.
-        ApplyHazardAvoidance(aiPath)
+        if applyAvoidance then
+            ApplyHazardAvoidance(aiPath)
+        end
 
         local goalFound = Ext.Level.FindPath(aiPath)
         -- DestinationReached is a separate flag that becomes true
@@ -2277,9 +3090,9 @@ local function FindPathHazard(path)
         -- thisNode.  Skip if the segment is shorter than one sample
         -- step -- the ring at each endpoint already covers it.
         local segmentLength = DistanceXZ(prevNode, thisNode)
-        if segmentLength > GPS_HAZARD_INTERNODE_SAMPLE_M then
+        if segmentLength > Config.GPS_HAZARD_INTERNODE_SAMPLE_M then
             local sampleCount = math.floor(
-                segmentLength / GPS_HAZARD_INTERNODE_SAMPLE_M)
+                segmentLength / Config.GPS_HAZARD_INTERNODE_SAMPLE_M)
             for sampleIndex = 1, sampleCount do
                 local fraction = sampleIndex / (sampleCount + 1)
                 local samplePosition = {
@@ -2316,7 +3129,7 @@ end
 -- patches that a 1m step would skip are also rarely worth
 -- re-routing around since the player could walk straight through
 -- before taking a single tick of damage.
-local GPS_STRAIGHT_LINE_SAMPLE_M = 1.0
+-- GPS_STRAIGHT_LINE_SAMPLE_M moved to Config table; see Config.GPS_STRAIGHT_LINE_SAMPLE_M
 
 --- Sample the straight line from the player to the target at 1m
 --- intervals and return the first hazardous surface we hit, if any.
@@ -2334,9 +3147,9 @@ local GPS_STRAIGHT_LINE_SAMPLE_M = 1.0
 local function FindStraightLineHazard(fromPosition, toPosition)
     if not fromPosition or not toPosition then return nil, nil end
     local distance = DistanceXZ(fromPosition, toPosition)
-    if distance < GPS_STRAIGHT_LINE_SAMPLE_M then return nil, nil end
+    if distance < Config.GPS_STRAIGHT_LINE_SAMPLE_M then return nil, nil end
     local sampleCount = math.ceil(
-        distance / GPS_STRAIGHT_LINE_SAMPLE_M)
+        distance / Config.GPS_STRAIGHT_LINE_SAMPLE_M)
     for sampleIndex = 1, sampleCount do
         local tValue = sampleIndex / sampleCount
         local samplePosition = {
@@ -2492,15 +3305,33 @@ end
 ---
 --- Silent on total failure (returns nil, nil); caller handles the
 --- "no path" transition announcement.
-local function ComputePath(playerEntity, playerPosition, targetPosition)
-    local tightMax = GPS_INTERACT_CLOSE_ENOUGH_MAX
+--- ComputePath: produce the engine's pathfinder result from
+--- playerPosition to targetPosition.  Returns (path, closeEnoughMax)
+--- on success, (nil, nil) on failure.
+---
+--- applyAvoidance follows TryPathfind's semantics:
+---   * true (default): guided-walk path -- player will walk this
+---     route themselves, so our hazard-avoidance influences make it
+---     safer.
+---   * false: auto-walk path -- the engine will execute the move
+---     with its own native weights, so we should compute the same
+---     path the engine will, NOT our hazard-paranoid variant.  This
+---     matters for distance previews and hostile-check corridors,
+---     where giving the user data that doesn't match the engine's
+---     actual route causes user-visible bugs (warnings on the wrong
+---     corridor, distance announcements that lie).
+local function ComputePath(playerEntity, playerPosition, targetPosition,
+        applyAvoidance)
+    if applyAvoidance == nil then applyAvoidance = true end
+    local tightMax = Config.GPS_INTERACT_CLOSE_ENOUGH_MAX
     local looseMax = GetMoveToCloseEnoughMax()
     -- Belt-and-suspenders: if engine config ever reports a tight
     -- MoveToTargetCloseEnoughMax smaller than our interaction
     -- radius, don't run a nonsensical "tight" phase larger than the
     -- loose one.
     if tightMax >= looseMax then
-        local path = TryPathfind(playerEntity, targetPosition, looseMax)
+        local path = TryPathfind(playerEntity, targetPosition,
+            looseMax, applyAvoidance)
         if not path then return nil, nil end
         local hazardIndex, _ = FindPathHazard(path)
         LogHazardDetourIfDetected(
@@ -2511,7 +3342,7 @@ local function ComputePath(playerEntity, playerPosition, targetPosition)
 
     -- Phase 1: tight.
     local tightPath = TryPathfind(
-        playerEntity, targetPosition, tightMax)
+        playerEntity, targetPosition, tightMax, applyAvoidance)
     if tightPath then
         local hazardIndex, hazardLabel = FindPathHazard(tightPath)
         if hazardIndex then
@@ -2532,7 +3363,7 @@ local function ComputePath(playerEntity, playerPosition, targetPosition)
 
     -- Phase 2: loose.
     local loosePath = TryPathfind(
-        playerEntity, targetPosition, looseMax)
+        playerEntity, targetPosition, looseMax, applyAvoidance)
     if not loosePath then return nil, nil end
     local hazardIndex, hazardLabel = FindPathHazard(loosePath)
     if hazardIndex then
@@ -2559,7 +3390,7 @@ end
 -- the player.  Close enough that the straight-line from the player
 -- should not cut through obstacles; far enough to give a stable
 -- clock reading that doesn't flicker with every step.
-local GPS_STEERING_DISTANCE   = 2.0
+-- GPS_STEERING_DISTANCE moved to Config table; see Config.GPS_STEERING_DISTANCE
 
 -- How far ahead on the path (in meters of cumulative path distance)
 -- to scan for dynamic hazards.  The scan runs every silent tick
@@ -2567,7 +3398,7 @@ local GPS_STEERING_DISTANCE   = 2.0
 -- however far the player walks during the speech delivery latency
 -- (~0.5s = ~1.5m at normal walking speed).  12m leaves ~10m of real
 -- warning, which is enough to stop before a fire/cloudkill edge.
-local GPS_HAZARD_WARNING_M    = 12.0
+-- GPS_HAZARD_WARNING_M moved to Config table; see Config.GPS_HAZARD_WARNING_M
 
 --- Recompute the path from the player's current position to the
 --- tracking target, refreshing the target's world position from the
@@ -2614,8 +3445,8 @@ local GPS_HAZARD_WARNING_M    = 12.0
 -- jitter without losing the "player chose a genuinely different
 -- direction" signal (they'd have to deviate by half a body-length
 -- from the path centerline to trigger recompute).
-local GPS_OFF_PATH_M     = 4.0  -- perpendicular drift that invalidates path
-local GPS_TARGET_MOVED_M = 3.0  -- target delta that invalidates path
+-- GPS_OFF_PATH_M moved to Config table; see Config.GPS_OFF_PATH_M
+-- GPS_TARGET_MOVED_M moved to Config table; see Config.GPS_TARGET_MOVED_M
 
 local function RecalculatePath(playerPosition)
     if not trackingTarget then return end
@@ -2632,7 +3463,7 @@ local function RecalculatePath(playerPosition)
         if trackingTarget.position then
             local targetDelta = DistanceXZ(
                 refreshedPosition, trackingTarget.position)
-            if targetDelta >= GPS_TARGET_MOVED_M then
+            if targetDelta >= Config.GPS_TARGET_MOVED_M then
                 targetMoved = true
             end
         end
@@ -2647,7 +3478,7 @@ local function RecalculatePath(playerPosition)
     if currentPath and #currentPath > 0 and not targetMoved then
         local offPathDistance = MinDistanceToPath(
             playerPosition, currentPath)
-        if offPathDistance <= GPS_OFF_PATH_M then
+        if offPathDistance <= Config.GPS_OFF_PATH_M then
             return
         end
     end
@@ -2678,7 +3509,7 @@ end
 -- observed on the Mind Flayer Pod approach.  Locking to the last node
 -- in the close-range endgame eliminates the flip-flop because the
 -- last node moves smoothly as the player approaches it.
-local GPS_CLOSE_RANGE_STEERING_M = 5.0
+-- GPS_CLOSE_RANGE_STEERING_M moved to Config table; see Config.GPS_CLOSE_RANGE_STEERING_M
 
 -- Node-consumed threshold.  Nodes within this distance of the player
 -- are treated as "reached" -- the bearing picker advances to the next
@@ -2693,14 +3524,14 @@ local GPS_CLOSE_RANGE_STEERING_M = 5.0
 -- bearing to the post-corner node -- pointing straight through the
 -- obstacle the pathfinder had routed around.  0.1m only skips nodes
 -- the player is literally standing on top of.
-local GPS_BEARING_MIN_SEGMENT_M = 0.1
+-- GPS_BEARING_MIN_SEGMENT_M moved to Config table; see Config.GPS_BEARING_MIN_SEGMENT_M
 
 -- Maximum distance (along path) the detour-aware picker will look
 -- for the end of the first leg.  If the bearing has not changed by
 -- the end of this window, the leg is treated as the entire readable
 -- path and the picker returns the node at that distance -- matching
 -- the long-range "2m ahead" behavior it replaces.
-local GPS_DETOUR_LEG_MAX_M = 6.0
+-- GPS_DETOUR_LEG_MAX_M moved to Config table; see Config.GPS_DETOUR_LEG_MAX_M
 
 --- Find the path node the player should steer toward, respecting
 --- local path detours instead of blindly picking a node 2m out.
@@ -2746,7 +3577,7 @@ local function GetSteeringTargetPosition(playerPosition)
 
     local lastNode = currentPath[#currentPath]
     local lastNodeDistance = DistanceXZ(playerPosition, lastNode)
-    if lastNodeDistance <= GPS_CLOSE_RANGE_STEERING_M then
+    if lastNodeDistance <= Config.GPS_CLOSE_RANGE_STEERING_M then
         return lastNode
     end
 
@@ -2758,7 +3589,7 @@ local function GetSteeringTargetPosition(playerPosition)
     for nodeIndex = 1, #currentPath do
         local dist = DistanceXZ(
             playerPosition, currentPath[nodeIndex])
-        if dist >= GPS_BEARING_MIN_SEGMENT_M then
+        if dist >= Config.GPS_BEARING_MIN_SEGMENT_M then
             firstLegStartIndex = nodeIndex
             break
         end
@@ -2786,7 +3617,7 @@ local function GetSteeringTargetPosition(playerPosition)
         local candidate = currentPath[nodeIndex]
         local candidateDistance = DistanceXZ(
             playerPosition, candidate)
-        if candidateDistance > GPS_DETOUR_LEG_MAX_M then
+        if candidateDistance > Config.GPS_DETOUR_LEG_MAX_M then
             -- Past the leg window.  Previous node was the pivot.
             break
         end
@@ -2851,14 +3682,14 @@ local function CheckUpcomingPathHazard()
         -- the full 0.75m radius probe.  The reported distance for
         -- a sample hit is the cumulative path distance up to that
         -- sample, which is what the "N meters ahead" warning uses.
-        if segmentLength > GPS_HAZARD_INTERNODE_SAMPLE_M then
+        if segmentLength > Config.GPS_HAZARD_INTERNODE_SAMPLE_M then
             local sampleCount = math.floor(
-                segmentLength / GPS_HAZARD_INTERNODE_SAMPLE_M)
+                segmentLength / Config.GPS_HAZARD_INTERNODE_SAMPLE_M)
             for sampleIndex = 1, sampleCount do
                 local fraction = sampleIndex / (sampleCount + 1)
                 local sampleDistance =
                     cumulativeDistance + segmentLength * fraction
-                if sampleDistance > GPS_HAZARD_WARNING_M then
+                if sampleDistance > Config.GPS_HAZARD_WARNING_M then
                     return false, nil, nil
                 end
                 local samplePosition = {
@@ -2879,7 +3710,7 @@ local function CheckUpcomingPathHazard()
 
         -- Then the node itself.
         cumulativeDistance = cumulativeDistance + segmentLength
-        if cumulativeDistance > GPS_HAZARD_WARNING_M then
+        if cumulativeDistance > Config.GPS_HAZARD_WARNING_M then
             break
         end
         local nodeHit, nodeLabel =
@@ -2972,7 +3803,7 @@ local function UpdateTrackingState(playerPosition)
         end
         pathWasAvailable = false
         noPathTickCount = noPathTickCount + 1
-        if noPathTickCount >= GPS_NO_PATH_CANCEL_TICKS then
+        if noPathTickCount >= Config.GPS_NO_PATH_CANCEL_TICKS then
             local cancelledName = trackingTarget.name
             Log.Info(string.format(
                 "GPS: auto-cancelling tracking of %s "
@@ -3012,11 +3843,11 @@ local function UpdateTrackingState(playerPosition)
     local atPathEndpoint = false
     if not atRawTarget
         and currentPath and #currentPath > 0
-        and distanceToTarget <= GPS_ENDPOINT_MAX_DISTANCE then
+        and distanceToTarget <= Config.GPS_ENDPOINT_MAX_DISTANCE then
         local endpointNode = currentPath[#currentPath]
         local endpointDistance = DistanceXZ(
             playerPosition, endpointNode)
-        if endpointDistance <= GPS_ENDPOINT_ARRIVAL_M then
+        if endpointDistance <= Config.GPS_ENDPOINT_ARRIVAL_M then
             atPathEndpoint = true
         end
     end
@@ -3041,6 +3872,8 @@ local function UpdateTrackingState(playerPosition)
         lastLoggedPathHazardKey = nil
         hazardClearTickCount = 0
         noPathTickCount = 0
+        -- Silence + despawn the spatial-audio beacon on arrival.
+        gpsBeacon.Stop()
         -- Auto-return to Exploration mode so the player does not
         -- have to cycle RS-Left (Off -> Exploration) after every
         -- arrival.  Combine the arrival and mode-switch messages
@@ -3109,7 +3942,7 @@ local function UpdateTrackingState(playerPosition)
     -- full-path scan is clean AND length shrank a lot, the player
     -- walked past the hazard rather than rerouting, so we suppress
     -- the announcement in that case too (same spirit as before).
-    local REROUTE_SHRINK_TOLERANCE = 1.5
+    -- REROUTE_SHRINK_TOLERANCE moved to Config table; see Config.REROUTE_SHRINK_TOLERANCE
     local hazardAhead, hazardLabel, hazardDistance =
         CheckUpcomingPathHazard()
     local fullPathHazardIndex, fullPathHazardLabel =
@@ -3162,11 +3995,11 @@ local function UpdateTrackingState(playerPosition)
                 -- declaring the reroute; single-tick probe jitter
                 -- does NOT get to fire the announcement.
                 hazardClearTickCount = hazardClearTickCount + 1
-                if hazardClearTickCount >= GPS_REROUTE_STABILITY_TICKS then
+                if hazardClearTickCount >= Config.GPS_REROUTE_STABILITY_TICKS then
                     local lengthDelta =
                         newPathLength - lastPathLength
                     local walkedPast =
-                        lengthDelta < -REROUTE_SHRINK_TOLERANCE
+                        lengthDelta < -Config.REROUTE_SHRINK_TOLERANCE
                     -- Minimum path-shape change required to consider
                     -- this an actual reroute.  A real reroute around
                     -- a fire tile adds at LEAST one tile's worth of
@@ -3182,9 +4015,9 @@ local function UpdateTrackingState(playerPosition)
                     -- fire.  Observed symptom: reroute detected
                     -- with length delta=+0.00m on consecutive ticks
                     -- while the path was still grazing fire edges.
-                    local MIN_REROUTE_DELTA_M = 0.5
+                    -- MIN_REROUTE_DELTA_M moved to Config table; see Config.MIN_REROUTE_DELTA_M
                     local noRealChange =
-                        math.abs(lengthDelta) < MIN_REROUTE_DELTA_M
+                        math.abs(lengthDelta) < Config.MIN_REROUTE_DELTA_M
                     local hazardText = FormatHazardLabel(
                         lastHazardAnnouncedLabel)
                     -- Early exit for the jitter case: suppress the
@@ -3222,18 +4055,18 @@ local function UpdateTrackingState(playerPosition)
                             local steeringTargetPosition =
                                 GetSteeringTargetPosition(
                                     playerPosition)
-                            local clockHour = nil
+                            local directionLabel = nil
                             if steeringTargetPosition then
-                                clockHour = ComputeClockDirection(
+                                directionLabel = FormatDirection(
                                     playerPosition,
                                     steeringTargetPosition)
                             end
                             local directionText = ""
-                            if clockHour then
+                            if directionLabel then
                                 directionText = ". "
                                     .. distanceRounded
                                     .. " meters. "
-                                    .. clockHour .. " o'clock"
+                                    .. directionLabel
                             end
                             Log.Info(string.format(
                                 "GPS: reroute detected -- full path "
@@ -3301,67 +4134,60 @@ end
 -- changes.  3m is enough distance to average out immediate jitter
 -- while still being short enough to represent the "next step"
 -- direction the player should walk.
-local GPS_BEARING_SAMPLE_M = 3.0
+-- GPS_BEARING_SAMPLE_M moved to Config table; see Config.GPS_BEARING_SAMPLE_M
 
---- Bearing from the player to a point GPS_BEARING_SAMPLE_M
---- meters along the given path.  Interpolates between path nodes
---- when the sample distance falls mid-segment.  Falls back to the
---- final node when the entire path is shorter than the sample
---- distance (residual arrival, short routes).  Returns nil when
---- the path is empty or the bearing lookup fails.
-local function GetSmoothedPathBearing(playerPosition, path)
+--- GetSmoothedPathSamplePoint: returns a {x, y, z} point
+--- GPS_BEARING_SAMPLE_M meters along the given path from the
+--- player's projection onto the nearest segment.  Interpolates
+--- mid-segment; falls back to the final node when the remaining
+--- path is shorter than the sample distance.  Returns nil when
+--- the path is empty.
+---
+--- Why this is its own function: callers (steering speech,
+--- reroute speech, initial track announcement) need to format
+--- the bearing in either clockface (camera-relative) or cardinal
+--- (world-relative) form depending on user setting.  Returning
+--- the sample POINT instead of a pre-computed clock hour lets
+--- each caller pass it through FormatDirection, which picks the
+--- right format internally.
+local function GetSmoothedPathSamplePoint(playerPosition, path)
     if not path or #path == 0 then return nil end
-    if #path == 1 then
-        return ComputeClockDirection(playerPosition, path[1])
-    end
+    if #path == 1 then return path[1] end
 
-    -- Walk the path forward from the player's projection onto the
-    -- nearest segment.  Accumulating from DistanceXZ(player,
-    -- path[1]) would count the distance back to node 1 when the
-    -- player has walked past it -- inflating "3 meters ahead" to
-    -- "3 + (meters walked past node 1) ahead."  The projection
-    -- gives a true "forward distance along path" measurement.
     local nextNodeIndex, distanceForward,
         projectionX, projectionZ =
         GetForwardPathStart(playerPosition, path)
-    if not nextNodeIndex then
-        return ComputeClockDirection(playerPosition, path[#path])
-    end
+    if not nextNodeIndex then return path[#path] end
 
-    -- Case 1: the sample distance lands on the stub segment (from
-    -- the projection to path[nextNodeIndex]).  Interpolate within
-    -- that segment.
-    if distanceForward >= GPS_BEARING_SAMPLE_M then
+    -- Case 1: sample lands on the stub segment.
+    if distanceForward >= Config.GPS_BEARING_SAMPLE_M then
         local stubEnd = path[nextNodeIndex]
         local stubT = 0
         if distanceForward > 0 then
-            stubT = GPS_BEARING_SAMPLE_M / distanceForward
+            stubT = Config.GPS_BEARING_SAMPLE_M / distanceForward
         end
-        local samplePoint = {
+        return {
             projectionX + (stubEnd[1] - projectionX) * stubT,
             stubEnd[2],
             projectionZ + (stubEnd[3] - projectionZ) * stubT,
         }
-        return ComputeClockDirection(playerPosition, samplePoint)
     end
 
-    -- Case 2: the sample distance lands past the stub.  Accumulate
-    -- along successive segments until we cross the sample distance
-    -- or run out of path.
+    -- Case 2: sample lands past the stub.
     local accumulated = distanceForward
     local previousNode = path[nextNodeIndex]
     for nodeIndex = nextNodeIndex + 1, #path do
         local node = path[nodeIndex]
         local segmentLength = DistanceXZ(previousNode, node)
         if accumulated + segmentLength
-            >= GPS_BEARING_SAMPLE_M then
+            >= Config.GPS_BEARING_SAMPLE_M then
             local remaining =
-                GPS_BEARING_SAMPLE_M - accumulated
+                Config.GPS_BEARING_SAMPLE_M - accumulated
             local segmentT = 0
             if segmentLength > 0 then
                 segmentT = remaining / segmentLength
             end
-            local samplePoint = {
+            return {
                 previousNode[1]
                     + (node[1] - previousNode[1]) * segmentT,
                 previousNode[2]
@@ -3369,16 +4195,25 @@ local function GetSmoothedPathBearing(playerPosition, path)
                 previousNode[3]
                     + (node[3] - previousNode[3]) * segmentT,
             }
-            return ComputeClockDirection(
-                playerPosition, samplePoint)
         end
         accumulated = accumulated + segmentLength
         previousNode = node
     end
 
-    -- Whole remaining path shorter than the sample distance:
-    -- fall back to bearing to the final node.
-    return ComputeClockDirection(playerPosition, path[#path])
+    -- Whole remaining path shorter than sample distance.
+    return path[#path]
+end
+
+--- Bearing-as-clock-hour wrapper for the dedup logic in
+--- SpeakTrackingGuidance, which compares old vs new bearings to
+--- decide whether to re-speak.  Clock hour is a useful integer for
+--- comparison even when the user's chosen format is cardinal --
+--- both formats partition into 12 buckets, and the hour number
+--- changes whenever the cardinal label would.
+local function GetSmoothedPathBearing(playerPosition, path)
+    local samplePoint = GetSmoothedPathSamplePoint(playerPosition, path)
+    if not samplePoint then return nil end
+    return ComputeClockDirection(playerPosition, samplePoint)
 end
 
 --- Speech-only tracking guidance.  Called by OnTick once the player
@@ -3407,6 +4242,13 @@ end
 --- awareness of nearby dangers.
 local function SpeakTrackingGuidance(playerPosition)
     if not trackingTarget or not currentPath then return end
+    -- Voice guidance gate: in audio-only mode, skip the per-tick
+    -- "N meters. Y o'clock" announcement.  Contextual speech
+    -- (hazards, arrival, stuck, route start, no-path) is NOT gated
+    -- here -- it always fires.  This only suppresses the running
+    -- direction/distance updates that audio-mode users don't need
+    -- because the beacon's cadence + panning convey the same info.
+    if not GuidanceVoiceEnabled() then return end
 
     local distanceToTarget = DistanceXZ(
         playerPosition, trackingTarget.position)
@@ -3432,7 +4274,24 @@ local function SpeakTrackingGuidance(playerPosition)
         shouldSpeak = true
     end
 
-    local phrase = distanceRounded .. " meters. " .. bearing .. " o'clock"
+    -- Format the steering direction via the unified formatter, which
+    -- picks clockface or cardinal based on the directionFormat
+    -- setting.  We use the path sample point directly so cardinal
+    -- mode gets the true world bearing, not the cardinal label
+    -- mapped from a camera-relative clock hour.
+    local samplePoint = GetSmoothedPathSamplePoint(
+        playerPosition, currentPath)
+    local directionPhrase = nil
+    if samplePoint then
+        directionPhrase = FormatDirection(playerPosition, samplePoint)
+    end
+    if not directionPhrase then
+        -- Defensive fallback if FormatDirection produced nil (e.g.
+        -- camera entity unreachable in clockface mode).  Use the
+        -- raw clock hour we already computed.
+        directionPhrase = tostring(bearing) .. " o'clock"
+    end
+    local phrase = distanceRounded .. " meters. " .. directionPhrase
 
     -- Distance trend for diagnostic log.
     local trend = ""
@@ -3514,6 +4373,131 @@ end
 --- CategoriseEntity -- scenery and unnamed entities are already
 --- filtered out at scan time, so everything in
 --- scannedCategories is eligible for tier announcements.
+
+-- Number-words used by FormatCountedName for small counts.  Speaking
+-- "two" / "three" reads more naturally than "2" / "3" and is what
+-- the user explicitly asked for.  Past 20 we just stringify the
+-- digits ("twenty-three Granite Benches" would require ordinal
+-- composition).  Indexed by count value (1 unused -- count == 1
+-- bypasses the prefix entirely).
+local NUMBER_WORDS = {
+    [2]  = "two",   [3]  = "three",  [4]  = "four",
+    [5]  = "five",  [6]  = "six",    [7]  = "seven",
+    [8]  = "eight", [9]  = "nine",   [10] = "ten",
+    [11] = "eleven", [12] = "twelve", [13] = "thirteen",
+    [14] = "fourteen", [15] = "fifteen", [16] = "sixteen",
+    [17] = "seventeen", [18] = "eighteen", [19] = "nineteen",
+    [20] = "twenty",
+}
+
+-- Irregular plurals: explicit overrides for words the rule-based
+-- pluralizer below would get wrong.  Keyed by LOWERCASE singular,
+-- value is the LOWERCASE plural -- PluralizeName re-applies the
+-- input's original casing when returning.  Latin -us -> -i and the
+-- handful of English irregulars BG3 entity names actually hit are
+-- the cases worth handling; extend this table as new ones surface
+-- rather than trying to be cleverer in the rule-based code.
+local IRREGULAR_PLURALS = {
+    -- Latin -us -> -i (BG3 dungeon dressing)
+    ["sarcophagus"] = "sarcophagi",
+    -- English -f / -fe -> -ves (races, monsters)
+    ["wolf"]        = "wolves",
+    ["elf"]         = "elves",
+    ["dwarf"]       = "dwarves",
+    -- Other English irregulars (people / creatures)
+    ["child"]       = "children",
+    ["man"]         = "men",
+    ["woman"]       = "women",
+    ["mouse"]       = "mice",
+    ["person"]      = "people",
+}
+
+--- ApplyOriginalCasing: return `target` with its first character
+--- matching the case of `source`'s first character.  Sufficient for
+--- BG3 entity names which are uniformly title case -- a full case
+--- transfer (UPPER -> UPPER, lower -> lower, Title -> Title) would
+--- require more state than the use case justifies.
+local function ApplyOriginalCasing(source, target)
+    if source == "" or target == "" then return target end
+    local firstChar = source:sub(1, 1)
+    if firstChar == firstChar:upper() then
+        return target:sub(1, 1):upper() .. target:sub(2)
+    end
+    return target
+end
+
+--- PluralizeName: English plural rules with irregular overrides.
+--- Lookup order:
+---   1. Whole-name irregular ("Sarcophagus" -> "Sarcophagi")
+---   2. Trailing-word irregular ("Half-Elf" -> "Half-Elves",
+---      "Stone Wolf" -> "Stone Wolves").  Splits on whitespace OR
+---      hyphen and checks the last alphabetic segment against the
+---      irregulars table; the leading prefix is preserved verbatim.
+---   3. Rule-based fallback: +es for sibilants (s / x / z / ch / sh),
+---      consonant+y -> +ies, otherwise +s.
+--- Called only when count > 1.
+local function PluralizeName(name)
+    if not name or name == "" then return name end
+    local lower = name:lower()
+
+    -- (1) Whole-name irregular.
+    local wholeIrregular = IRREGULAR_PLURALS[lower]
+    if wholeIrregular then
+        return ApplyOriginalCasing(name, wholeIrregular)
+    end
+
+    -- (2) Trailing-word irregular.  `(.-)([%a]+)$` captures
+    -- "everything up to" + "trailing alphabetic word".  For
+    -- "Half-Elf" the prefix is "Half-" and the last word is "Elf".
+    local prefix, lastWord = name:match("^(.-)([%a]+)$")
+    if lastWord then
+        local lastIrregular = IRREGULAR_PLURALS[lastWord:lower()]
+        if lastIrregular then
+            return prefix
+                .. ApplyOriginalCasing(lastWord, lastIrregular)
+        end
+    end
+
+    -- (3) Rule-based fallback.
+    local lastChar = lower:sub(-1)
+    local lastTwo = lower:sub(-2)
+    -- Sibilant endings need "es".
+    if lastTwo == "ch" or lastTwo == "sh"
+        or lastChar == "s" or lastChar == "x" or lastChar == "z" then
+        return name .. "es"
+    end
+    -- Consonant + y -> ies (but vowel + y just adds s).
+    if lastChar == "y" then
+        local prev = lower:sub(-2, -2)
+        local vowels = "aeiou"
+        if not vowels:find(prev, 1, true) then
+            return name:sub(1, -2) .. "ies"
+        end
+    end
+    return name .. "s"
+end
+
+--- FormatCountedName: build the name portion of a proximity speech
+--- group.  Combines count + "Dead" prefix + pluralized name.
+--- Examples:
+---   FormatCountedName("Intellect Devourer", 1, true)  -> "Dead Intellect Devourer"
+---   FormatCountedName("Intellect Devourer", 3, true)  -> "Three dead Intellect Devourers"
+---   FormatCountedName("Granite Bench", 1, false)      -> "Granite Bench"
+---   FormatCountedName("Granite Bench", 2, false)      -> "Two Granite Benches"
+---   FormatCountedName("Granite Bench", 27, false)     -> "27 Granite Benches"
+local function FormatCountedName(name, count, isCorpse)
+    if count == 1 then
+        if isCorpse then return "Dead " .. name end
+        return name
+    end
+    local countWord = NUMBER_WORDS[count] or tostring(count)
+    local plural = PluralizeName(name)
+    if isCorpse then
+        return countWord .. " dead " .. plural
+    end
+    return countWord .. " " .. plural
+end
+
 local function ProcessProximityUpdate(playerPosition)
     -- Combat gate: skip proximity tier announcements while in combat.
     -- GPS modes (Exploration / Routing) and auto-walk are still
@@ -3536,7 +4520,7 @@ local function ProcessProximityUpdate(playerPosition)
     -- Rescan if moved enough.
     if not lastScanPosition
         or DistanceXZ(playerPosition, lastScanPosition)
-            >= ENTITY_SCAN_MOVEMENT then
+            >= Config.ENTITY_SCAN_MOVEMENT then
         ScanAndCategorise(playerPosition)
     end
 
@@ -3552,6 +4536,17 @@ local function ProcessProximityUpdate(playerPosition)
     -- normal hysteresis check).
     local liveHandles = {}
 
+    -- Pass 1: classify each entity into Tier 1 / Tier 2 / silent.
+    -- For tier-bound entries, set the per-entity latch immediately
+    -- (preserves the single-shot-per-visit semantics) and append the
+    -- entry to a per-tier candidate queue.  Hysteresis un-latching
+    -- still happens here -- it's per-entity and independent of the
+    -- grouped speech.  Each entry carries `distance` so the grouping
+    -- step can pick the closest member of each group as the
+    -- representative for distance/direction speech.
+    local tier1Candidates = {}
+    local tier2Candidates = {}
+
     for _, entry in ipairs(allEntities) do
         liveHandles[entry.entityKey] = true
 
@@ -3562,69 +4557,146 @@ local function ProcessProximityUpdate(playerPosition)
         local distance = DistanceXZ(
             playerPosition, entry.position)
 
-        if distance <= GPS_PROXIMITY_TIER1_ENTER_M then
-            -- Tier 1 candidate.
+        if distance <= Config.GPS_PROXIMITY_TIER1_ENTER_M then
             if not tier1Latched[entry.entityKey] then
                 tier1Latched[entry.entityKey] = true
                 -- Entering tier 1 from tier 2 should also ensure
                 -- tier 2 is latched so we do not re-announce at
                 -- tier 2 on the way out.
                 tier2Latched[entry.entityKey] = true
-                Log.Info("Proximity Tier 1: " .. entry.name)
-                local proxSpeech = SpeechData.Create()
-                proxSpeech:Add("name", entry.name, "brief")
-                Ext.Tolk.Speak(proxSpeech:Format(), false)
+                table.insert(tier1Candidates, {
+                    name         = entry.name,
+                    isCorpse     = entry.isCorpse,
+                    wantsToTalk  = entry.wantsToTalk,
+                    distance     = distance,
+                    position     = entry.position,
+                })
             end
-        elseif distance > GPS_PROXIMITY_TIER1_EXIT_M
-            and distance <= GPS_PROXIMITY_TIER2_ENTER_M then
-            -- Tier 2 candidate.
+        elseif distance > Config.GPS_PROXIMITY_TIER1_EXIT_M
+            and distance <= Config.GPS_PROXIMITY_TIER2_ENTER_M then
             if not tier2Latched[entry.entityKey] then
                 tier2Latched[entry.entityKey] = true
-                -- Cardinal direction (world-relative) instead of
-                -- clock-face (camera-relative).  Auto-walk handles
-                -- routing-mode steering, so proximity announcements
-                -- only need to convey "where on the map" -- which
-                -- cardinal does without changing as the user rotates
-                -- the camera.  Clock-face stays the choice for
-                -- target reads / arrival speech (steering speech).
-                local cardinal = ComputeCardinalDirection(
-                    playerPosition, entry.position)
-                local distanceRounded = math.floor(distance + 0.5)
-                local parts = {
-                    entry.name,
-                    distanceRounded .. " meters",
-                }
-                if cardinal then
-                    table.insert(parts, cardinal)
-                end
-                local proxSpeech2 = SpeechData.Create()
-                proxSpeech2:Add("name", entry.name, "brief")
-                proxSpeech2:AddProperty("Distance",
-                    distanceRounded .. " meters", "brief")
-                if cardinal then
-                    proxSpeech2:AddProperty("Direction",
-                        cardinal, "normal")
-                end
-                local speech = proxSpeech2:Format()
-                Log.Info("Proximity Tier 2: " .. speech)
-                Ext.Tolk.Speak(speech, false)
+                table.insert(tier2Candidates, {
+                    name         = entry.name,
+                    isCorpse     = entry.isCorpse,
+                    wantsToTalk  = entry.wantsToTalk,
+                    distance     = distance,
+                    position     = entry.position,
+                })
             end
         end
 
         -- Hysteresis un-latching.  An entity that has moved past
         -- its exit radius becomes eligible for re-announcement
         -- on the next entry into the tier.
-        if distance > GPS_PROXIMITY_TIER1_EXIT_M then
+        if distance > Config.GPS_PROXIMITY_TIER1_EXIT_M then
             tier1Latched[entry.entityKey] = nil
         end
-        if distance > GPS_PROXIMITY_TIER2_EXIT_M then
+        if distance > Config.GPS_PROXIMITY_TIER2_EXIT_M then
             tier2Latched[entry.entityKey] = nil
         end
     end
 
+    -- Pass 2: group each tier's candidates by (name, isCorpse).
+    -- A duplicate-name burst (3 Intellect Devourer corpses, 27
+    -- Granite Benches) collapses to one speech with a count.  The
+    -- closest entry in each group provides distance/direction for
+    -- Tier 2 -- it's the most actionable representative.
+    -- Group key MUST encode isCorpse so a dead Goblin and a live
+    -- Goblin entering the same tier in the same tick don't merge
+    -- into a single "two Goblins" speech.
+    local function GroupCandidates(candidates)
+        local groups = {}        -- key -> {name, isCorpse, wantsToTalk, count, closest}
+        local groupOrder = {}    -- preserves first-seen order so the
+                                  -- speech order matches the iteration
+                                  -- order from Pass 1 (closer entities
+                                  -- come first in allEntities).
+        for _, candidate in ipairs(candidates) do
+            -- Group key encodes isCorpse AND wantsToTalk so a tagged
+            -- and an untagged entity of the same name don't merge
+            -- into one "two Goblins" speech that would drop the
+            -- "wants to talk" decoration from the tagged member.
+            local key = (candidate.isCorpse and "D|" or "L|")
+                .. (candidate.wantsToTalk and "T|" or "U|")
+                .. candidate.name
+            local group = groups[key]
+            if not group then
+                group = {
+                    name        = candidate.name,
+                    isCorpse    = candidate.isCorpse,
+                    wantsToTalk = candidate.wantsToTalk,
+                    count       = 1,
+                    closest     = candidate,
+                }
+                groups[key] = group
+                table.insert(groupOrder, key)
+            else
+                group.count = group.count + 1
+                if candidate.distance < group.closest.distance then
+                    group.closest = candidate
+                end
+            end
+        end
+        return groups, groupOrder
+    end
+
+    -- Tier 1 emission: just the counted name.  No distance/direction
+    -- because the player is effectively touching the entity (or the
+    -- closest one in the group) -- spatial info adds noise.
+    -- "wants to talk" decoration appended for tagged groups so the
+    -- player learns who's actionable as they wander past.
+    do
+        local groups, groupOrder = GroupCandidates(tier1Candidates)
+        for _, key in ipairs(groupOrder) do
+            local group = groups[key]
+            local label = FormatCountedName(
+                group.name, group.count, group.isCorpse)
+            Log.Info("Proximity Tier 1: " .. label)
+            local proxSpeech = SpeechData.Create()
+            proxSpeech:Add("name", label, "brief")
+            if group.wantsToTalk then
+                proxSpeech:Add("status", "wants to talk", "brief")
+            end
+            Ext.Tolk.Speak(proxSpeech:Format(), false)
+        end
+    end
+
+    -- Tier 2 emission: counted name + distance + direction from the
+    -- closest entry in the group.  Distance/direction speech via the
+    -- unified formatter.  In cardinal mode this gives a 12-point
+    -- world-relative label ("northeast", "south-southwest"); in
+    -- clockface mode "8 o'clock" etc.
+    do
+        local groups, groupOrder = GroupCandidates(tier2Candidates)
+        for _, key in ipairs(groupOrder) do
+            local group = groups[key]
+            local closestPosition = group.closest.position
+            local closestDistance = group.closest.distance
+            local label = FormatCountedName(
+                group.name, group.count, group.isCorpse)
+            local directionLabel = FormatDirection(
+                playerPosition, closestPosition)
+            local distanceRounded = math.floor(closestDistance + 0.5)
+            local proxSpeech2 = SpeechData.Create()
+            proxSpeech2:Add("name", label, "brief")
+            if group.wantsToTalk then
+                proxSpeech2:Add("status", "wants to talk", "brief")
+            end
+            proxSpeech2:AddProperty("Distance",
+                distanceRounded .. " meters", "brief")
+            if directionLabel then
+                proxSpeech2:AddProperty("Direction",
+                    directionLabel, "normal")
+            end
+            local speech = proxSpeech2:Format()
+            Log.Info("Proximity Tier 2: " .. speech)
+            Ext.Tolk.Speak(speech, false)
+        end
+    end
+
     -- Prune latched entries for entities no longer in the scan
-    -- results.  An entity that left the 30m scan radius is out
-    -- of speech range anyway, and leaving its latch set would
+    -- results.  An entity that left the configured scan radius is
+    -- out of speech range anyway, and leaving its latch set would
     -- leak memory across a long session.
     for handle in pairs(tier1Latched) do
         if not liveHandles[handle] then
@@ -3660,6 +4732,12 @@ local function ClearGPSState()
     lastProximityPosition = nil
     tier1Latched = {}
     tier2Latched = {}
+    -- previousWantsToTalkSet is intentionally NOT reset here.  Mode
+    -- toggles (Exploration <-> Routing) happen frequently during
+    -- normal play and resetting would re-announce every currently-
+    -- tagged entity on every toggle.  Only ResetState (level change,
+    -- save load) clears the set so the underlying entity-key keys
+    -- stay valid until a hard state change invalidates them.
     scannedCategories = {}
     lastScanPosition = nil
     entityListOpen = false
@@ -3677,11 +4755,31 @@ local function ClearGPSState()
     noPathAnnounced = false
     noPathTickCount = 0
     trackingTicks = 0
+    -- Drop hostile-check / prompt state too.  A combat-start or menu
+    -- suspend that lands here means whatever decision the user was
+    -- about to make is moot -- the entry, the path, even the player
+    -- position are stale.  Leaving the prompt subscription alive
+    -- would also leak button capture into the new game state.
+    if hostileWarning.ClearPendingCheck then
+        hostileWarning.ClearPendingCheck()
+    end
+    if hostileWarning.ClearPendingPrompt then
+        hostileWarning.ClearPendingPrompt()
+    end
+    -- Silence + despawn the spatial-audio beacon on any GPS state
+    -- transition (Off / Exploration / mid-route cancel via mode swap).
+    -- Stop is idempotent so calling here is safe even when no beacon
+    -- is active.  Guard the method-existence check for the case where
+    -- ClearGPSState runs before the gpsBeacon table is populated
+    -- (forward-declaration is an empty table at module load time).
+    if gpsBeacon.Stop then
+        gpsBeacon.Stop()
+    end
 end
 
 --- Enter Off mode: clear everything and go silent.
 local function EnterOffMode()
-    gpsMode = GPS_MODE_OFF
+    gpsMode = Config.GPS_MODE_OFF
     ClearGPSState()
     Log.Info("GPS: Off")
     local offSpeech = SpeechData.Create()
@@ -3703,9 +4801,11 @@ end
 --- function.  See the matching `local EnterExplorationMode`
 --- declaration above UpdateTrackingState for the rationale.
 function EnterExplorationMode(introText)
-    gpsMode = GPS_MODE_EXPLORATION
+    gpsMode = Config.GPS_MODE_EXPLORATION
     tier1Latched = {}
     tier2Latched = {}
+    -- previousWantsToTalkSet persists across mode entries (see
+    -- comment in ClearGPSState).
     lastProximityPosition = nil
     Log.Info("GPS: Exploration mode")
     local exploSpeech = SpeechData.Create()
@@ -3735,9 +4835,11 @@ end
 --- and navigating the list, which is idle time in the main thread
 --- anyway.
 local function EnterRoutingMode()
-    gpsMode = GPS_MODE_ROUTING
+    gpsMode = Config.GPS_MODE_ROUTING
     tier1Latched = {}
     tier2Latched = {}
+    -- previousWantsToTalkSet persists across mode entries (see
+    -- comment in ClearGPSState).
     lastProximityPosition = nil
     Log.Info("GPS: Routing mode")
     -- Force the hazard set to build now if it has not been built
@@ -3774,14 +4876,361 @@ end
 --- chest and break it" type tactics.  On other characters' turns LS
 --- is inert anyway, so guidance just sits silent until your turn.
 local function CycleGPSMode()
-    if gpsMode == GPS_MODE_OFF then
+    if gpsMode == Config.GPS_MODE_OFF then
         EnterExplorationMode()
-    elseif gpsMode == GPS_MODE_EXPLORATION then
+    elseif gpsMode == Config.GPS_MODE_EXPLORATION then
         EnterRoutingMode()
     else
         EnterOffMode()
     end
 end
+
+-- ============================================================================
+-- GPS navigation beacon
+--
+-- Spatial-audio beacon that follows the next path-node toward the
+-- player's tracking target.  Architecture validated through extensive
+-- audition (see project_navigation_beacon.md memory):
+--   * Server spawns an invisible Helper_Invisible_A item at the node
+--     position via Osi.CreateAt.
+--   * Client receives the item UUID via BG3Access_GPSBeaconReady, waits
+--     ~10 frames for entity init, then PostEvents
+--     "Items_Objects_Drop_Fiber_Tiny" on the entity at GPS_BEACON_INTERVAL_MS
+--     intervals via Scheduler.RunAfterMs.
+--   * Wwise tracks the entity's transform per-frame -- when the server
+--     moves the item via ItemMoveToPosition, the audio follows the new
+--     position automatically (no need to re-post anything).
+--   * On arrival / cancel, client fires Ext.Audio.Stop(entity) and the
+--     server despawns via Osi.RequestDelete.
+--
+-- All methods on a single table to keep the module-level local count
+-- minimal (one local instead of many).  The local itself is forward-
+-- declared at the top of the file -- this assignment populates the
+-- empty table created there.
+-- ============================================================================
+gpsBeacon = {
+    activeItemGuid = nil,
+    -- True between Start being called and the BG3Access_GPSBeaconReady
+    -- response arriving from the server.  Suppresses the per-tick
+    -- OnTick code from issuing a second Start while the first is still
+    -- in-flight (otherwise we get two emitters + two metronomes, since
+    -- activeItemGuid hasn't been set yet by the time OnTick re-checks).
+    spawnPending = false,
+    -- Generation counter for metronome cancellation.  Bumped on Stop /
+    -- new Start; the scheduler callback compares against this and
+    -- silently no-ops if stale.  Same pattern as the dev-test
+    -- metronome above; avoids Ext.Timer.WaitFor's lack of a cancel API.
+    metronomeGen = 0,
+    -- Last position we asked the server to move the beacon to.  Used
+    -- to suppress redundant move messages when the GPS sample point
+    -- hasn't changed enough to warrant a network round-trip.
+    lastSentPosition = nil,
+    -- Threshold for "the node moved enough to re-issue a move".
+    -- 1.0m corresponds to ~7 deg rotation at the 8m projection
+    -- distance.  Smaller values made panning re-update on tiny
+    -- camera/path wiggles which felt "frenzied" -- the audio kept
+    -- shifting side-to-side as the player walked past nodes.  1.0m
+    -- gives meaningful but unhurried updates.
+    MOVE_THRESHOLD_M = 1.0,
+    -- Wwise event we PostEvent on the beacon item.  Chosen after the
+    -- 30-candidate audition; tiny, dry, distinct, not gameplay-tied.
+    SOUND_EVENT = "Items_Objects_Drop_Fiber_Tiny",
+    -- Metronome cadence (ms).  300 used to be a fixed rate, now used
+    -- as a fallback when relativeBearingMag is unknown.  See Tick for
+    -- the dynamic-rate logic that maps relative bearing magnitude to
+    -- a 250-1000ms range -- fast = target ahead, slow = target behind.
+    -- This is the audio-only cue for "target front vs back" that
+    -- replaces what HRTF/surround sound would otherwise provide.
+    INTERVAL_MS = 300,
+    -- Bucket cadences (ms) for the three discrete tick rates.
+    -- Picked for a calm "fast / medium / slow" feel rather than a
+    -- frenzied continuous variation as the bearing drifts.  Front
+    -- is the comfortable "you're aligned, keep going" rate; behind
+    -- is intentionally slow so the gap between ticks feels like a
+    -- noticeable "wrong direction" cue.
+    BUCKET_FRONT_MS  = 500,
+    BUCKET_SIDE_MS   = 800,
+    BUCKET_BEHIND_MS = 1300,
+    -- Hysteresis margin (radians) for bucket switching.  Once a
+    -- bucket is active, the bearing must cross the threshold by
+    -- this much before switching.  Eliminates flickering when the
+    -- bearing wobbles right at a boundary (e.g., 60 deg = 1.047
+    -- radians, and a 1-degree wiggle would otherwise toggle the
+    -- bucket every few ticks).
+    BUCKET_HYSTERESIS_RAD = math.rad(15),
+    -- Current bucket (string: "front", "side", "behind", or nil if
+    -- never set).  ComputeNextInterval reads / writes this so the
+    -- hysteresis check has memory of the prior state.
+    currentBucket = nil,
+    -- |relative bearing| in radians, cached from OnTick for the
+    -- metronome to compute its next interval from.  0 = ahead,
+    -- math.pi = directly behind.  Nil before first update.
+    relativeBearingMag = nil,
+    -- Fixed distance to project the beacon along the player->node
+    -- bearing.  The beacon is NOT placed at the absolute world
+    -- position of the next path node; it's placed at this distance
+    -- along the bearing toward that node so that:
+    --   * When the player is facing the node direction, the beacon
+    --     is straight ahead -> audio centers ("go straight").
+    --   * When the player turns away from the node, the beacon stays
+    --     at its world position so the audio pans in the direction
+    --     the player needs to turn TOWARD ("audio on right = turn
+    --     right to re-align").
+    --   * Loudness is consistent regardless of how far the actual
+    --     target is, because the beacon is always this distance
+    --     from the listener.
+    PROJECTION_DISTANCE_M = 8,
+    -- Distance-to-target below which beacon updates are FROZEN.
+    -- The "audio swings wildly" effect within the last few meters
+    -- is bearing math doing what it should: small lateral movements
+    -- = large angle changes when the target is close.  Rather than
+    -- fight it, we freeze panning + cadence once you're within
+    -- this radius -- the audio that got you close is left alone,
+    -- and the speech distance updates ("3 meters", "2 meters") +
+    -- arrival announcement guide the final approach.
+    STABILIZE_NEAR_M = 4.0,
+}
+
+-- Project a beacon world position: place it PROJECTION_DISTANCE_M
+-- along the raw bearing from player to target.  Wwise's natural
+-- spatialization (listener = camera) pans the audio based on where
+-- the emitter is relative to the camera's forward direction.
+--
+-- User-facing model: "push the stick toward the direction the audio
+-- is coming from".  Audio right -> push stick right.  Audio centered
+-- -> push stick forward.  Stable and predictable: audio direction
+-- always matches the stick direction the user should push.
+--
+-- We tried body-anchored projection (compensating emitter position
+-- so audio "centers when body faces target").  In practice that
+-- created an oscillation: audio centers, user instinctively pushes
+-- stick 12, character walks camera-forward instead of body-forward,
+-- body re-rotates, audio re-pans.  Stable camera-anchored projection
+-- avoids that loop.
+--
+-- Returns the projected (x, y, z) position, or nil if inputs are
+-- too close together to compute a stable target bearing.
+function gpsBeacon.ProjectPosition(playerPos, targetPos)
+    if not playerPos or not targetPos then return nil end
+    local dx = targetPos[1] - playerPos[1]
+    local dz = targetPos[3] - playerPos[3]
+    local distance = math.sqrt(dx * dx + dz * dz)
+    if distance < 0.01 then
+        -- Degenerate case: target on top of player -- no stable
+        -- bearing.  Place beacon at player position.
+        return { playerPos[1], playerPos[2], playerPos[3] }
+    end
+    -- math.atan(y, x) -- Lua 5.3 merged atan2 into atan with optional
+    -- second arg; the rest of WorldNav.lua uses this same signature.
+    local targetBearing = math.atan(dx, dz)
+    local ux = math.sin(targetBearing)
+    local uz = math.cos(targetBearing)
+    return {
+        playerPos[1] + ux * gpsBeacon.PROJECTION_DISTANCE_M,
+        playerPos[2],
+        playerPos[3] + uz * gpsBeacon.PROJECTION_DISTANCE_M,
+    }
+end
+
+-- Internal: Scheduler-driven tick.  Generation gate suppresses stale
+-- callbacks left over from previous Start/Stop cycles.
+-- Compute the next metronome interval from the cached
+-- relativeBearingMag (|target bearing - camera bearing|, radians).
+-- Three discrete buckets WITH HYSTERESIS: once a bucket is active,
+-- the bearing must cross the threshold by BUCKET_HYSTERESIS_RAD
+-- before switching, so small bearing wobbles around a boundary
+-- don't flicker the cadence.
+--
+--   |bearing| in (0, 60 deg)   = FRONT  : fast  ticks (BUCKET_FRONT_MS)
+--   |bearing| in [60 deg, 120 deg)  = SIDE   : med   ticks (BUCKET_SIDE_MS)
+--   |bearing| in [120 deg, 180 deg] = BEHIND : slow  ticks (BUCKET_BEHIND_MS)
+--
+-- Hysteresis: from FRONT you don't go to SIDE until mag > 60+15=75 deg.
+-- From SIDE you don't go back to FRONT until mag < 60-15=45 deg.
+-- Similar +/-15 deg margins around the SIDE/BEHIND boundary at 120 deg.
+function gpsBeacon.ComputeNextInterval()
+    local mag = gpsBeacon.relativeBearingMag
+    if not mag then return gpsBeacon.BUCKET_SIDE_MS end
+    if mag < 0 then mag = -mag end
+    local lowerThreshold = math.pi / 3       -- 60 deg
+    local upperThreshold = 2 * math.pi / 3   -- 120 deg
+    local margin = gpsBeacon.BUCKET_HYSTERESIS_RAD
+    local current = gpsBeacon.currentBucket
+    local next
+    if current == "front" then
+        next = (mag > lowerThreshold + margin) and "side" or "front"
+        if next == "side" and mag > upperThreshold + margin then
+            next = "behind"
+        end
+    elseif current == "side" then
+        if mag < lowerThreshold - margin then
+            next = "front"
+        elseif mag > upperThreshold + margin then
+            next = "behind"
+        else
+            next = "side"
+        end
+    elseif current == "behind" then
+        next = (mag < upperThreshold - margin) and "side" or "behind"
+        if next == "side" and mag < lowerThreshold - margin then
+            next = "front"
+        end
+    else
+        -- First call: pick bucket directly without hysteresis.
+        if mag < lowerThreshold then
+            next = "front"
+        elseif mag < upperThreshold then
+            next = "side"
+        else
+            next = "behind"
+        end
+    end
+    gpsBeacon.currentBucket = next
+    if next == "front" then
+        return gpsBeacon.BUCKET_FRONT_MS
+    elseif next == "side" then
+        return gpsBeacon.BUCKET_SIDE_MS
+    else
+        return gpsBeacon.BUCKET_BEHIND_MS
+    end
+end
+
+function gpsBeacon.Tick(generation)
+    if generation ~= gpsBeacon.metronomeGen then return end
+    if not gpsBeacon.activeItemGuid then return end
+    local entity = Ext.Entity.Get(gpsBeacon.activeItemGuid)
+    if entity then
+        local ok, err = pcall(Ext.Audio.PostEvent, entity,
+            gpsBeacon.SOUND_EVENT)
+        -- Log only the FIRST tick of a generation so we don't spam.
+        if generation ~= gpsBeacon._lastLoggedGen then
+            gpsBeacon._lastLoggedGen = generation
+            Log.Info("gpsBeacon.Tick: first PostEvent of gen="
+                .. generation .. " ok=" .. tostring(ok)
+                .. " err=" .. tostring(err))
+        end
+    else
+        if generation ~= gpsBeacon._lastLoggedGen then
+            gpsBeacon._lastLoggedGen = generation
+            Log.Warn("gpsBeacon.Tick: Ext.Entity.Get returned nil for "
+                .. gpsBeacon.activeItemGuid)
+        end
+    end
+    local Scheduler = BG3Access.Client.Scheduler
+    if Scheduler and Scheduler.RunAfterMs then
+        Scheduler.RunAfterMs(gpsBeacon.ComputeNextInterval(), function()
+            gpsBeacon.Tick(generation)
+        end)
+    end
+end
+
+-- Request a beacon spawn at the given position.  Non-blocking; the
+-- BG3Access_GPSBeaconReady listener below will receive the item UUID
+-- once the server has spawned + initialized the entity.
+function gpsBeacon.Start(position)
+    if not position then
+        Log.Warn("gpsBeacon.Start: nil position, skipping")
+        return
+    end
+    -- Honor the user's guidance mode -- skip entirely in voice-only
+    -- mode so no item spawns, no Wwise events fire, no per-tick
+    -- network move messages.  The mode is re-checked on each
+    -- guidance update so a mid-route mode switch silences the
+    -- beacon immediately on its next Stop() call.
+    if not GuidanceAudioEnabled() then return end
+    gpsBeacon.Stop()  -- clean any previous session before starting fresh
+    gpsBeacon.lastSentPosition = {
+        position[1], position[2], position[3]
+    }
+    -- Latch spawn-pending so OnTick's late-path-start branch doesn't
+    -- issue a duplicate Start while we're waiting for the server's
+    -- BG3Access_GPSBeaconReady response.
+    gpsBeacon.spawnPending = true
+    local payload = Ext.Json.Stringify({
+        x = position[1], y = position[2], z = position[3],
+    })
+    pcall(Ext.ClientNet.PostMessageToServer,
+        "BG3Access_GPSBeaconSpawn", payload)
+    Log.Info(string.format(
+        "gpsBeacon.Start: spawn requested at (%.2f, %.2f, %.2f)",
+        position[1], position[2], position[3]))
+end
+
+-- Request a beacon move to a new node position.  Suppresses redundant
+-- moves when the new position is within MOVE_THRESHOLD_M of the last
+-- sent position -- prevents spamming the server every tick when the
+-- GPS sample point only drifts a fraction of a meter.
+function gpsBeacon.MoveTo(position)
+    if not position then return end
+    if not gpsBeacon.activeItemGuid then return end  -- not spawned yet
+    if gpsBeacon.lastSentPosition then
+        local dx = position[1] - gpsBeacon.lastSentPosition[1]
+        local dz = position[3] - gpsBeacon.lastSentPosition[3]
+        local distance = math.sqrt(dx * dx + dz * dz)
+        if distance < gpsBeacon.MOVE_THRESHOLD_M then return end
+    end
+    gpsBeacon.lastSentPosition = {
+        position[1], position[2], position[3]
+    }
+    local payload = Ext.Json.Stringify({
+        itemGuid = gpsBeacon.activeItemGuid,
+        x = position[1], y = position[2], z = position[3],
+    })
+    pcall(Ext.ClientNet.PostMessageToServer,
+        "BG3Access_GPSBeaconMove", payload)
+end
+
+-- Stop the beacon: bump metronome generation (stops next scheduled
+-- tick), silence the entity, despawn the item.  Idempotent -- safe to
+-- call repeatedly or when no beacon is active.
+function gpsBeacon.Stop()
+    gpsBeacon.metronomeGen = gpsBeacon.metronomeGen + 1
+    gpsBeacon.lastSentPosition = nil
+    gpsBeacon.spawnPending = false
+    gpsBeacon.relativeBearingMag = nil
+    gpsBeacon.currentBucket = nil
+    if not gpsBeacon.activeItemGuid then return end
+    local entity = Ext.Entity.Get(gpsBeacon.activeItemGuid)
+    if entity then
+        pcall(Ext.Audio.Stop, entity)
+    end
+    local payload = Ext.Json.Stringify({
+        itemGuid = gpsBeacon.activeItemGuid,
+    })
+    pcall(Ext.ClientNet.PostMessageToServer,
+        "BG3Access_GPSBeaconDespawn", payload)
+    gpsBeacon.activeItemGuid = nil
+end
+
+-- Server callback: spawn is ready.  Defer the first PostEvent by 10
+-- frames so the entity's SoundComponent has time to wire up.
+Ext.RegisterNetListener("BG3Access_GPSBeaconReady",
+    function(channel, payload, userId)
+        local parseOk, data = pcall(Ext.Json.Parse, payload)
+        if not parseOk or type(data) ~= "table" then return end
+        gpsBeacon.activeItemGuid = tostring(data.itemGuid)
+        gpsBeacon.spawnPending = false
+        Log.Info("gpsBeacon: server ready, item="
+            .. gpsBeacon.activeItemGuid)
+        local Scheduler = BG3Access.Client.Scheduler
+        if not Scheduler then
+            Log.Warn("gpsBeacon: no Scheduler, firing immediately")
+            gpsBeacon.metronomeGen = gpsBeacon.metronomeGen + 1
+            gpsBeacon.Tick(gpsBeacon.metronomeGen)
+            return
+        end
+        Scheduler.RunAfterFrames(10, function()
+            if not gpsBeacon.activeItemGuid then
+                Log.Warn("gpsBeacon: activeItemGuid cleared before "
+                    .. "metronome could start")
+                return
+            end
+            gpsBeacon.metronomeGen = gpsBeacon.metronomeGen + 1
+            Log.Info("gpsBeacon: starting metronome gen="
+                .. gpsBeacon.metronomeGen)
+            gpsBeacon.Tick(gpsBeacon.metronomeGen)
+        end)
+    end)
 
 --- Start tracking to a specific entity (selected from entity list).
 --- Always called from EntityListSelect in Routing mode, so the mode is
@@ -3860,10 +5309,31 @@ local function StartTracking(targetEntry)
         -- longer needed.
         local initialBearing = GetSmoothedPathBearing(
             playerPosition, currentPath)
+        local initialSamplePoint = GetSmoothedPathSamplePoint(
+            playerPosition, currentPath)
+
+        -- Spawn the spatial-audio beacon PROJECTED at a fixed distance
+        -- along the player->node bearing, clamped to the forward
+        -- hemisphere so the audio always pans correctly for the
+        -- "turn toward the sound" mental model.  See
+        -- gpsBeacon.ProjectPosition for the clamp logic.  The beacon
+        -- follows updates via per-tick MoveTo calls in OnTick.
+        -- Despawn happens in arrival, cancel, and any Off-mode swap.
+        if initialSamplePoint then
+            local beaconWorldPos = gpsBeacon.ProjectPosition(
+                playerPosition, initialSamplePoint)
+            if beaconWorldPos then
+                gpsBeacon.Start(beaconWorldPos)
+            end
+        end
         local guidancePhrase = nil
-        if initialBearing then
-            guidancePhrase = distanceRounded .. " meters. "
-                .. initialBearing .. " o'clock"
+        if initialBearing and initialSamplePoint then
+            local directionLabel = FormatDirection(
+                playerPosition, initialSamplePoint)
+            if directionLabel then
+                guidancePhrase = distanceRounded .. " meters. "
+                    .. directionLabel
+            end
             -- Record initial bearing so SpeakTrackingGuidance does
             -- not re-announce on the first post-tracking movement
             -- tick.  Without this the player would hear the same
@@ -3959,9 +5429,9 @@ end
 
 -- (autoWalkActive declared in the GPS state block above.)
 
-local AUTOWALK_REQUEST_CHANNEL = "BG3Access_AutoWalk"
-local AUTOWALK_TRACK_CHANNEL   = "BG3Access_AutoWalk_TrackTarget"
-local AUTOWALK_RESULT_CHANNEL  = "BG3Access_AutoWalkResult"
+-- AUTOWALK_REQUEST_CHANNEL moved to Config table; see Config.AUTOWALK_REQUEST_CHANNEL
+-- AUTOWALK_TRACK_CHANNEL moved to Config table; see Config.AUTOWALK_TRACK_CHANNEL
+-- AUTOWALK_RESULT_CHANNEL moved to Config table; see Config.AUTOWALK_RESULT_CHANNEL
 
 --- Send an auto-walk request to the server and announce the route.
 --- Replaces StartTracking for routing-list A-selections.  Returns
@@ -4004,12 +5474,16 @@ local function RequestAutoWalk(targetEntry)
 
     -- Compute the path locally so we can announce distance + hazard
     -- warnings.  The engine's auto-walk uses its own pathfinder
-    -- (which respects the same hazard-influence weights -- see
-    -- ApplyHazardAvoidance -- so the actual path it takes should
-    -- match ours), but it doesn't TELL the user "fire on route".
-    -- We do that ourselves before handing off.
+    -- The engine drives auto-walk via Osi.CharacterMoveTo, which
+    -- uses its own native pathfinder weights -- it does NOT see our
+    -- ApplyHazardAvoidance SurfacePathInfluences (those only affect
+    -- AiPath instances we configure ourselves).  Pass applyAvoidance
+    -- = false so the preview path matches what the engine will
+    -- actually walk.  Otherwise our distance preview and "fire on
+    -- route" warning describe a hypothetical safer detour the engine
+    -- won't take.
     local previewPath, _ = ComputePath(
-        playerEntity, playerPosition, targetEntry.position)
+        playerEntity, playerPosition, targetEntry.position, false)
 
     local distanceToTarget = DistanceXZ(
         playerPosition, targetEntry.position)
@@ -4043,7 +5517,22 @@ local function RequestAutoWalk(targetEntry)
 
     -- Build target identification.  Prefer entity UUID if we have
     -- one (engine can use Osi.CharacterMoveTo with object-based
-    -- pathfinding); otherwise fall back to position.
+    -- pathfinding AND can rotate the character to face the target on
+    -- arrival via LookAtEntity); otherwise fall back to position.
+    --
+    -- Two sources of UUID:
+    --   1. targetEntry.entity (real scanner entry) -- read
+    --      entity.Uuid.EntityUuid the normal way.
+    --   2. targetEntry.itemGuid (virtual waypoint entry) -- the
+    --      server already resolved the shrine item's UUID and
+    --      passed it through the waypoint payload.  Used as the
+    --      target so MoveTo walks the character to the shrine AND
+    --      arrival-time LookAtEntity faces it.
+    --
+    -- Discovered Places (virtual subregion entries) have no entity
+    -- and no itemGuid, so they fall through to position-based
+    -- dispatch and skip facing.  That's the right behavior --
+    -- there's no object to face, just a region center.
     local targetUuid = nil
     if targetEntry.entity then
         pcall(function()
@@ -4053,6 +5542,9 @@ local function RequestAutoWalk(targetEntry)
                     targetEntry.entity.Uuid.EntityUuid)
             end
         end)
+    elseif targetEntry.itemGuid
+        and targetEntry.itemGuid ~= "" then
+        targetUuid = tostring(targetEntry.itemGuid)
     end
 
     local request = {
@@ -4083,11 +5575,11 @@ local function RequestAutoWalk(targetEntry)
     })
     if trackJsonOk then
         pcall(Ext.ClientNet.PostMessageToServer,
-            AUTOWALK_TRACK_CHANNEL, trackJsonStr)
+            Config.AUTOWALK_TRACK_CHANNEL, trackJsonStr)
     end
 
     pcall(Ext.ClientNet.PostMessageToServer,
-        AUTOWALK_REQUEST_CHANNEL, jsonStr)
+        Config.AUTOWALK_REQUEST_CHANNEL, jsonStr)
 
     -- Snapshot Tav's position at AutoWalk request time.  The arrival
     -- handler compares request-position to arrival-position to
@@ -4122,7 +5614,7 @@ local function RequestAutoWalk(targetEntry)
 end
 
 --- Server result listener: arrival / cancellation / failure.
-Ext.RegisterNetListener(AUTOWALK_RESULT_CHANNEL,
+Ext.RegisterNetListener(Config.AUTOWALK_RESULT_CHANNEL,
     function(channel, payload, userId)
         if not autoWalkActive then return end
         local parseOk, result = pcall(Ext.Json.Parse, payload)
@@ -4142,7 +5634,7 @@ Ext.RegisterNetListener(AUTOWALK_RESULT_CHANNEL,
             --   delta >= ARRIVAL_TOLERANCE_M -> false arrival (engine
             --     stopped Tav short).  Speak an honest "walk
             --     interrupted" message instead of lying about arrival.
-            local ARRIVAL_TOLERANCE_M = 5.0
+            -- ARRIVAL_TOLERANCE_M moved to Config table; see Config.ARRIVAL_TOLERANCE_M
             local cachedTargetPosition = autoWalkActive.targetPosition
             local cachedStartPosition = autoWalkActive.startPosition
             local cachedCombatStartPosition =
@@ -4208,7 +5700,7 @@ Ext.RegisterNetListener(AUTOWALK_RESULT_CHANNEL,
                     or "?"))
             autoWalkActive = nil
             local trueArrival = arrivalDelta == nil
-                or arrivalDelta < ARRIVAL_TOLERANCE_M
+                or arrivalDelta < Config.ARRIVAL_TOLERANCE_M
             if trueArrival then
                 Log.Info("AutoWalk: arrived at " .. cachedTargetName)
             else
@@ -4257,6 +5749,383 @@ Ext.RegisterNetListener(AUTOWALK_RESULT_CHANNEL,
     end)
 
 -- ============================================================================
+-- Hostile-on-route check + warning prompt
+--
+-- When the user A-selects a destination, we check whether the planned path
+-- passes within combat-aggro distance of any hostile NPC.  If it does,
+-- auto-walking is dangerous: BG3 frequently fast-resolves the queued
+-- CharacterMoveTo during combat lock-in, teleporting the auto-walking
+-- character to the destination while the rest of the party stays put.
+-- The result is a split party at the start of combat -- often catastrophic.
+--
+-- No Osiris primitive exists to surgically cancel a queued move (the only
+-- option is FlushOsirisQueue, which is too broad).  So we PRE-CHECK and
+-- offer the user three choices:
+--   A -- walk anyway (accept the teleport risk)
+--   X -- switch to guided mode (engine never gets a move order, so there's
+--        nothing to teleport)
+--   B -- cancel back to exploration mode
+--
+-- Hostility is a server-side check (Osi.IsEnemy).  We collect NPC UUIDs
+-- whose positions are within hostileWarning.PROXIMITY_M of the planned
+-- path, send them in one query, and act on the response.  If no hostiles
+-- are present, the auto-walk dispatch happens immediately with no prompt.
+--
+-- IMPORTANT (module-local budget): everything in this section lives on
+-- the `hostileWarning` table declared near the top of the file.  Lua
+-- caps a chunk at 200 active locals and WorldNav is already near that
+-- ceiling; adding ~17 new module-level locals here (constants, state,
+-- forward decls, function names) blew the limit and the file refused
+-- to parse.  The table consolidation costs us nothing in clarity --
+-- each name is still uniquely scoped, just under one container -- and
+-- buys back 16 local slots for future additions.
+--
+-- pendingCheck shape:
+--   nil           -- no check in flight
+--   { entry, path, queryId, cancelTimer }
+--                 -- check dispatched; waiting for server response.
+-- pendingPrompt shape:
+--   nil           -- no prompt visible
+--   { entry, path, subscription, cancelTimer }
+--                 -- prompt is active; subscription captures A/X/B.
+-- ============================================================================
+
+-- NOTE: client-side CollectNpcsNearPath / ExtractEntityUuid helpers
+-- were removed when the hostile-on-route check moved server-side.
+-- The server enumerates ALL live characters (not just whatever's
+-- streamed to the client's ECS) and does its own proximity + IsEnemy
+-- filtering -- the client just sends path nodes.  See the relay
+-- handler in BootstrapServer.lua's "Hostile-on-route check relay"
+-- section for the server-side implementation.
+
+--- hostileWarning.ClearPendingCheck: drop state and any pending
+--- timeout for a check that's no longer relevant (response arrived,
+--- prompt resolved, player cancelled, etc.).
+hostileWarning.ClearPendingCheck = function()
+    local pending = hostileWarning.pendingCheck
+    if pending and pending.cancelTimer then
+        pending.cancelTimer()
+        pending.cancelTimer = nil
+    end
+    hostileWarning.pendingCheck = nil
+end
+
+--- hostileWarning.ClearPendingPrompt: dismiss the prompt UI,
+--- unsubscribe its button capture, and drop the timeout.
+hostileWarning.ClearPendingPrompt = function()
+    local pending = hostileWarning.pendingPrompt
+    if pending then
+        if pending.subscription
+            and Ext.Events
+            and Ext.Events.ControllerButtonInput then
+            pcall(Ext.Events.ControllerButtonInput.Unsubscribe,
+                Ext.Events.ControllerButtonInput,
+                pending.subscription)
+            pending.subscription = nil
+        end
+        if pending.cancelTimer then
+            pending.cancelTimer()
+            pending.cancelTimer = nil
+        end
+        hostileWarning.pendingPrompt = nil
+    end
+end
+
+--- HandleHostileWarningButton: routed button capture for the prompt.
+--- A => walk anyway, X => guided, B => cancel.  Other buttons are
+--- silently absorbed via PreventAction so the player can't accidentally
+--- trigger something else while the prompt is up.
+---
+--- Cancel handling note: the entity list was closed by EntityListSelect
+--- before the prompt ever fired, but gpsMode is still GPS_MODE_ROUTING
+--- (Routing implies "wanting to route somewhere" not "list is open").
+--- On B-cancel we must actively transition back to Exploration --
+--- otherwise the next RS-Left press cycles Routing -> Off, surprising
+--- the user with "GPS off" when they expected Routing again.
+--- EnterExplorationMode accepts an introText argument that doubles as
+--- the speech, so a single call handles both the state transition and
+--- the cancellation announcement.
+local function HandleHostileWarningButton(event)
+    if not event then return end
+    -- IMPORTANT: gate ALL handler work (including PreventAction) on
+    -- pendingPrompt being set.  If the subscription ever survives a
+    -- ClearPendingPrompt call -- which can happen silently if the
+    -- pcall'd Unsubscribe fails for any reason -- an orphan handler
+    -- would otherwise swallow every button press in the world.
+    -- Symptom: spell casts produce no game effect because A is
+    -- PreventAction'd before the engine sees it.  Putting the early
+    -- bail BEFORE PreventAction keeps a leaked subscription harmless.
+    if not hostileWarning.pendingPrompt then return end
+    pcall(function() event:PreventAction() end)
+    if not event.Pressed then return end
+
+    local buttonName = tostring(event.Button)
+    if buttonName == "A" then
+        local entry = hostileWarning.pendingPrompt.entry
+        hostileWarning.ClearPendingPrompt()
+        if not RequestAutoWalk(entry) then
+            StartTracking(entry)
+        end
+    elseif buttonName == "X" then
+        local entry = hostileWarning.pendingPrompt.entry
+        hostileWarning.ClearPendingPrompt()
+        StartTracking(entry)
+    elseif buttonName == "B" then
+        hostileWarning.ClearPendingPrompt()
+        EnterExplorationMode(
+            "Cancelled. Exploration mode.")
+    end
+end
+
+--- hostileWarning.ShowPrompt: speak the warning and subscribe to
+--- capture the next A/X/B press.  Auto-cancels after PROMPT_TIMEOUT_MS.
+hostileWarning.ShowPrompt = function(entry, path)
+    hostileWarning.ClearPendingPrompt()
+
+    local promptText = "Warning: enemies on route. "
+        .. "If combat starts on the way, your character could be "
+        .. "moved and the party split. "
+        .. "A to walk anyway, X to be manually guided, "
+        .. "B to cancel."
+    SpeechData.Alert(promptText, "interrupt")
+
+    local subscription = nil
+    if Ext.Events and Ext.Events.ControllerButtonInput then
+        subscription = Ext.Events.ControllerButtonInput:Subscribe(
+            HandleHostileWarningButton)
+    end
+
+    local cancelTimer = nil
+    if BG3Access.Client.Scheduler
+        and BG3Access.Client.Scheduler.RunAfterMs then
+        cancelTimer = BG3Access.Client.Scheduler.RunAfterMs(
+            hostileWarning.PROMPT_TIMEOUT_MS, function()
+                if hostileWarning.pendingPrompt then
+                    hostileWarning.ClearPendingPrompt()
+                    SpeechData.Alert(
+                        "Prompt timed out. Exploration mode.",
+                        "interrupt")
+                end
+            end)
+    end
+
+    hostileWarning.pendingPrompt = {
+        entry        = entry,
+        path         = path,
+        subscription = subscription,
+        cancelTimer  = cancelTimer,
+    }
+end
+
+--- HandleHostileCheckResult: net listener invoked when the server
+--- finishes a hostile-check query.  Matches the response queryId
+--- against our pending request, then dispatches either the prompt
+--- (hostiles present) or the immediate auto-walk (none).
+local function HandleHostileCheckResult(payload)
+    if not hostileWarning.pendingCheck then return end
+    local parseOk, response = pcall(Ext.Json.Parse, payload)
+    if not parseOk or type(response) ~= "table" then return end
+
+    if tonumber(response.queryId)
+        ~= hostileWarning.pendingCheck.queryId then
+        return
+    end
+
+    local entry = hostileWarning.pendingCheck.entry
+    local path  = hostileWarning.pendingCheck.path
+    local hostileCount = 0
+    if type(response.hostile) == "table" then
+        hostileCount = #response.hostile
+    end
+    hostileWarning.ClearPendingCheck()
+
+    if hostileCount == 0 then
+        if not RequestAutoWalk(entry) then
+            StartTracking(entry)
+        end
+    else
+        Log.Info(string.format(
+            "HostileCheck: %d hostile(s) near route to %s -- prompting",
+            hostileCount, tostring(entry.name or "target")))
+        hostileWarning.ShowPrompt(entry, path)
+    end
+end
+
+Ext.RegisterNetListener(hostileWarning.RESULT_CHANNEL,
+    function(_, payload)
+        local ok, err = pcall(HandleHostileCheckResult, payload)
+        if not ok then
+            Log.Warn("HostileCheck handler error: " .. tostring(err))
+        end
+    end)
+
+--- hostileWarning.DispatchSelection: replacement entry point for the
+--- A-button press on an entity list entry.  Inserts the hostile-check
+--- step in front of the existing auto-walk dispatch.
+---
+--- Decision tree:
+---   * No path available             -> RequestAutoWalk -> StartTracking
+---                                      (StartTracking handles "no path"
+---                                      speech).
+---   * Path under CHECK_PATH_MIN_M   -> tiny move, skip check.
+---   * No NPCs near path             -> dispatch immediately.
+---   * Server check times out        -> treat as "no hostiles" and
+---                                      dispatch.  Better to occasionally
+---                                      skip the warning than freeze the
+---                                      user on an unresponsive server.
+---   * Hostiles confirmed            -> ShowPrompt.
+hostileWarning.DispatchSelection = function(entry)
+    if not entry then return end
+
+    -- Routing behavior gate.  When the user has chosen "manually
+    -- guided" as their default routing behavior, skip the entire
+    -- hostile-check and prompt pipeline -- manually guided mode is the
+    -- player walking with voice + spatial beacon cues, so the
+    -- pre-route "enemies on route" warning has no purpose (the player
+    -- makes every step decision themselves and proximity tier
+    -- announcements surface enemies as they approach).  Default is
+    -- "automatic", which preserves the existing flow below.
+    if GetRoutingBehavior() == "manually guided" then
+        Log.Info("Routing behavior 'manually guided': starting "
+            .. "tracking for " .. tostring(entry.name or "target"))
+        StartTracking(entry)
+        return
+    end
+
+    local playerEntity = GetPlayerEntity()
+    if not playerEntity then
+        Log.Info("HostileCheck skipped: no player entity")
+        if not RequestAutoWalk(entry) then
+            StartTracking(entry)
+        end
+        return
+    end
+    local playerPosition = GetEntityPosition(playerEntity)
+    if not playerPosition then
+        Log.Info("HostileCheck skipped: no player position")
+        if not RequestAutoWalk(entry) then
+            StartTracking(entry)
+        end
+        return
+    end
+
+    -- Hostile-check corridor must match the path the ENGINE will
+    -- actually walk via Osi.CharacterMoveTo, not our hazard-paranoid
+    -- variant.  See the note in RequestAutoWalk above and the
+    -- doc-comment on ComputePath for why we pass false here.  Without
+    -- this, the server checks proximity around a long detour the
+    -- engine ignores -- and enemies sitting next to the engine's
+    -- shorter actual path silently miss the warning.
+    local previewPath, _ = ComputePath(
+        playerEntity, playerPosition, entry.position, false)
+
+    if not previewPath or #previewPath < 2 then
+        Log.Info("HostileCheck skipped: no path or path too short ("
+            .. tostring(previewPath and #previewPath or 0)
+            .. " nodes)")
+        if not RequestAutoWalk(entry) then
+            StartTracking(entry)
+        end
+        return
+    end
+    local pathLength = 0
+    for segmentIndex = 1, #previewPath - 1 do
+        pathLength = pathLength + DistanceXZ(
+            previewPath[segmentIndex],
+            previewPath[segmentIndex + 1])
+    end
+    if pathLength < hostileWarning.CHECK_PATH_MIN_M then
+        Log.Info(string.format(
+            "HostileCheck skipped: path %.1fm < threshold %.1fm",
+            pathLength, hostileWarning.CHECK_PATH_MIN_M))
+        if not RequestAutoWalk(entry) then
+            StartTracking(entry)
+        end
+        return
+    end
+
+    -- The hostile check runs SERVER-SIDE now.  We send the path
+    -- nodes; the server enumerates every live character in the
+    -- simulation (not just what's streamed to the client), filters
+    -- by proximity to the path, and checks each survivor via
+    -- Osi.IsEnemy.  This sidesteps the streaming-horizon limitation
+    -- of the client-side scanner -- which empirically returns 0 NPCs
+    -- for hostile creatures sitting a few meters away (e.g.
+    -- intellect devourers in the Ravaged Beach wreckage).
+    --
+    -- The client doesn't need to pre-filter or pass UUIDs.  Just
+    -- send the path.  Server's coarse pre-filter (60m of the path
+    -- origin) keeps the per-query cost bounded.
+    Log.Info(string.format(
+        "HostileCheck: dispatching server check for route to %s "
+            .. "(path=%.1fm, %d nodes, proximity=%.1fm)",
+        tostring(entry.name or "target"),
+        pathLength, #previewPath, hostileWarning.PROXIMITY_M))
+
+    hostileWarning.ClearPendingCheck()
+    hostileWarning.nextQueryId = hostileWarning.nextQueryId + 1
+    local queryId = hostileWarning.nextQueryId
+
+    local cancelTimer = nil
+    if BG3Access.Client.Scheduler
+        and BG3Access.Client.Scheduler.RunAfterMs then
+        cancelTimer = BG3Access.Client.Scheduler.RunAfterMs(
+            hostileWarning.CHECK_TIMEOUT_MS, function()
+                local pending = hostileWarning.pendingCheck
+                if pending and pending.queryId == queryId then
+                    local timedOutEntry = pending.entry
+                    hostileWarning.ClearPendingCheck()
+                    Log.Warn(string.format(
+                        "HostileCheck: timeout for query %d -- "
+                            .. "dispatching without warning",
+                        queryId))
+                    if not RequestAutoWalk(timedOutEntry) then
+                        StartTracking(timedOutEntry)
+                    end
+                end
+            end)
+    end
+
+    hostileWarning.pendingCheck = {
+        entry       = entry,
+        path        = previewPath,
+        queryId     = queryId,
+        cancelTimer = cancelTimer,
+    }
+
+    -- Build the path payload.  Send only the (x, y, z) tuples;
+    -- everything else the server might need (hostility lookup keys,
+    -- distance math) it derives itself.  We pass x and z faithfully
+    -- but also keep y so future enhancements (multi-floor pathing)
+    -- have it available; current server-side math is 2D and ignores
+    -- y, matching client-side proximity logic.
+    local pathPayload = {}
+    for _, node in ipairs(previewPath) do
+        pathPayload[#pathPayload + 1] = {
+            tonumber(node[1]) or 0,
+            tonumber(node[2]) or 0,
+            tonumber(node[3]) or 0,
+        }
+    end
+
+    local requestPayload = {
+        queryId    = queryId,
+        proximityM = hostileWarning.PROXIMITY_M,
+        path       = pathPayload,
+    }
+    local encodeOk, encoded = pcall(Ext.Json.Stringify, requestPayload)
+    if not encodeOk then
+        hostileWarning.ClearPendingCheck()
+        if not RequestAutoWalk(entry) then
+            StartTracking(entry)
+        end
+        return
+    end
+    pcall(Ext.ClientNet.PostMessageToServer,
+        hostileWarning.CHECK_CHANNEL, encoded)
+end
+
+-- ============================================================================
 -- Entity List
 -- ============================================================================
 
@@ -4278,7 +6147,15 @@ local function FormatEntitySpeech(playerPosition, entry)
         playerPosition, entry.position)
     local distanceRounded = math.floor(
         (distance or entry.distance) + 0.5)
-    return entry.name .. ". " .. distanceRounded .. " meters"
+    local base = entry.name .. ". " .. distanceRounded .. " meters"
+    -- Append the "wants to talk" decoration if the entity carried
+    -- the HasExclamationDialog tag at scan time.  Browsing through
+    -- the entity list should let the user discover who's actionable
+    -- without waiting for the next state-change announcement.
+    if entry.wantsToTalk then
+        base = base .. ". Wants to talk"
+    end
+    return base
 end
 
 --- Announce the current item (no category prefix).
@@ -4366,7 +6243,20 @@ function OpenEntityList(prefix)
 
     ScanAndCategorise(playerPosition)
     entityListOpen = true
-    currentCategoryIndex = 1
+    -- Start at the first ENABLED category rather than always index 1.
+    -- If the user has Companions turned off but Companions is index 1,
+    -- starting at 1 would land them on a category that's been disabled.
+    -- If nothing is enabled, announce that and bail (no list to navigate).
+    local startIdx = FirstEnabledCategoryIndex()
+    if not startIdx then
+        local noneSpeech = SpeechData.Create()
+        noneSpeech:Add("status",
+            "No routing categories enabled", "brief")
+        Ext.Tolk.Speak(noneSpeech:Format(), true)
+        entityListOpen = false
+        return
+    end
+    currentCategoryIndex = startIdx
     currentItemIndex = 1
 
     Log.Info("Entity list opened")
@@ -4382,10 +6272,9 @@ end
 
 local function EntityListCategoryNext()
     if not entityListOpen then return end
-    currentCategoryIndex = currentCategoryIndex + 1
-    if currentCategoryIndex > #CATEGORY_NAMES then
-        currentCategoryIndex = 1
-    end
+    local nextIdx = NextEnabledCategoryIndex(currentCategoryIndex, 1)
+    if not nextIdx then return end  -- no categories enabled
+    currentCategoryIndex = nextIdx
     local playerEntity = GetPlayerEntity()
     if not playerEntity then return end
     local playerPosition = GetEntityPosition(playerEntity)
@@ -4395,10 +6284,9 @@ end
 
 local function EntityListCategoryPrevious()
     if not entityListOpen then return end
-    currentCategoryIndex = currentCategoryIndex - 1
-    if currentCategoryIndex < 1 then
-        currentCategoryIndex = #CATEGORY_NAMES
-    end
+    local prevIdx = NextEnabledCategoryIndex(currentCategoryIndex, -1)
+    if not prevIdx then return end  -- no categories enabled
+    currentCategoryIndex = prevIdx
     local playerEntity = GetPlayerEntity()
     if not playerEntity then return end
     local playerPosition = GetEntityPosition(playerEntity)
@@ -4450,16 +6338,13 @@ local function EntityListSelect()
     if not entry then return end
 
     CloseEntityList()
-    -- Auto-walk via Osi.CharacterMoveTo: the engine drives the
-    -- character along its own pathfinder route (same one our
-    -- clock-face was approximating).  Replaces StartTracking, which
-    -- compressed the multi-segment path into per-tick clock-face
-    -- bearings and cut corners through walls / fire.  StartTracking
-    -- is still defined (above) as a fallback in case auto-walk
-    -- can't dispatch (no character UUID, etc.).
-    if not RequestAutoWalk(entry) then
-        StartTracking(entry)
-    end
+    -- Pre-flight hostile check: if enemies lie on the planned route,
+    -- hostileWarning.DispatchSelection surfaces a three-way prompt
+    -- (A walk anyway / X guided / B cancel) instead of dispatching
+    -- directly.  Routes with no nearby hostiles dispatch immediately
+    -- via the same RequestAutoWalk -> StartTracking fallback chain.
+    -- See the "Hostile-on-route check + warning prompt" section above.
+    hostileWarning.DispatchSelection(entry)
 end
 
 -- ============================================================================
@@ -4487,7 +6372,7 @@ end
 -- this whole subsystem now consumes.  Same behaviour as before --
 -- just scoped tighter to free up local slots elsewhere in the file.
 local ScanRadialHazards = (function()
-    local DISTANCES = { 6, 12, 18 }
+    -- DISTANCES moved to Config table; see Config.DISTANCES
 
     -- Cardinal labels and unit vectors (world-relative).  +Z = north;
     -- order matches CARDINAL_LABELS used by ComputeCardinalDirection
@@ -4508,27 +6393,34 @@ local ScanRadialHazards = (function()
     -- bucket -- so a hazard within +/- 22.5deg of the motion vector
     -- counts as "ahead" (urgent interrupt warning).  Outside that cone
     -- it's "side/back" (queued cardinal warning).
-    local AHEAD_CONE_RAD = math.pi / 8
+    -- AHEAD_CONE_RAD moved to Config table; see Config.AHEAD_CONE_RAD
 
     -- Minimum motion (meters) per tick to count as "moving".  Below
     -- this the player is stationary -- ALL hits classify as side/
     -- cardinal, nothing as "ahead".  No motion vector to compare.
-    local MIN_MOTION_M = 0.3
+    -- MIN_MOTION_M moved to Config table; see Config.MIN_MOTION_M
 
     -- Per-(label + direction) dedup window.  Same hazard, same
     -- compass direction, fired less than this ago: suppress.  Re-arms
     -- on different hazard, different direction, or after the window.
-    local REPEAT_MS = 30000
+    -- REPEAT_MS moved to Config table; see Config.REPEAT_MS
 
     -- Throttle: scan runs at most this often regardless of position-
     -- check cadence.  Same 1Hz cap the proximity tier scan uses.
-    local MIN_INTERVAL_MS = 1000
+    -- MIN_INTERVAL_MS moved to Config table; see Config.MIN_INTERVAL_MS
 
     local lastMs = 0
     local dedup = {}  -- {[label .. ":" .. direction] = timestampMs}
 
     return function(playerPosition, previousPosition)
         if not playerPosition then return end
+
+        -- User setting: hazard radar can be disabled entirely.
+        local Settings = BG3Access.Client.Settings
+        if Settings and Settings.Get
+            and Settings.Get("hazardRadarEnabled") == false then
+            return
+        end
 
         -- Skip during auto-walk: engine pathfinder routes around
         -- hazards via SurfacePathInfluences and the user has no
@@ -4547,9 +6439,17 @@ local ScanRadialHazards = (function()
             return
         end
 
+        -- Skip while the settings menu itself is open -- our own UI
+        -- shouldn't have to compete with hazard chatter.
+        local SettingsMenu = BG3Access.Client.SettingsMenu
+        if SettingsMenu and SettingsMenu.IsOpen
+            and SettingsMenu.IsOpen() then
+            return
+        end
+
         -- 1Hz throttle.
         local nowMs = Ext.Utils.MonotonicTime()
-        if nowMs - lastMs < MIN_INTERVAL_MS then
+        if nowMs - lastMs < Config.MIN_INTERVAL_MS then
             return
         end
         lastMs = nowMs
@@ -4562,7 +6462,7 @@ local ScanRadialHazards = (function()
             local dx = playerPosition[1] - previousPosition[1]
             local dz = playerPosition[3] - previousPosition[3]
             local dlen = math.sqrt(dx * dx + dz * dz)
-            if dlen >= MIN_MOTION_M then
+            if dlen >= Config.MIN_MOTION_M then
                 motionDirX = dx / dlen
                 motionDirZ = dz / dlen
             end
@@ -4573,7 +6473,7 @@ local ScanRadialHazards = (function()
         -- direction.
         for _, dir in ipairs(DIRECTIONS) do
             local hitDistance, hitLabel = nil, nil
-            for _, distance in ipairs(DISTANCES) do
+            for _, distance in ipairs(Config.DISTANCES) do
                 local sample = {
                     playerPosition[1] + dir.dirX * distance,
                     playerPosition[2],
@@ -4590,7 +6490,7 @@ local ScanRadialHazards = (function()
                 -- Dedup: label + direction + window.
                 local dedupKey = hitLabel .. ":" .. dir.label
                 local prevMs = dedup[dedupKey] or 0
-                if nowMs - prevMs >= REPEAT_MS then
+                if nowMs - prevMs >= Config.REPEAT_MS then
                     dedup[dedupKey] = nowMs
 
                     -- Classify ahead vs cardinal based on whether
@@ -4601,7 +6501,7 @@ local ScanRadialHazards = (function()
                     if motionDirX then
                         local dot = motionDirX * dir.dirX
                             + motionDirZ * dir.dirZ
-                        if dot >= math.cos(AHEAD_CONE_RAD) then
+                        if dot >= math.cos(Config.AHEAD_CONE_RAD) then
                             isAhead = true
                         end
                     end
@@ -4632,8 +6532,28 @@ end)()
 -- ============================================================================
 
 local function OnTick()
+    -- Game-state gate.  Every per-tick job below (hazard radar,
+    -- facing announcement, GPS guidance) is for interactive world
+    -- gameplay only.  Without this gate OnTick ran during the
+    -- opening cinematic (state == PrepareRunning) and during
+    -- character creation -- because a player entity already
+    -- exists at those points.  Symptoms: the ~900ms hazard-set
+    -- build fired mid-cinematic (blocking the client thread, so
+    -- the audio-description net message queued behind it played
+    -- ~1s late), and "Facing south" was announced over the
+    -- cinematic.  The opening cinematic plays entirely within the
+    -- PrepareRunning state, so gating on Running alone removes it
+    -- from the cinematic; the CC check removes it from character
+    -- creation too.  Combat and dialogue are within Running and
+    -- are intentionally NOT gated out -- WorldNav has real work
+    -- to do there.
+    local gameStateOk, gameState = pcall(Ext.Utils.GetGameState)
+    if not gameStateOk or gameState ~= "Running" then return end
+    local CC = BG3Access.Client.CC
+    if CC and CC.IsInCC and CC.IsInCC() then return end
+
     local now = Ext.Utils.MonotonicTime()
-    if now - lastPositionCheckTime < POSITION_CHECK_MS then return end
+    if now - lastPositionCheckTime < Config.POSITION_CHECK_MS then return end
     lastPositionCheckTime = now
 
     local playerEntity = GetPlayerEntity()
@@ -4654,7 +6574,84 @@ local function OnTick()
     -- inside the function; per-direction dedup prevents repeats.
     ScanRadialHazards(playerPosition, previousPosition)
 
-    if gpsMode == GPS_MODE_OFF then return end
+    -- Player facing announcement.  Hazard speech uses world-fixed
+    -- cardinals (north/east/south/west) -- which means "east" only
+    -- equals "your left" when you're facing south, etc.  Without a
+    -- running cue for which way you're facing, world-cardinal hazard
+    -- directions are impossible to map to the camera-relative audio
+    -- you hear.  This block tracks the facing direction (read from
+    -- the player entity's Transform.RotationQuat) and speaks the new
+    -- cardinal when it changes and stays stable, so you always have a
+    -- current frame of reference for the cardinal-direction
+    -- announcements that follow.
+    do
+        local Settings = BG3Access.Client.Settings
+        local facingEnabled = not Settings or not Settings.Get
+            or Settings.Get("playerFacingEnabled") ~= false
+        local Menus = BG3Access.Client.Menus
+        local menuActive = Menus and Menus.GetActiveHandler
+            and Menus.GetActiveHandler()
+        local SettingsMenu = BG3Access.Client.SettingsMenu
+        local settingsMenuOpen = SettingsMenu and SettingsMenu.IsOpen
+            and SettingsMenu.IsOpen()
+        -- Suppress facing announcements during GPS tracking based on
+        -- guidance mode + direction format:
+        --   * audio mode                  -> suppress (beacon handles
+        --                                    direction camera-relative)
+        --   * voice/both + clockface fmt  -> suppress (clockface speech
+        --                                    is already camera-relative)
+        --   * voice/both + cardinal fmt   -> ALLOW (cardinal is world-
+        --                                    relative; user needs facing
+        --                                    to translate to stick dir)
+        -- Outside tracking, facing is always allowed (general
+        -- exploration orientation).
+        local suppressForTracking = false
+        if trackingTarget then
+            local mode = GetGuidanceMode()
+            local format = GetDirectionFormat()
+            if mode == "audio" then
+                suppressForTracking = true
+            elseif format ~= "cardinal" then
+                suppressForTracking = true
+            end
+        end
+        if facingEnabled and not autoWalkActive
+            and not menuActive and not settingsMenuOpen
+            and not suppressForTracking then
+            local facingLabel = ComputePlayerFacingLabel(
+                playerEntity, playerPosition)
+            if facingLabel then
+                if facingLabel == lastFacingLabel then
+                    -- Stable on the already-announced direction;
+                    -- clear any pending different-direction timer
+                    -- because the turn (if any) reverted.
+                    pendingFacingLabel = nil
+                    pendingFacingSinceMs = 0
+                elseif facingLabel == pendingFacingLabel then
+                    -- Player has been in this new direction for at
+                    -- least FACING_STABLE_MS AND we haven't spoken
+                    -- a facing recently: announce.
+                    if now - pendingFacingSinceMs >= Config.FACING_STABLE_MS
+                        and now - lastFacingAnnounceMs
+                            >= Config.FACING_MIN_INTERVAL_MS then
+                        lastFacingLabel = facingLabel
+                        lastFacingAnnounceMs = now
+                        pendingFacingLabel = nil
+                        pendingFacingSinceMs = 0
+                        SpeechData.Alert(
+                            "Facing " .. facingLabel, "queue")
+                    end
+                else
+                    -- New direction first seen this tick: start the
+                    -- stability timer.
+                    pendingFacingLabel = facingLabel
+                    pendingFacingSinceMs = now
+                end
+            end
+        end
+    end
+
+    if gpsMode == Config.GPS_MODE_OFF then return end
 
     -- Routing mode with active target.  Work split:
     --   UpdateTrackingState: runs every tick.  Silent.  Recomputes
@@ -4715,10 +6712,10 @@ local function OnTick()
                 or GetMoveToCloseEnoughMax())
         local inArrivalVicinity =
             currentDistanceToTarget
-                <= (arrivalThreshold + GPS_STUCK_CLOSE_RANGE_PAD)
+                <= (arrivalThreshold + Config.GPS_STUCK_CLOSE_RANGE_PAD)
         local stuckEligible =
             currentPath
-            and trackingTicks > GPS_STUCK_GRACE_TICKS
+            and trackingTicks > Config.GPS_STUCK_GRACE_TICKS
             and not inArrivalVicinity
         if stuckEligible then
             if stuckLastDistance == nil then
@@ -4727,7 +6724,7 @@ local function OnTick()
             else
                 local progress =
                     stuckLastDistance - currentDistanceToTarget
-                if progress >= GPS_PROGRESS_DELTA then
+                if progress >= Config.GPS_PROGRESS_DELTA then
                     -- Player is making real progress: reset the
                     -- counter and drop the blocked-announce latch
                     -- so the next stall can report blocked again.
@@ -4736,7 +6733,7 @@ local function OnTick()
                     blockedAnnounced = false
                 else
                     stuckTickCount = stuckTickCount + 1
-                    if stuckTickCount >= GPS_STUCK_TICKS
+                    if stuckTickCount >= Config.GPS_STUCK_TICKS
                         and not blockedAnnounced then
                         Log.Info(string.format(
                             "GPS: stuck (%d ticks, dist=%.2f)",
@@ -4766,13 +6763,79 @@ local function OnTick()
         if currentPath then
             local movementSinceGuidance = DistanceXZ(
                 playerPosition, lastGuidancePosition)
-            if movementSinceGuidance >= GPS_GUIDANCE_MOVEMENT then
+            if movementSinceGuidance >= Config.GPS_GUIDANCE_MOVEMENT then
                 SpeakTrackingGuidance(playerPosition)
                 lastGuidancePosition = {
                     playerPosition[1],
                     playerPosition[2],
                     playerPosition[3]
                 }
+            end
+            -- Update the spatial-audio beacon position.  See
+            -- gpsBeacon.ProjectPosition: beacon is placed at a fixed
+            -- distance along the player->sample-point bearing, clamped
+            -- to the forward hemisphere so audio pans match the
+            -- direction the user needs to turn.  MoveTo internally
+            -- suppresses redundant moves below the threshold so per-
+            -- tick calls are cheap.
+            -- Also handles the late-path-start case: if the path was
+            -- nil when StartTracking ran (so no Start call fired) but
+            -- the path has since become available, spawn the beacon now.
+            -- Mode-change handling: if user switched to voice-only
+            -- mid-route, silence any active beacon.  Start is guarded
+            -- internally too, so a switch the other direction (voice
+            -- -> audio) gets picked up here when we try to Start.
+            if not GuidanceAudioEnabled()
+                and (gpsBeacon.activeItemGuid
+                    or gpsBeacon.spawnPending) then
+                gpsBeacon.Stop()
+            end
+            -- Near-target stabilization: once within STABILIZE_NEAR_M
+            -- of the actual target, freeze beacon updates entirely.
+            -- The audio that got us close stays put; the last cadence
+            -- and panning hold through the final approach.  Bearing
+            -- math otherwise oscillates wildly in this last stretch
+            -- (tiny lateral movements = huge angle swings near the
+            -- target).  Speech distance updates + the arrival
+            -- announcement guide the final approach.
+            local distanceToTarget = DistanceXZ(
+                playerPosition, trackingTarget.position)
+            local nearTarget = distanceToTarget
+                <= gpsBeacon.STABILIZE_NEAR_M
+            local sampleNode = GetSmoothedPathSamplePoint(
+                playerPosition, currentPath)
+            if sampleNode and GuidanceAudioEnabled()
+                and not nearTarget then
+                local beaconWorldPos = gpsBeacon.ProjectPosition(
+                    playerPosition, sampleNode)
+                if beaconWorldPos then
+                    if not gpsBeacon.activeItemGuid
+                        and not gpsBeacon.spawnPending then
+                        -- Late-path-start: only spawn if not already
+                        -- spawned AND no spawn in-flight.  spawnPending
+                        -- catches the race where StartTracking already
+                        -- requested a spawn but the server response
+                        -- hasn't populated activeItemGuid yet.
+                        gpsBeacon.Start(beaconWorldPos)
+                    elseif gpsBeacon.activeItemGuid then
+                        gpsBeacon.MoveTo(beaconWorldPos)
+                    end
+                end
+                -- Cache the |target bearing - camera bearing| for the
+                -- metronome to pick its next interval from.  This is
+                -- the audio-only front/back cue: fast ticks when target
+                -- is ahead, slow ticks when behind, since stereo audio
+                -- alone can't distinguish those.
+                local targetBearing = BearingXZ(
+                    playerPosition, sampleNode)
+                local cameraBearing = GetCameraReferenceAngle(
+                    playerPosition)
+                if targetBearing and cameraBearing then
+                    local rel = targetBearing - cameraBearing
+                    while rel > math.pi do rel = rel - 2 * math.pi end
+                    while rel < -math.pi do rel = rel + 2 * math.pi end
+                    gpsBeacon.relativeBearingMag = math.abs(rel)
+                end
             end
         end
         return
@@ -4795,14 +6858,14 @@ local function OnTick()
     -- Proximity announcements only run in Exploration mode.  Routing
     -- without a picked target yet (entity list still open, or closed
     -- without selection) stays silent.
-    if gpsMode ~= GPS_MODE_EXPLORATION then return end
+    if gpsMode ~= Config.GPS_MODE_EXPLORATION then return end
 
     if not lastProximityPosition then
         lastProximityPosition = playerPosition
     end
     local movementSinceProximity = DistanceXZ(
         playerPosition, lastProximityPosition)
-    if movementSinceProximity < GPS_PROXIMITY_POLL_M then
+    if movementSinceProximity < Config.GPS_PROXIMITY_POLL_M then
         return
     end
 
@@ -4819,8 +6882,8 @@ local function OnTick()
     -- 1Hz is plenty for accessibility; the user can't act on faster
     -- proximity announcements anyway.
     local nowMs = Ext.Utils.MonotonicTime()
-    local PROXIMITY_MIN_INTERVAL_MS = 1000
-    if nowMs - lastProximityUpdateMs < PROXIMITY_MIN_INTERVAL_MS then
+    -- PROXIMITY_MIN_INTERVAL_MS moved to Config table; see Config.PROXIMITY_MIN_INTERVAL_MS
+    if nowMs - lastProximityUpdateMs < Config.PROXIMITY_MIN_INTERVAL_MS then
         return
     end
     lastProximityUpdateMs = nowMs
@@ -4848,6 +6911,8 @@ end
 local function CancelTrackingTarget()
     if not trackingTarget then return nil end
     local cancelledName = trackingTarget.name or "target"
+    -- Silence + despawn the spatial-audio beacon on cancel.
+    gpsBeacon.Stop()
     trackingTarget = nil
     currentPath = nil
     lastGuidancePosition = nil
@@ -4870,23 +6935,55 @@ local function CancelTrackingTarget()
 end
 
 local function OnControllerButton(event)
+    -- BG3Access settings menu owns input while open: no GPS list nav,
+    -- no tracking-cancel, no list category cycling.
+    local SettingsMenu = BG3Access.Client.SettingsMenu
+    if SettingsMenu and SettingsMenu.IsOpen
+        and SettingsMenu.IsOpen() then
+        return
+    end
     if not event.Pressed then return end
 
-    -- Defer ALL world-context button handling when a menu handler is
-    -- active.  This handler manages the GPS routing list and tracking-
-    -- cancel, both of which only make sense while the player is in
-    -- the world.  Without this gate:
-    --   * Pause menu opens with GPS list still open (entityListOpen=true)
-    --     -> any B press the user makes to dismiss the pause menu gets
-    --     eaten by our list-close handler instead of routing to the
-    --     menu.  The pause menu then can't speak / dismiss cleanly
-    --     until the user accidentally closes the GPS list first.
-    --   * D-pad in the menu would be ambiguously routed (menu nav vs.
-    --     our list category cycling).
-    -- The menu's own handler (Menus.lua) owns input while it's active;
-    -- we just step out of the way.
+    -- Defer ALL world-context button handling when ANOTHER UI handler
+    -- is active.  GPS routing list / tracking-cancel / GPS off-toggle
+    -- all only make sense while the player is in the world with no
+    -- panel claiming input.  Without this gate:
+    --   * Pause menu opens with GPS list still open: any B press the
+    --     user makes to dismiss the pause menu gets eaten by our
+    --     list-close handler instead of routing to the menu.
+    --   * Examine panel opens after auto-walk arrival: B should
+    --     close Examine first.  Our handler used to fire instead
+    --     ("GPS: Off") because we only checked Menus and missed
+    --     the WorldUI panel layer.
+    --   * D-pad in any other UI: ambiguous routing (UI nav vs. our
+    --     list category cycling).
+    -- The owning module's handler owns input while it's active; we
+    -- step out of the way.
+    --
+    -- PartyLine is excluded: it's the always-visible HUD portrait
+    -- row and gets activated as the panel handler when no other
+    -- panel exists.  Treating it as "UI active" would gate our
+    -- handler off in the open world permanently.  Same exclusion
+    -- HasRealUIHandlerActive in EventRouter uses for RS gating.
     local Menus = BG3Access.Client.Menus
     if Menus and Menus.GetActiveHandler and Menus.GetActiveHandler() then
+        return
+    end
+    local World = BG3Access.Client.WorldUI
+    if World and World.GetActivePanelHandler then
+        local panelHandler = World.GetActivePanelHandler()
+        if panelHandler and panelHandler.name
+            and panelHandler.name ~= "PartyLine" then
+            return
+        end
+    end
+    -- Radial menus (action radial, RT shortcuts) are a separate UI
+    -- layer from the panel handlers above and need their own gate.
+    -- Without this, pressing B with the radial open would fire our
+    -- GPS-off handler first ("GPS: Off"), then the radial's own B
+    -- handler would close it on the next press -- two presses to
+    -- close the radial instead of one.  Radial owns B while open.
+    if World and World.IsRadialOpen and World.IsRadialOpen() then
         return
     end
 
@@ -4900,7 +6997,7 @@ local function OnControllerButton(event)
     --   * trackingTarget set (actively guiding) AND
     --   * entityListOpen false (list-open case is handled below).
     if buttonName == "B"
-        and gpsMode == GPS_MODE_ROUTING
+        and gpsMode == Config.GPS_MODE_ROUTING
         and trackingTarget
         and not entityListOpen then
         event:PreventAction()
@@ -4908,6 +7005,30 @@ local function OnControllerButton(event)
         EnterExplorationMode(
             "Tracking cancelled, " .. (cancelledName or "target")
             .. ", exploration mode")
+        return
+    end
+
+    -- B in Exploration mode (no tracking, list closed) -> turn GPS
+    -- fully off.  Completes the B-cancels-back-one-level pattern:
+    --   * B in Routing while tracking -> Exploration (handled above).
+    --   * B in Routing with list open -> Exploration (handled in the
+    --     list-open block below).
+    --   * B in Exploration -> Off (this branch).
+    -- Without this, B from Exploration was a no-op and the user had to
+    -- cycle RS-Left forward through Routing -> Off to turn GPS off, an
+    -- inconvenient extra step that's also surprising (B drops a level
+    -- everywhere else; here it suddenly does nothing).
+    --
+    -- Gated by the same "we're in the world, no menus active" checks
+    -- as the tracking-cancel above (menu / SettingsMenu gates are
+    -- earlier in this function).  Won't fire during dialog, combat
+    -- targeting, etc. because those are also "world-but-with-UI"
+    -- states that the existing gates filter out.
+    if buttonName == "B"
+        and gpsMode == Config.GPS_MODE_EXPLORATION
+        and not entityListOpen then
+        event:PreventAction()
+        EnterOffMode()
         return
     end
 
@@ -4998,7 +7119,7 @@ end
 -- ============================================================================
 
 local function ResetState()
-    gpsMode = GPS_MODE_OFF
+    gpsMode = Config.GPS_MODE_OFF
     trackingTarget = nil
     currentPath = nil
     lastPlayerPosition = nil
@@ -5007,6 +7128,7 @@ local function ResetState()
     lastProximityPosition = nil
     tier1Latched = {}
     tier2Latched = {}
+    previousWantsToTalkSet = {}
     scannedCategories = {}
     lastScanPosition = nil
     entityListOpen = false
@@ -5027,6 +7149,15 @@ local function ResetState()
     noPathTickCount = 0
     trackingTicks = 0
     lastPositionCheckTime = 0
+    -- Drop any pending hostile-check / prompt state too, same
+    -- rationale as in ClearGPSState: stale entry data + dangling
+    -- button-input subscription would leak into the new state.
+    if hostileWarning.ClearPendingCheck then
+        hostileWarning.ClearPendingCheck()
+    end
+    if hostileWarning.ClearPendingPrompt then
+        hostileWarning.ClearPendingPrompt()
+    end
     -- Hint gates reset on state transitions (new save load, new
     -- campaign, etc.) so the first Routing mode entry after a
     -- GameStateChanged plays the instructional tutorial again.
@@ -5052,7 +7183,7 @@ local function ResumeGPS()
 end
 
 local function IsGPSActive()
-    return gpsMode ~= GPS_MODE_OFF
+    return gpsMode ~= Config.GPS_MODE_OFF
 end
 
 --- Force GPS off in response to combat start.  Combat's HandleCombatStarted
@@ -5094,16 +7225,16 @@ end
 --- in-flight CharacterMoveTo when a menu opens, so the eventual arrival
 --- callback would never fire anyway.
 local function SuspendForMenu()
-    if gpsMode == GPS_MODE_OFF and not autoWalkActive then
+    if gpsMode == Config.GPS_MODE_OFF and not autoWalkActive then
         return
     end
-    gpsMode = GPS_MODE_OFF
+    gpsMode = Config.GPS_MODE_OFF
     ClearGPSState()
     Log.Info("GPS: Menu opened -- forced off")
 end
 
 local function SuspendForCombat()
-    if gpsMode == GPS_MODE_OFF and not autoWalkActive then
+    if gpsMode == Config.GPS_MODE_OFF and not autoWalkActive then
         return
     end
     -- Save autoWalkActive across the ClearGPSState call so the
@@ -5125,7 +7256,7 @@ local function SuspendForCombat()
             combatStartPosition = GetEntityPosition(playerEntity)
         end
     end)
-    gpsMode = GPS_MODE_OFF
+    gpsMode = Config.GPS_MODE_OFF
     ClearGPSState()
     autoWalkActive = preservedAutoWalk
     if autoWalkActive and combatStartPosition then
@@ -5165,6 +7296,7 @@ end)
 Ext.RegisterConsoleCommand("bg3a_pathdiag", function()
     PathDiagnostic()
 end)
+
 
 --- Diagnostic: dump every character entity's name, position, distance
 --- from the active player, HP, and the filter conditions that the
@@ -5312,9 +7444,9 @@ Ext.RegisterConsoleCommand("bg3a_charscan", function()
         end
     end
     Log.Info("CHARSCAN: done. ENTITY_MIN_DISTANCE="
-        .. tostring(ENTITY_MIN_DISTANCE)
-        .. "m  ENTITY_SCAN_RADIUS="
-        .. tostring(ENTITY_SCAN_RADIUS) .. "m")
+        .. tostring(Config.ENTITY_MIN_DISTANCE)
+        .. "m  ROUTING_LIST_RANGE="
+        .. tostring(GetRoutingListRange()) .. "m")
 end)
 
 --- Probe whether GetAllEntitiesWithComponent works with various
@@ -5441,6 +7573,16 @@ BG3Access.Client.WorldNav = {
     CycleGPSMode         = CycleGPSMode,
     IsEntityListOpen     = function() return entityListOpen end,
     HasPlayerEntity      = function() return GetPlayerEntity() ~= nil end,
+    -- Exported for Subregion.lua so it can snapshot the player's
+    -- position the moment a region-entry event fires, enabling the
+    -- "Discovered places" routing category to route back to where
+    -- the player crossed in.  Returns {x, y, z} or nil if the
+    -- player entity isn't resolvable yet (loading screens, etc.).
+    GetPlayerPosition    = function()
+        local playerEntity = GetPlayerEntity()
+        if not playerEntity then return nil end
+        return GetEntityPosition(playerEntity)
+    end,
     -- Exported so Combat.lua can dismiss the routing list the
     -- instant CombatStarted fires.  Without this the list stays
     -- open across the combat transition and eats A-presses meant

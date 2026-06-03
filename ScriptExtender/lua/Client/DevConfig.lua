@@ -40,6 +40,11 @@ BG3Access.DevMode = true
 -- together triggers the game's photo mode, but individual clicks do
 -- nothing), so the single-button chord avoids any conflict.
 Ext.Events.ControllerButtonInput:Subscribe(function(event)
+    local SettingsMenu = BG3Access.Client.SettingsMenu
+    if SettingsMenu and SettingsMenu.IsOpen
+        and SettingsMenu.IsOpen() then
+        return
+    end
     local buttonName = tostring(event.Button)
     if event.Pressed and BG3Access.Client and BG3Access.Client.Log then
         BG3Access.Client.Log.Debug("INPUT: " .. buttonName)

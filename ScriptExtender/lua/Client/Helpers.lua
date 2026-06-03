@@ -89,6 +89,17 @@ local FILTERED_ELEMENT_NAMES = {
 local function CleanElementName(name)
     if not name or name == "" then return nil end
     if FILTERED_ELEMENT_NAMES[name:lower()] then return nil end
+    -- LSGrid focus phantoms: BG3 inserts invisible "fake element"
+    -- borders into grid layouts (inventories, hotbars, trade panels)
+    -- so d-pad navigation has something to focus on in empty cells.
+    -- Catch them BEFORE the camel-split cleanup so we don't speak
+    -- "Widget Navigation Primary Fake Element" -- every grid-using
+    -- panel (Trade, Container, Combine, Camp, CharSheet, Donate, etc.)
+    -- benefits from this universal fix.
+    if name:find("WidgetNavigationPrimaryFakeElement")
+        or name:find("WidgetNavigationSecondaryFakeElement") then
+        return "Empty slot"
+    end
     local cleaned = name
         :gsub("Button$", "")
         :gsub("Btn$", "")
@@ -123,6 +134,37 @@ local function GetTranslatedStringIfHandle(textOrHandle, logContextStringOptiona
         end
     end
     return textOrHandle
+end
+
+-- Resolve a slug / TextToStringKey identifier to translated text.
+--
+-- BG3 declares slugs (e.g. "CRA_Beach_SUB", "WAYP_CHA_Chapel",
+-- "CRE_Main_A") via TranslatedStringKey resources in the Localization
+-- LSX files.  The runtime maintains a TextToStringKey HashMap that
+-- joins slug -> handle, and the translation pool resolves the handle
+-- -> text from English.loca.  Our fork exposes the joined lookup as
+-- Ext.Loca.GetTranslatedStringFromKey (Lua/Libs/Localization.inl).
+--
+-- This is the right resolver for any string that's a slug rather than
+-- a TranslatedString handle.  Subregion names, waypoint names, level
+-- names, and most named-object UI strings are stored as slugs and
+-- WON'T resolve via GetTranslatedStringIfHandle.
+--
+-- Returns the translated text, or nil if the slug isn't registered.
+-- Callers that want a passthrough on miss can do `result or slug`.
+local function GetTranslatedStringIfSlug(slug)
+    if not slug or type(slug) ~= "string" or slug == "" then
+        return nil
+    end
+    if not (Ext.Loca and Ext.Loca.GetTranslatedStringFromKey) then
+        return nil
+    end
+    local ok, translated = pcall(Ext.Loca.GetTranslatedStringFromKey, slug)
+    if not ok then return nil end
+    if not translated or translated == "" or translated == slug then
+        return nil
+    end
+    return translated
 end
 
 -- ---------------------------------------------------------------------------
@@ -1354,6 +1396,7 @@ BG3Access.Client.Helpers = {
     ExtractStatusText            = ExtractStatusText,
     ExtractTextFromData          = ExtractTextFromData,
     GetTranslatedStringIfHandle  = GetTranslatedStringIfHandle,
+    GetTranslatedStringIfSlug    = GetTranslatedStringIfSlug,
     DumpWidgets                  = DumpWidgets,
     ParseDescriptionParam        = ParseDescriptionParam,
     ResolveDescriptionParams     = ResolveDescriptionParams,

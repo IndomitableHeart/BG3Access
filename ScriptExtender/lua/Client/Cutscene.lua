@@ -106,12 +106,18 @@ local function HandleSubtitle(dcProps)
         if cleanSpeaker == "" then cleanSpeaker = nil end
     end
 
+    -- Subtitles are the primary content of a cutscene -- always
+    -- speak regardless of verbosity / toggles.  sectionLabel is
+    -- unconditionally emitted by SpeechData.Format(); the
+    -- "description" core field routes through speakDescription
+    -- and would vanish whenever the user's normal verbosity
+    -- preset turns descriptions off.
     local speechData = SpeechData.Create()
     if cleanSpeaker then
-        speechData:Add("description",
+        speechData:Add("sectionLabel",
             cleanSpeaker .. ": " .. cleanSubtitle, "brief")
     else
-        speechData:Add("description", cleanSubtitle, "brief")
+        speechData:Add("sectionLabel", cleanSubtitle, "brief")
     end
     local fullText = speechData:Format()
     Log.Info("SUBTITLE: " .. fullText)
@@ -157,8 +163,13 @@ local function HandleDialogWidget(dcProps)
     local cleanBody = Helpers.StripMarkupTags(bodyText)
     if not cleanBody or cleanBody == "" then return end
 
+    -- NPC dialogue body is the primary content of a dialog --
+    -- always speak regardless of verbosity / toggles.  See the
+    -- subtitle helper above for the same rationale (sectionLabel
+    -- is unconditional in SpeechData.Format(); description routes
+    -- through the speakDescription toggle).
     local dialogSpeech = SpeechData.Create()
-    dialogSpeech:Add("description", cleanBody, "brief")
+    dialogSpeech:Add("sectionLabel", cleanBody, "brief")
     Log.Info("DIALOG: " .. cleanBody:sub(1, 80))
     Ext.Tolk.Speak(dialogSpeech:Format(), true)
 end
@@ -239,19 +250,27 @@ local function HandleDialogAnswerSnapshot(snapshot)
 
     -- Tag prefix: "[INVESTIGATION]", "[PERSUASION]", etc.  The tag
     -- text comes through ReadFocusedTextBlocks because it's a styled
-    -- Run whose StringFormat binding is evaluated.  Look for any
-    -- entry that starts with "[" and contains uppercase letters --
-    -- that's the D&D skill/ability tag the player needs to know.
+    -- Run whose StringFormat binding is evaluated.
+    --
+    -- Subtle: Larian's AnswerText TextBlock renders the tag Run and
+    -- the body Run as ONE concatenated string ("[NATURE] Don't druids
+    -- cherish harmony?..."), not as separate TextBlocks.  So a naive
+    -- "starts with [" check would grab the ENTIRE answer (tag + body)
+    -- and we'd then append the body again from dcProps.BodyText,
+    -- producing a doubled-body announcement.  Extract just the
+    -- bracketed prefix substring instead.
     local tagPrefix = ""
     if Ext.UI.ReadFocusedTextBlocks then
         local okFocusedTexts, focusedTexts = pcall(
             Ext.UI.ReadFocusedTextBlocks)
         if okFocusedTexts and type(focusedTexts) == "table" then
             for _, text in ipairs(focusedTexts) do
-                if type(text) == "string"
-                    and text:match("^%[%u") then
-                    tagPrefix = text .. " "
-                    break
+                if type(text) == "string" then
+                    local bracketed = text:match("^(%[%u[^%]]+%])")
+                    if bracketed then
+                        tagPrefix = bracketed .. " "
+                        break
+                    end
                 end
             end
         end
@@ -351,107 +370,123 @@ end
 local AD_BASE_PATH = "Mods/BG3Access_a8cddf0c-2e61-1b7c-5c0c-275d46073949"
     .. "/ScriptExtender/lua/Audio/"
 
--- Audio description files keyed by cutscene identifier.
--- Add new entries here as AD tracks are produced.
+-- Audio description tracks keyed by cinematic identifier.  Lookup
+-- key:
+--   * Engine timeline cinematics (TimelineScreenFadeStarted):
+--     DIALOGRESOURCE GUID string.  When such a timeline fires the
+--     server relays a MovieStarted with movie=<uuid>, and
+--     HandleMovieStarted picks the matching track.
+--   * Video CGI .bk2 files: short movie name (e.g. "GUS_CGI01_Part1"
+--     for the Nautiloid intro -- confirmed at
+--     D:\extracted packs\Osi\Z_Shared_TutorialCharacterCreation.txt:13).
+--     CAVEAT: BG3's CGI player does NOT fire any Osiris start
+--     event -- only MovieFinished at end.  Diagnostic confirmed
+--     this in production (none of MoviePlay / PROC_StartMovie /
+--     DB_MoviePlayed / TimelineScreenFadeStarted fire for
+--     GUS_CGI01_Part1; only MovieFinished does).  For CGIs we
+--     therefore can't subscribe to a per-movie start signal, so
+--     the opening case uses a state-transition heuristic
+--     (StopLoading -> PrepareRunning + new-game gate) to time
+--     the AD start.  MovieFinished still cleanly stops the AD
+--     when the cinematic ends.
+--
+-- Add new entries as AD tracks are produced.
+-- Each entry: { file = "<filename>", delayMs = <number, optional> }
+-- delayMs is for per-cinematic alignment when the trigger signal
+-- fires before the video visually starts on screen (e.g. Part 2's
+-- CharacterCreationFinished fires ~500ms before the video begins).
+-- Default delay is 0 (play immediately).  Negative delays not
+-- supported -- if a trigger fires AFTER the video starts, trim
+-- the audio file's lead-in instead.
 local AD_TRACKS = {
-    opening = "AD001.wav",
+    ["GUS_CGI01_Part1"] = { file = "AD001.wav" },
+    ["GUS_CGI01_Part2"] = { file = "AD002.wav", delayMs = 1100 },
 }
 
--- Tracks whether AD has already played this session to avoid replaying
--- on subsequent Running transitions (e.g. after a save/load cycle).
-local adPlayedThisSession = false
+-- Opening CGI AD: there's no per-movie Osiris start event for the
+-- engine-played .bk2 video (confirmed in production -- only
+-- MovieFinished fires, at the end).  But the server detects the
+-- fresh-new-game path via the CharacterCreationStarted Osiris
+-- event (character creation happens ONLY on a new game, never on
+-- a save load) and relays it as a MovieStarted for GUS_CGI01
+-- _Part1.  So the opening cinematic flows through the exact same
+-- client-side path as every other cinematic: HandleMovieStarted
+-- looks up AD_TRACKS and plays; HandleMovieFinished stops.  No
+-- menu-VM flag, no settings persistence, no game-state heuristic.
 
--- Delay (ms) between the Running state and AD playback start.
--- Tune this to align with the actual cutscene start.
-local AD_START_DELAY_MS = 200
+-- Tracks the movie name currently associated with an active AD
+-- playback.  Used to deduplicate concurrent MovieStarted relays
+-- for the same cinematic (the server subscribes to multiple Osi
+-- signals -- MoviePlay / PROC_StartMovie / DB_MoviePlayed / etc.
+-- -- and more than one may fire for the same movie; we don't
+-- want to start the audio playback multiple times in parallel).
+-- Cleared on MovieFinished.
+local currentlyPlayingMovie = nil
 
---- IsFreshCharacter: decide if the party's main character is a
---- just-created new-game character vs an existing save being loaded.
+--- HandleMovieStarted: client-side handler for the server-relayed
+--- "MovieStarted" event.  Looks up the AD track for the named
+--- movie and plays it.  Movies the AD_TRACKS table doesn't cover
+--- are silently ignored.  Duplicate relays for the same movie
+--- (multiple Osi signals firing in tandem) are deduplicated.
 ---
---- Approach: check Experience.NextLevelExperience (the player's current
---- cumulative XP, despite the counterintuitive field name -- see
---- CharSheet.lua:712 for the same read).  A newly-created character
---- has 0 XP.  A Continue or Load Game has some progress and therefore
---- XP > 0 (or is at least level 2+).
----
---- This runs on PrepareRunning, by which point the player's party
---- member entities are loaded and their components are populated.
----
---- @return boolean true if the main character appears to be a fresh
----                 new-game character, false otherwise or on error.
-local function IsFreshCharacter()
-    local queryOk, partyMembers = pcall(
-        Ext.Entity.GetAllEntitiesWithComponent, "PartyMember")
-    if not queryOk or not partyMembers or #partyMembers == 0 then
-        Log.Info("AD: IsFreshCharacter could not find party members")
-        return false
+--- @param eventData table  { event = "MovieStarted", movie = "...",
+---                           source = "..." (optional, diagnostic) }
+local function HandleMovieStarted(eventData)
+    local movieName = tostring(eventData and eventData.movie or "")
+    local source = tostring(eventData and eventData.source
+        or "<unknown>")
+    if movieName == "" then return end
+    if currentlyPlayingMovie == movieName then
+        Log.Debug("AD: MovieStarted '" .. movieName
+            .. "' via " .. source .. " -- already playing,"
+            .. " ignored as duplicate")
+        return
     end
-
-    -- Any party member with XP > 0 means we're loading an existing save.
-    -- Only a fresh new game has every party member at exactly 0 XP.
-    -- (The opening cinematic plays before any XP could be gained.)
-    for _, partyEntity in ipairs(partyMembers) do
-        local xpOk, currentXP = pcall(function()
-            local xpComponent = partyEntity.Experience
-            if not xpComponent then return nil end
-            return xpComponent.NextLevelExperience or 0
-        end)
-        if xpOk and currentXP and currentXP > 0 then
-            Log.Info("AD: Party member XP=" .. tostring(currentXP)
-                .. " -- treating as loaded save, not a new game")
-            return false
+    local entry = AD_TRACKS[movieName]
+    Log.Info("AD: MovieStarted '" .. movieName
+        .. "' via " .. source
+        .. (entry and (" -> " .. tostring(entry.file)
+            .. (entry.delayMs and (" (+" .. entry.delayMs
+                .. "ms)") or ""))
+            or " (no AD track)"))
+    if not entry or not entry.file then return end
+    currentlyPlayingMovie = movieName
+    local fullPath = AD_BASE_PATH .. entry.file
+    local delayMs = tonumber(entry.delayMs) or 0
+    local function doPlay()
+        local playOk, playResult = pcall(Ext.Audio.PlayFile, fullPath)
+        if playOk then
+            Log.Info("AD: PlayFile returned " .. tostring(playResult))
+        else
+            Log.Warning("AD: PlayFile error: " .. tostring(playResult))
         end
     end
-
-    Log.Info("AD: All party members have 0 XP -- treating as new game")
-    return true
+    if delayMs > 0 then
+        Log.Info("AD: scheduling " .. entry.file .. " in "
+            .. delayMs .. "ms (path=" .. fullPath .. ")")
+        BG3Access.Client.Scheduler.RunAfterMs(delayMs, doPlay)
+    else
+        Log.Info("AD: playing " .. entry.file
+            .. " (path=" .. fullPath .. ")")
+        doPlay()
+    end
 end
 
--- Called from the Manager on every GameStateChanged event.
-local function HandleGameStateForAD(fromState, toState)
-    Log.Info("AD CHECK: " .. fromState .. " -> " .. toState
-        .. " played=" .. tostring(adPlayedThisSession))
-
-    -- The opening cutscene begins on StopLoading -> PrepareRunning.
-    -- This transition fires for BOTH new games AND continued saves.
-    -- Distinguish by inspecting character state: a fresh new game has
-    -- party members at 0 XP; a Continue/Load has accumulated XP.
-    -- No persistent state required (the previous newGameInitiated flag
-    -- approach was broken by the Menu->Game VM reset that happens
-    -- between difficulty selection and PrepareRunning).
-    if fromState == "StopLoading" and toState == "PrepareRunning"
-        and not adPlayedThisSession then
-        if not IsFreshCharacter() then
-            return
-        end
-        adPlayedThisSession = true
-        local adFile = AD_TRACKS.opening
-        if adFile then
-            local fullPath = AD_BASE_PATH .. adFile
-            Log.Info("AD: Scheduling " .. adFile
-                .. " in " .. AD_START_DELAY_MS .. "ms"
-                .. " (path=" .. fullPath .. ")")
-            BG3Access.Client.Scheduler.RunAfterMs(AD_START_DELAY_MS,
-                function()
-                    Log.Info("AD: Timer fired, playing " .. adFile)
-                    local playSuccess, playResult = pcall(
-                        Ext.Audio.PlayFile, fullPath)
-                    if playSuccess then
-                        Log.Info("AD: PlayFile returned "
-                            .. tostring(playResult))
-                    else
-                        Log.Warning("AD: PlayFile error: "
-                            .. tostring(playResult))
-                    end
-                end)
-        end
-    end
-
-    -- Returning to the main menu cancels any playing AD.
-    if toState == "Menu" then
-        pcall(Ext.Audio.StopFile)
-        Log.Debug("AD: Stopped (returned to menu)")
-    end
+--- HandleMovieFinished: client-side handler for the server-relayed
+--- "MovieFinished" event.  Stops any currently-playing AD track.
+--- The natural-end case is fine to stop because the AD file's
+--- duration is matched to the cinematic; the user-skip case is
+--- what really matters (no more talking after the visuals are
+--- gone).
+---
+--- Server side subscribes to Osi.MovieFinished (Event, 1 arg).
+---
+--- @param eventData table  { event = "MovieFinished", movie = "..." }
+local function HandleMovieFinished(eventData)
+    local movieName = tostring(eventData and eventData.movie or "")
+    Log.Info("AD: MovieFinished '" .. movieName .. "' -- stopping AD")
+    currentlyPlayingMovie = nil
+    pcall(Ext.Audio.StopFile)
 end
 
 -- ============================================================================
@@ -482,6 +517,7 @@ BG3Access.Client.Cutscene = {
     HandleDialogWidgetEvent    = HandleDialogWidgetEvent,
     HandleDialogAnswerFocus    = HandleDialogAnswerFocus,
     HandleDialogAnswerSnapshot = HandleDialogAnswerSnapshot,
-    HandleGameStateForAD       = HandleGameStateForAD,
+    HandleMovieStarted         = HandleMovieStarted,
+    HandleMovieFinished        = HandleMovieFinished,
     ResetDialogState           = ResetDialogState,
 }

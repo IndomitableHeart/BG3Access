@@ -19,6 +19,16 @@
 --     then dispatches to the active handler.
 --
 -- The Manager detects CC and delegates here via HandleCCSnapshot().
+--
+-- Verbosity policy:
+--   Every SpeechData.Create call in this file passes "verbose" as the
+--   verbosity override.  A user creating a character wants every detail
+--   spoken (race description, class features, ability info, feat
+--   descriptions, spell info, etc.) regardless of their Global verbosity
+--   setting -- one-shot deep-info experience, not the place to filter
+--   for terseness.  Do NOT remove the "verbose" arg from any
+--   SpeechData.Create call here unless you've thought hard about why
+--   CC should suddenly start respecting the global filter.
 
 local Log = BG3Access.Client.Log
 local Helpers = BG3Access.Client.Helpers
@@ -888,7 +898,7 @@ local function SpeakNamingScreen()
     ccState.lastMainTab = "Naming"
     namingScreenWasSpoken = true
 
-    local speechData = SpeechData.Create()
+    local speechData = SpeechData.Create("verbose")
     speechData:Add("title", "Enter Character Name")
     speechData:Add("name", characterName, "brief")
     speechData:Add("instructionHint",
@@ -905,6 +915,11 @@ local function SubscribeCCYButton()
     if ccYButtonSubscription then return end
     ccYButtonSubscription =
         Ext.Events.ControllerButtonInput:Subscribe(function(event)
+            local SettingsMenu = BG3Access.Client.SettingsMenu
+            if SettingsMenu and SettingsMenu.IsOpen
+                and SettingsMenu.IsOpen() then
+                return
+            end
             if not event.Pressed then return end
             if not ccState.inCharacterCreation then return end
             local buttonName = tostring(event.Button)
@@ -1000,7 +1015,7 @@ local function SpeakIntroBackstory()
             .. " Everything changes when you awaken imprisoned on an alien ship."
             .. " Perhaps your time has finally come."
     end
-    local speechData = SpeechData.Create()
+    local speechData = SpeechData.Create("verbose")
     speechData:Add("sectionLabel", "Create a custom character.", "brief")
     speechData:Add("description", "Backstory: " .. backstory, "verbose")
     local speech = speechData:Format()
@@ -1025,6 +1040,11 @@ local function SubscribeIntroContinue()
     -- "LeftTrigger" or "TriggerLeft").
     ccState.introContinueSubscription =
         Ext.Events.ControllerButtonInput:Subscribe(function(event)
+            local SettingsMenu = BG3Access.Client.SettingsMenu
+            if SettingsMenu and SettingsMenu.IsOpen
+                and SettingsMenu.IsOpen() then
+                return
+            end
             if not event.Pressed then return end
             if not ccState.introAwaitingContinue then return end
             local buttonName = tostring(event.Button)
@@ -1040,6 +1060,11 @@ local function SubscribeIntroContinue()
     local axisEdgeCrossed = false
     ccState.introAxisSubscription =
         Ext.Events.ControllerAxisInput:Subscribe(function(event)
+            local SettingsMenu = BG3Access.Client.SettingsMenu
+            if SettingsMenu and SettingsMenu.IsOpen
+                and SettingsMenu.IsOpen() then
+                return
+            end
             if not ccState.introAwaitingContinue then return end
             local axisName = tostring(event.Axis)
             if axisName ~= "TriggerLeft" then return end
@@ -1059,6 +1084,11 @@ local function SubscribeIntroContinue()
     -- above).  Unsubscribed by UnsubscribeIntroContinue on LT press.
     ccState.introButtonSuppression =
         Ext.Events.ControllerButtonInput:Subscribe(function(event)
+            local SettingsMenu = BG3Access.Client.SettingsMenu
+            if SettingsMenu and SettingsMenu.IsOpen
+                and SettingsMenu.IsOpen() then
+                return
+            end
             if not ccState.introAwaitingContinue then return end
             if not event.Pressed then return end
             local buttonName = tostring(event.Button)
@@ -1073,6 +1103,11 @@ local function SubscribeIntroContinue()
         end)
     ccState.introAxisSuppression =
         Ext.Events.ControllerAxisInput:Subscribe(function(event)
+            local SettingsMenu = BG3Access.Client.SettingsMenu
+            if SettingsMenu and SettingsMenu.IsOpen
+                and SettingsMenu.IsOpen() then
+                return
+            end
             if not ccState.introAwaitingContinue then return end
             local axisName = tostring(event.Axis)
             -- Allow LT through; suppress sticks and other axes.
@@ -1089,7 +1124,7 @@ end
 
 -- SpeakGuardianEntry: first CC snapshot after naming -> guardian page.
 local function SpeakGuardianEntry()
-    local speechData = SpeechData.Create()
+    local speechData = SpeechData.Create("verbose")
     speechData:Add("title", "Guardian Appearance", "brief")
     speechData:Add("navigationHint",
         "Choose your guardian's appearance."
@@ -1112,7 +1147,7 @@ local function SpeakLevelUpEntry(focusedElement)
     if levelUpClass and levelUpClass ~= "" then
         levelUpTitle = "Level Up: " .. levelUpClass
     end
-    local speechData = SpeechData.Create()
+    local speechData = SpeechData.Create("verbose")
     speechData:Add("title", levelUpTitle, "brief")
     speechData:Add("navigationHint",
         "Up and down to review gains."
@@ -1141,7 +1176,7 @@ local function SpeakMainCCEntry(focusedElement)
     ccState.introAwaitingContinue = true
     SubscribeIntroContinue()
 
-    local speechData = SpeechData.Create()
+    local speechData = SpeechData.Create("verbose")
     -- Title omitted: the welcome text opens with "Welcome to
     -- character creation" which establishes context without
     -- a redundant "Character Creation" prefix.
@@ -1625,7 +1660,7 @@ local function CreateCCPageHandler(config)
                         tabName, handlerState)
             end
 
-            local valueSpeech = SpeechData.Create()
+            local valueSpeech = SpeechData.Create("verbose")
             if focusedElement.dcType == "gui::VMSliderSetting"
                 and itemValue and itemValue ~= "" then
                 -- Sliders: speak only the number.
@@ -1663,7 +1698,7 @@ local function CreateCCPageHandler(config)
         -- =============================================================
         -- Screen entry or item navigation.
         -- =============================================================
-        local speechData = SpeechData.Create()
+        local speechData = SpeechData.Create("verbose")
         local screenTitle = nil
 
         if isScreenEntry then
@@ -1889,14 +1924,20 @@ local function CreateCCPageHandler(config)
 
 
         -- Value cycling: same element pointer, text changed.
-        -- Name was already spoken on focus arrival -- just speak the
-        -- new value.  Uses elemAddr for stable identity instead of
-        -- comparing itemName strings.
+        -- Name was already spoken on focus arrival -- speak the new
+        -- value AND, for carousel-style cycles where each option
+        -- carries its own description (Race / Class / Subrace /
+        -- Subclass / Background / Deity / Feat / etc.), the new
+        -- description too.  Without the description the player just
+        -- hears "Tiefling" / "Drow" with no idea what's behind the
+        -- name -- and the whole point of cycling these carousels
+        -- IS to compare descriptions.  Uses elemAddr for stable
+        -- identity instead of comparing itemName strings.
         if elemAddr ~= ""
             and elemAddr == handlerState.lastSpokenElemAddr
             and not isScreenEntry then
-            -- Same element, new data.  Speak only what changed.
-            local cycleSpeech = SpeechData.Create()
+            -- Same element, new data.  Speak what changed.
+            local cycleSpeech = SpeechData.Create("verbose")
             if itemValue and itemValue ~= "" then
                 cycleSpeech:Add("value", itemValue, "brief")
             elseif itemName and itemName ~= ""
@@ -1905,13 +1946,31 @@ local function CreateCCPageHandler(config)
                 -- cycling where ExtractOriginContext returned raw text).
                 cycleSpeech:Add("value", itemName, "brief")
             end
+            -- Include the per-option description on every cycle.
+            -- "verbose" tier so it follows the user's global verbosity
+            -- dial -- if they've dialed down to brief, only the name
+            -- speaks; at normal / verbose the description follows.
+            if itemDescription and itemDescription ~= "" then
+                cycleSpeech:Add("description",
+                    itemDescription, "verbose")
+            end
             local cycleText = cycleSpeech:Format()
             if cycleText and cycleText ~= "" then
                 handlerState.lastSpokenName = elemId
                 handlerState.lastSpokenElemAddr = elemAddr
                 Log.Info("VALUE CYCLE [" .. config.name .. "]: "
                     .. cycleText)
-                Ext.Tolk.Speak(cycleText, true)
+                -- Route through SpeechData:Speak so dedup tracking,
+                -- role recording (for tooltip cross-off), and the
+                -- standard SPEAK log line all happen.  Previously
+                -- this branch called Ext.Tolk.Speak directly, which
+                -- bypassed every one of those paths -- a sediment
+                -- pattern from before SpeechData consolidated speech
+                -- emission.  isScreenEntry is explicitly false here
+                -- (the branch above already guarded with
+                -- `not isScreenEntry`).
+                RecordSpokenRoles(cycleSpeech)
+                cycleSpeech:Speak(ccState, false, nil, userInitiated)
                 return
             end
         end
@@ -3056,7 +3115,7 @@ local function HandleCCSnapshot(snapshot)
         else
             if not ccState.postCutsceneHintSpoken then
                 ccState.postCutsceneHintSpoken = true
-                local hintSpeech = SpeechData.Create()
+                local hintSpeech = SpeechData.Create("verbose")
                 hintSpeech:Add("navigationHint",
                     "Press down twice to return to the character list",
                     "brief")
@@ -3099,7 +3158,7 @@ local function HandleCCSnapshot(snapshot)
         if instruction then
             if ccState.activeInstruction ~= focusedElement.elemName then
                 ccState.activeInstruction = focusedElement.elemName
-                local instructionSpeech = SpeechData.Create()
+                local instructionSpeech = SpeechData.Create("verbose")
                 instructionSpeech:Add("instructionHint", instruction, "brief")
                 Log.Info("CC INSTRUCTION: " .. focusedElement.elemName)
                 Ext.Tolk.Speak(instructionSpeech:Format(), true)

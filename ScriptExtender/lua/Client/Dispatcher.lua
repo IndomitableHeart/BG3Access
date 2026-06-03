@@ -299,9 +299,13 @@ end
 --   dispatcher:GetActiveHandler()
 --     - Returns the current handler instance (or nil).
 --
---   dispatcher:GetActiveHandlerWidgetName()
---     - Returns one of the current entry's registered widget x:Names
---       (or nil).
+--   dispatcher:GetActiveHandlerWidgetNames()
+--     - Returns the SET (table keyed by name, value true) of the
+--       current entry's registered widget x:Names, or nil if no
+--       active handler / no widgetNames criterion.  Set form
+--       supports any-match queries across multi-widget-name
+--       handlers (e.g. SaveLoad covers both LoadGame_c and
+--       SaveGame_c).
 --
 --   dispatcher:IsRegisteredDCType(dcType)
 --     - True if any handler has the DC type in its dcTypes set.  Used
@@ -421,10 +425,37 @@ function DispatcherModule.Create(config)
 
         -- Re-instantiation check: same elemName + different
         -- widgetRootId = a fresh C++ widget instance (previous one
-        -- destroyed, new one created).  Force a deactivate when this
-        -- affects the active handler so the subsequent ActivateEntry
-        -- below runs ResetState and the handler gets a clean
-        -- activation (clears currentTabContext etc.).
+        -- destroyed, new one created).  The game does this on
+        -- tab switches in tabbed menus (e.g. Options swaps the
+        -- inner widget per tab while keeping the outer x:Name
+        -- "Options_c" stable).  The user is STILL in the same
+        -- logical panel -- only the underlying widget pointer
+        -- changed.
+        --
+        -- Use a SOFT reset (ResetNavigation) instead of a full
+        -- DeactivateCurrent -> ResetState here.  ResetNavigation
+        -- clears per-tab navigation state (currentTabContext,
+        -- lastSpokenTitle, lastSpokenName, previousSpeechData)
+        -- which is what we want for a tab switch, BUT preserves
+        -- tabHintSpoken and screenEntryOverrides which should
+        -- carry across the re-instantiation:
+        --
+        --   - tabHintSpoken: the user already heard the nav hint
+        --     when they entered the panel; re-speaking it on
+        --     every tab switch is noise.
+        --   - screenEntryOverrides: forward-looking state set by
+        --     onWidgetAdded for the new tab, to be consumed by
+        --     the next screen entry.  Wiping it would defeat the
+        --     design (same rationale as ResetNavigation itself
+        --     not wiping it).
+        --
+        -- onWidgetAdded still fires below via HandleWidgetAdded,
+        -- so per-tab subscriptions (controller input bindings,
+        -- description overrides for special tabs) are re-applied
+        -- as needed; handlers that swap state on tab change
+        -- (e.g. Options unsubscribing controller input when
+        -- leaving the Controller tab) use the onWidgetAdded
+        -- elseif branch which still runs.
         if matchedEntry then
             local widgetRootId = widgetData.widgetRootId
             local elemName = widgetData.elemName
@@ -436,8 +467,10 @@ function DispatcherModule.Create(config)
                     Log.Info(logName .. ": widget '" .. elemName
                         .. "' re-instantiated (widgetRootId "
                         .. lastRootId .. " -> " .. widgetRootId
-                        .. ") -- forcing reactivation")
-                    DeactivateCurrent("widget re-instantiated")
+                        .. ") -- soft reset (preserve tab hint)")
+                    if currentEntry.handler.ResetNavigation then
+                        currentEntry.handler.ResetNavigation()
+                    end
                 end
             end
         end
@@ -482,6 +515,25 @@ function DispatcherModule.Create(config)
         end
     end
 
+    --- CheckLiveness: run ONLY Step 1 (liveness) of RouteSnapshot,
+    --- with no pickup or dispatch.  Used by EventRouter to detect
+    --- "the active handler's widget went away" on snapshots that
+    --- don't have a focusedElement -- the normal full RouteSnapshot
+    --- is gated above by the focusedElement guard in EventRouter,
+    --- which means a handler whose widget closed during a "no focus"
+    --- window (e.g. shortcuts radial dismiss, no HUD focus target
+    --- afterwards) would stay pinned indefinitely.  Per the design
+    --- statement, liveness uses snapshot.allWidget* -- this is
+    --- safe to call on every snapshot regardless of focus state.
+    function dispatcher:CheckLiveness(snapshot)
+        if skipWhen and skipWhen(snapshot) then return end
+        if currentEntry
+            and not IsHandlerOpen(currentEntry, snapshot) then
+            DeactivateCurrent("openWhen failed (liveness check)")
+            TryRestoreFromStack(snapshot)
+        end
+    end
+
     function dispatcher:HandleWidgetRootChanged()
         if currentEntry then
             currentEntry.handler.ResetNavigation()
@@ -515,15 +567,31 @@ function DispatcherModule.Create(config)
         return currentEntry
     end
 
-    function dispatcher:GetActiveHandlerWidgetName()
+    --- Returns the set of widget x:Names the active handler is
+    --- registered for, or nil if no handler is active / it has no
+    --- widgetNames criterion.  Set form (key = name, value = true)
+    --- so callers can membership-test in O(1).
+    ---
+    --- A handler may register multiple widget names (e.g. SaveLoad
+    --- covers both LoadGame_c and SaveGame_c).  The previous version
+    --- of this function returned a SINGLE name picked by Lua's
+    --- unordered table iteration, which made the liveness fallback
+    --- in EventRouter check the wrong widget half the time -- e.g.
+    --- on a Load Game session it would query "SaveGame_c" against
+    --- allWidgetNames, fail to find it, and falsely deactivate the
+    --- live handler.  Returning the whole set lets callers do an
+    --- any-match check.
+    function dispatcher:GetActiveHandlerWidgetNames()
         if not currentEntry then return nil end
         local criterion = currentEntry.openWhen
-        if criterion and criterion.widgetNames then
-            for widgetName in pairs(criterion.widgetNames) do
-                return widgetName
-            end
+        if not criterion or not criterion.widgetNames then
+            return nil
         end
-        return nil
+        local names = {}
+        for widgetName in pairs(criterion.widgetNames) do
+            names[widgetName] = true
+        end
+        return names
     end
 
     function dispatcher:IsRegisteredDCType(dcType)

@@ -24,6 +24,21 @@ BG3Access.Client = BG3Access.Client or {}
 local Log        = BG3Access.Client.Log
 local SpeechData = BG3Access.Client.SpeechData
 
+-- User-facing setting: subregion entry/leave announcements can be
+-- silenced for players who find them noisy.  Lives in the GPS
+-- submenu alongside the other navigation features.
+if BG3Access.Client.Settings then
+    BG3Access.Client.Settings.RegisterDefault(
+        "subregionEntryEnabled", true, { true, false },
+        "Subregion announcements", "gpsSettings")
+    -- Tier preset for the Global verbosity dial.  Off in Brief
+    -- because subregion entry is "nice to know" rather than
+    -- essential; on at Normal+ as ambient context.
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "subregionEntryEnabled",
+        { brief = false, normal = true, verbose = true })
+end
+
 local SUBREGION_CHANNEL       = "BG3Access_SubregionEvent"
 local SUBREGION_QUERY_CHANNEL = "BG3Access_SubregionQuery"
 
@@ -102,7 +117,56 @@ end
 --- would feel hostile.
 local function AnnounceTransition(prefix, name)
     if not name or name == "" then return end
+    local Settings = BG3Access.Client.Settings
+    if Settings and Settings.Get
+        and Settings.Get("subregionEntryEnabled") == false then
+        return
+    end
     SpeechData.Alert(prefix .. " " .. name, "queue")
+end
+
+--- Resolve a subregion slug to its best display name.  Returns
+--- (name, fellBackToHumanized).  When the second value is true, the
+--- caller knows the UI widget wasn't ready and a deferred retry may
+--- be worth scheduling.
+---
+--- Resolution order:
+---   1. Local cache (already resolved this slug this session)
+---   2. UI widget read (SubRegionName / MapLocation)
+---   3. Locations.ResolveDisplayName (rarely produces a real result;
+---      kept as defense in depth)
+---   4. Humanized slug fallback (always returns SOMETHING)
+local function ResolveSubregionName(slug)
+    local Locations = BG3Access.Client.Locations
+    local displayName = subregionNames[slug]
+    if displayName and displayName ~= "" then
+        return displayName, false
+    end
+    displayName = ReadCurrentSubRegionText()
+    if displayName and displayName ~= "" then
+        subregionNames[slug] = displayName
+        return displayName, false
+    end
+    if Locations and Locations.ResolveDisplayName then
+        local resolved = Locations.ResolveDisplayName(slug, "subregion")
+        local humanized = slug
+            :gsub("_SUB$", "")
+            :gsub("_sub$", "")
+            :gsub("_", " ")
+        if resolved and resolved ~= "" and resolved ~= humanized
+            and resolved ~= slug then
+            subregionNames[slug] = resolved
+            return resolved, false
+        end
+    end
+    -- Humanized fallback -- never silent, but signals the caller that
+    -- a deferred retry might yield a better name (the UI widget may
+    -- not have populated yet at the moment we read it).
+    local humanized = slug
+        :gsub("_SUB$", "")
+        :gsub("_sub$", "")
+        :gsub("_", " ")
+    return humanized, true
 end
 
 --- Event handler for net messages from the server.
@@ -122,38 +186,51 @@ local function OnSubregionEvent(payload)
             and "You are in"
             or "Entering"
 
-        -- Cache hit: announce immediately.
-        local cachedName = subregionNames[slug]
-        if cachedName then
-            currentSubregionSlug = slug
-            AnnounceTransition(prefix, cachedName)
-            Log.Info("Subregion: " .. data.event .. " " .. slug
-                .. " (cached: " .. cachedName .. ")")
-            return
-        end
-        -- Cache miss: read the UI widget.  Larian's own SetSubRegionName
-        -- call fires on the same tick as EnteredTrigger so the text
-        -- should already be current by the time the net relay
-        -- round-trip delivers.  If the read returns nil (widget not
-        -- visible yet, early frame, etc.), fall back to speaking
-        -- the cleaned-up slug rather than going silent.
-        local displayName = ReadCurrentSubRegionText()
-        if not displayName or displayName == "" then
-            -- Fallback: strip the _SUB / _ area suffixes, replace
-            -- underscores with spaces.  Not pretty but not silent.
-            displayName = slug
-                :gsub("_SUB$", "")
-                :gsub("_sub$", "")
-                :gsub("_", " ")
-            Log.Info("Subregion: UI read failed for " .. slug
-                .. ", using slug fallback: " .. displayName)
-        else
-            subregionNames[slug] = displayName
+        -- Snapshot player position for the visited-places list so
+        -- WorldNav can route the user back to this region later.
+        -- pcall the position read: GetEntityPosition is defined in
+        -- WorldNav, which loads after this module; calling it before
+        -- WorldNav initializes would fail.  Position is optional in
+        -- the visited list (entry without it just means "I've been
+        -- here, but I don't know exactly where").
+        local position = nil
+        pcall(function()
+            local Worldnav = BG3Access.Client.WorldNav
+            if Worldnav and Worldnav.GetPlayerPosition then
+                position = Worldnav.GetPlayerPosition()
+            end
+        end)
+        currentSubregionSlug = slug
+
+        -- Always defer announcement by 30 frames (~500ms) to give
+        -- the HUD widget (SubRegionName / MapLocation) time to
+        -- populate before we read it.  Without the defer, the same
+        -- event sometimes resolves to "Ravaged Beach" and sometimes
+        -- to the humanized "CRA Beach" depending on whether the
+        -- widget binding completed before our read fired.  Always-
+        -- defer eliminates the inconsistency and roughly matches
+        -- Larian's own HUD-fade timing for the visual cue.
+        local Scheduler = BG3Access.Client.Scheduler
+        local function ResolveAndAnnounce()
+            local displayName = ResolveSubregionName(slug)
+            local Locations = BG3Access.Client.Locations
+            if Locations and Locations.RegisterVisitedSubregion then
+                Locations.RegisterVisitedSubregion(
+                    slug, position, displayName)
+            end
+            AnnounceTransition(prefix, displayName)
             Log.Info("Subregion: " .. data.event .. " " .. slug
                 .. " -> " .. displayName)
         end
-        currentSubregionSlug = slug
-        AnnounceTransition(prefix, displayName)
+        if Scheduler and Scheduler.RunAfterFrames then
+            Scheduler.RunAfterFrames(30, ResolveAndAnnounce)
+        else
+            -- Scheduler unavailable (module load order issue, very
+            -- early game state) -- resolve and announce immediately
+            -- as fallback so we never go silent.
+            ResolveAndAnnounce()
+        end
+        return
 
     elseif data.event == "leave" then
         local cachedName = subregionNames[slug]

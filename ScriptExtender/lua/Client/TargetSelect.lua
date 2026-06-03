@@ -1134,6 +1134,21 @@ end
 --- Permanent statuses (no Lifetime) render as name only; timed
 --- statuses append " N turn" / " N turns" based on remaining
 --- turns.
+---
+--- Visual-only statuses (those Larian intentionally left without a
+--- DisplayName because they're VFX-only) are normally filtered out
+--- because they speak as "%%% EMPTY".  But some of them ARE visible
+--- to sighted players via VFX on the character model and should be
+--- announced for accessibility parity.  VISUAL_ONLY_STATUS_NAMES
+--- below maps the statusId to a readable name we'll use when the
+--- DisplayName comes back as the placeholder.
+local VISUAL_ONLY_STATUS_NAMES = {
+    -- Blood splatter VFX on the character model after melee combat
+    -- or bleeding sources.  Sighted players see a bloody character;
+    -- blind players hear "Blood covered".
+    BLOOD_COVERED = "Blood covered",
+}
+
 local function FormatStatusesPhrase(statuses)
     if not statuses or #statuses == 0 then return nil end
     local parts = {}
@@ -1155,14 +1170,23 @@ local function FormatStatusesPhrase(statuses)
         local hasResolvedDisplayName = name ~= ""
             and name ~= statusId
             and name:sub(1, 3) ~= "%%%"
+        local effectiveName = nil
         if hasResolvedDisplayName then
+            effectiveName = name
+        else
+            -- Fall back to the visual-only-status lookup so
+            -- accessibility-relevant VFX statuses (Blood covered etc.)
+            -- still get announced.
+            effectiveName = VISUAL_ONLY_STATUS_NAMES[statusId]
+        end
+        if effectiveName then
             local turns = LifetimeToTurns(entry.rawLifetime)
             if turns then
                 local unit = (turns == 1) and "turn" or "turns"
-                parts[#parts + 1] = name .. " "
+                parts[#parts + 1] = effectiveName .. " "
                     .. tostring(turns) .. " " .. unit
             else
-                parts[#parts + 1] = name
+                parts[#parts + 1] = effectiveName
             end
         end
     end
@@ -2088,6 +2112,15 @@ SubscribeTick()
 --- d-pad L/R to its target cycle in those states; we must read
 --- TargetInfo_c / CursorText_c on every press.
 local function ShouldHandleDPad()
+    -- BG3Access settings menu owns D-pad while open: cycling combat
+    -- targets while the user is configuring would be confusing and
+    -- competes with the menu's own announcements.  Checked first so
+    -- the gate fires regardless of turn state.
+    local SettingsMenu = BG3Access.Client.SettingsMenu
+    if SettingsMenu and SettingsMenu.IsOpen and SettingsMenu.IsOpen() then
+        return false
+    end
+
     if not IsLocalPlayerTurn() then return false end
 
     local Menus = BG3Access.Client.Menus
@@ -2394,10 +2427,29 @@ local function BuildEffectsDetailList(focusedData, _tooltipTexts)
 
     local detailList = {}
     for _, statusInfo in ipairs(statuses) do
-        detailList[#detailList + 1] = {
-            label = statusInfo.name,
-            value = statusInfo.description or "",
-        }
+        -- Same display-name filter as FormatStatusesPhrase: skip
+        -- statuses with no resolved DisplayName, UNLESS they're in
+        -- VISUAL_ONLY_STATUS_NAMES (statuses Larian left unnamed
+        -- but ARE visible to sighted players via VFX -- blood
+        -- splatter etc.).  For those we substitute our own name
+        -- so blind players get the same info.
+        local name = statusInfo.name or ""
+        local statusId = statusInfo.statusId or ""
+        local hasResolvedDisplayName = name ~= ""
+            and name ~= statusId
+            and name:sub(1, 3) ~= "%%%"
+        local effectiveName = nil
+        if hasResolvedDisplayName then
+            effectiveName = name
+        else
+            effectiveName = VISUAL_ONLY_STATUS_NAMES[statusId]
+        end
+        if effectiveName then
+            detailList[#detailList + 1] = {
+                label = effectiveName,
+                value = statusInfo.description or "",
+            }
+        end
     end
     return detailList
 end

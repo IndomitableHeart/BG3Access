@@ -38,6 +38,11 @@ local inspectWidgetActive = false  -- true while PinnedTooltips_c has focus
 -- Loading tips use their own dedup to avoid needing a handler state.
 -- Table used as a set because multiple tips can arrive in the same snapshot.
 local spokenLoadingTips = {}
+-- Tips collected while the first-launch welcome was active.  The C++
+-- side flushes its tip buffer one-shot, so tips we'd otherwise drop
+-- get held here and replayed when Welcome calls FlushPendingLoadingTips
+-- on completion.  Kept until flushed -- never auto-cleared.
+local pendingTipsDuringWelcome = {}
 -- True when snapshots should route to WorldUI panel handlers instead of Menus.
 local routeToWorld        = false
 -- Last value of routeToWorld we logged at dispatch time.  Triggers a
@@ -46,6 +51,7 @@ local lastRouteToWorldLogged = nil
 -- True when a dialog overlay spoke on this tick while WorldUI is active.
 -- Suppresses the panel handler so dialog speech isn't interrupted.
 local worldDialogOverlayJustSpoke = false
+local menuDialogOverlayJustSpoke  = false
 -- True on world entry (Running state) to suppress the initial burst of
 -- visual text from HUD widgets (Overlay "Examine/Context Menu/Actions",
 -- etc.).  The RS HUD reader replaces this -- user reads when ready.
@@ -117,11 +123,41 @@ end
 -- computed here.  Routing state (routeToWorld) is updated based on which
 -- handler kinds activated; menu wins over world if both appeared.
 -- ---------------------------------------------------------------------------
+-- Diagnostic toggle: when true, every widgetAdded event logs the
+-- widget's name + DC type so cinematic / overlay widgets can be
+-- identified by triggering the UI condition in-game and reading
+-- the log.  Toggled by /bg3a_log_widgets console command.
+local widgetIdentityLogging = false
+
+-- Most recent snapshot, cached for the bg3a_dump_widgets command.
+-- snapshot.allWidgetNames / allWidgetDCTypes are populated every
+-- tick (used by Dispatcher for handler-liveness checks) -- the
+-- data IS already enumerated, we just need to surface it on
+-- demand for forensics.
+local latestSnapshot = nil
+
 local function HandleTickSnapshot(snapshot)
+    latestSnapshot = snapshot  -- For bg3a_dump_widgets forensic command.
     Log.Debug("[BG3A_BC] phase=lua_snapshot_begin events="
         .. tostring(snapshot.widgetEvents and #snapshot.widgetEvents or 0)
         .. " removed=" .. tostring(snapshot.widgetRemoved or false))
     local widgetEvents = snapshot.widgetEvents or {}
+
+    -- Identity diagnostic.  Logs every widgetEvent's name + dcType
+    -- when the toggle is on -- used for one-off forensics when
+    -- trying to map "this cinematic plays through which widget?".
+    -- Toggle on, trigger the cinematic / dialog / overlay, read
+    -- the log, toggle off.  See Ext.RegisterConsoleCommand below.
+    if widgetIdentityLogging and #widgetEvents > 0 then
+        for i, widgetEvent in ipairs(widgetEvents) do
+            Log.Info("WIDGET DIAG: event[" .. i
+                .. "] name='" .. tostring(widgetEvent.elemName or "")
+                .. "' dcType='" .. tostring(widgetEvent.dcType or "")
+                .. "' elemType='"
+                .. tostring(widgetEvent.elemType or "")
+                .. "'")
+        end
+    end
     local hasWidgetEvents = #widgetEvents > 0
     -- Track whether a menu handler activated this tick.  Used to gate
     -- the late world-panel detection at the bottom of this function so
@@ -158,6 +194,15 @@ local function HandleTickSnapshot(snapshot)
     -- that might return early (loading screen has no focused element).
     -- =================================================================
     if snapshot.widgetAdded and hasWidgetEvents then
+        -- Welcome-mode handling: while the first-launch welcome is
+        -- mid-flow it owns the audio channel.  We can't speak tips
+        -- alongside it (they'd interrupt), and we can't just drop them
+        -- because the C++ side flushes its buffer one-shot.  Solution:
+        -- enqueue suppressed tips in pendingTipsDuringWelcome; Welcome
+        -- calls FlushPendingLoadingTips on completion to speak them.
+        local Welcome = BG3Access.Client.Welcome
+        local welcomeActive = Welcome and Welcome.IsActive
+            and Welcome.IsActive()
         for _, widgetEvent in ipairs(widgetEvents) do
             if widgetEvent.dcType == "ls.LoadingScreen"
                 and widgetEvent.namedTexts then
@@ -166,17 +211,27 @@ local function HandleTickSnapshot(snapshot)
                         if textValue and textValue ~= ""
                             and not textValue:match("^%d+%%?$")
                             and not spokenLoadingTips[textValue] then
+                            -- Mark spoken either way so we don't
+                            -- enqueue duplicates if the same text
+                            -- arrives in two widget events.
                             spokenLoadingTips[textValue] = true
-                            Log.Info("LOADING TIP: " .. textValue)
-                            -- One-off announcement, no field structure --
-                            -- Alert is the correct primitive per the
-                            -- speech architecture (CLAUDE.md).  "queue"
-                            -- so multiple buffered tips speak in order
-                            -- and a tip in flight isn't killed by the
-                            -- next one arriving.  Direct Ext.Tolk.Speak
-                            -- bypassed dedup tracking and didn't route
-                            -- through the architecture.
-                            SpeechData.Alert(textValue, "queue")
+                            if welcomeActive then
+                                Log.Info("LOADING TIP (queued during"
+                                    .. " welcome): " .. textValue)
+                                pendingTipsDuringWelcome[
+                                    #pendingTipsDuringWelcome + 1] =
+                                    textValue
+                            else
+                                Log.Info("LOADING TIP: " .. textValue)
+                                -- One-off announcement, no field
+                                -- structure -- Alert is the correct
+                                -- primitive per the speech architecture
+                                -- (CLAUDE.md).  "queue" so multiple
+                                -- buffered tips speak in order and a
+                                -- tip in flight isn't killed by the
+                                -- next one arriving.
+                                SpeechData.Alert(textValue, "queue")
+                            end
                         end
                     end
                 end
@@ -313,23 +368,48 @@ local function HandleTickSnapshot(snapshot)
     if not suppressSnapshots and snapshot.widgetAdded and hasWidgetEvents then
         -- Skip widget scan noise after menu close (e.g., PartyLine_c
         -- re-discovered when returning to world from shortcuts/radials).
-        -- Filter the events: drop world/HUD re-discovery events but
-        -- KEEP menu events.  Without this filter, the user closing a
-        -- menu and immediately reopening one (e.g., Esc → close pause
-        -- menu → Esc → reopen pause menu) lands the reopen's widget
-        -- event in the suppressed tick, dropping the activation and
-        -- producing silence.  Menu events arriving here are
-        -- legitimate user opens; only world re-discovery is noise.
+        -- Filter the events: drop generic HUD re-discovery events but
+        -- KEEP events that match a REGISTERED handler (menu OR world).
+        -- Reasons:
+        --   - Menu events: the user closing a menu and immediately
+        --     reopening one would lose the reopen's activation if we
+        --     dropped all events in the suppression window.
+        --   - World panel events: a panel like Tutorial popping up
+        --     after a camp transition arrives in the suppression
+        --     window; if we drop it, onWidgetAdded never runs and
+        --     the panel's screen entry has no title/body to speak.
+        -- Only events that match NO registered handler are genuine
+        -- noise to suppress.
         if suppressNextWidgetScan then
             suppressNextWidgetScan = false
+            local World = BG3Access.Client.WorldUI
             local filteredEvents = {}
             for _, widgetEvent in ipairs(widgetEvents) do
                 local dcType = widgetEvent.dcType or ""
                 local elemName = widgetEvent.elemName or ""
-                local isMenuEvent = Menus.IsMenuDCType(dcType)
+                local matchesMenu = Menus.IsMenuDCType(dcType)
                     or (Menus.IsMenuWidgetName
                         and Menus.IsMenuWidgetName(elemName))
-                if isMenuEvent then
+                local matchesWorld = World
+                    and ((World.IsWorldDCType
+                            and World.IsWorldDCType(dcType))
+                        or (World.IsWorldWidgetName
+                            and World.IsWorldWidgetName(elemName)))
+                -- Dialog overlays (LSMessageBoxData widgets like the
+                -- Long Rest "Do you want to end the day?" confirmation)
+                -- are NOT in any registered handler's openWhen -- they
+                -- speak via Menus.HandleDialogOverlay directly without
+                -- switching the active handler.  Without keeping them
+                -- here, the post-menu-close suppression silently drops
+                -- the dialog right when it arrives, and the user gets
+                -- no prompt at all.  Bug seen specifically after closing
+                -- the character sheet: the widget address churn makes
+                -- the next cache rebuild report changed=0 (so the
+                -- non-suppress fast path in C++ doesn't run), so this
+                -- filter is the only path the dialog has into dispatch.
+                local matchesDialogOverlay =
+                    Menus.IsDialogOverlay and Menus.IsDialogOverlay(dcType)
+                if matchesMenu or matchesWorld or matchesDialogOverlay then
                     filteredEvents[#filteredEvents + 1] = widgetEvent
                 end
             end
@@ -340,8 +420,8 @@ local function HandleTickSnapshot(snapshot)
                 widgetEvents = filteredEvents
                 Log.Debug("WIDGET EVENT partial suppression "
                     .. "(menu close re-scan): kept "
-                    .. #filteredEvents .. " menu events, dropped "
-                    .. "world re-discovery noise")
+                    .. #filteredEvents .. " registered-handler events, "
+                    .. "dropped unregistered HUD noise")
             end
         end
 
@@ -451,11 +531,18 @@ local function HandleTickSnapshot(snapshot)
                 end
             end
 
-            -- When WorldUI is active and a dialog overlay spoke,
-            -- suppress the panel handler on this tick so the dialog
-            -- speech isn't immediately interrupted.
-            if dialogOverlaySpoke and routeToWorld then
-                worldDialogOverlayJustSpoke = true
+            -- When a dialog overlay spoke this tick, suppress the
+            -- subsequent active-handler dispatch so the handler's
+            -- own item speech (interrupt-mode Tolk.Speak) doesn't
+            -- cut off the dialog mid-word.  Two flags because the
+            -- world and menu dispatch paths are separate -- one
+            -- gets consumed depending on routeToWorld.
+            if dialogOverlaySpoke then
+                if routeToWorld then
+                    worldDialogOverlayJustSpoke = true
+                else
+                    menuDialogOverlayJustSpoke = true
+                end
             end
         end  -- end of "if snapshot.widgetAdded then" block
     end
@@ -550,22 +637,24 @@ local function HandleTickSnapshot(snapshot)
         local removedName = snapshot.removedWidgetData.elemName or ""
         local removedDCType = snapshot.removedWidgetData.dcType or ""
         local activeHandler = Menus.GetActiveHandler()
-        local activeWidgetName = Menus.GetActiveHandlerWidgetName
-            and Menus.GetActiveHandlerWidgetName() or nil
+        local activeWidgetNames = Menus.GetActiveHandlerWidgetNames
+            and Menus.GetActiveHandlerWidgetNames() or nil
+        local hasAnyActiveName = activeWidgetNames
+            and next(activeWidgetNames) ~= nil
 
         -- Check if the removed widget matches the active handler.
         -- Match by widget name first (distinguishes shortcuts menu
         -- from pause menu when both share gui::DCGameMenu), then
         -- by DC type as fallback.
         local handlerMatched = false
-        if activeWidgetName and removedName ~= ""
-            and removedName == activeWidgetName then
+        if hasAnyActiveName and removedName ~= ""
+            and activeWidgetNames[removedName] then
             handlerMatched = true
         elseif activeHandler and removedDCType ~= ""
             and Menus.IsMenuDCType(removedDCType) then
             -- DC type match: only if the handler was NOT activated by
             -- widget name (otherwise we'd false-match on shared types).
-            if not activeWidgetName then
+            if not hasAnyActiveName then
                 handlerMatched = true
             end
         end
@@ -581,22 +670,35 @@ local function HandleTickSnapshot(snapshot)
         -- allWidgetNames to authoritatively detect a missing widget.
         -- Still event-driven (only fires when SOMETHING was removed),
         -- not a per-tick poll.
-        if not handlerMatched and activeHandler and activeWidgetName
+        --
+        -- ANY-MATCH: a handler may register MULTIPLE widget names
+        -- (e.g. SaveLoad covers both LoadGame_c and SaveGame_c --
+        -- only one of those is present in any given visit).  The
+        -- handler is still alive as long as AT LEAST ONE of its
+        -- registered names is in the live widget set.  Previously
+        -- this used a single arbitrarily-picked name and false-
+        -- matched on Load Game visits (checked SaveGame_c, found
+        -- it missing, deactivated the live handler).
+        if not handlerMatched and activeHandler and hasAnyActiveName
             and snapshot.allWidgetNames then
-            local stillPresent = false
+            local anyPresent = false
             for _, liveWidgetName in ipairs(snapshot.allWidgetNames) do
-                if liveWidgetName == activeWidgetName then
-                    stillPresent = true
+                if activeWidgetNames[liveWidgetName] then
+                    anyPresent = true
                     break
                 end
             end
-            if not stillPresent then
+            if not anyPresent then
                 handlerMatched = true
+                local nameList = {}
+                for name in pairs(activeWidgetNames) do
+                    nameList[#nameList + 1] = name
+                end
                 Log.Info("Widget removal liveness fallback: "
                     .. "removedWidgetData reported '" .. removedName
-                    .. "' but active handler's widget '"
-                    .. activeWidgetName
-                    .. "' is also gone from allWidgetNames")
+                    .. "' AND none of the active handler's widgets {"
+                    .. table.concat(nameList, ", ")
+                    .. "} are in allWidgetNames")
             end
         end
 
@@ -606,6 +708,67 @@ local function HandleTickSnapshot(snapshot)
             suppressNextWidgetScan = true
             Log.Info("Routing back to WorldUI (widget removed: "
                 .. removedName .. " dc=" .. removedDCType .. ")")
+        end
+    end
+
+    -- =================================================================
+    -- Generic menu liveness check.  Runs every snapshot regardless of
+    -- focusedElement state.  Catches the case where a menu's widget
+    -- closed but didn't fire snapshot.widgetRemoved (e.g. the radial
+    -- closes visually without unloading its widget, or C++ misses the
+    -- visibility transition).  The dispatcher's normal Step-1 liveness
+    -- inside Menus.RouteSnapshot is gated below by the focusedElement
+    -- guard, so post-close "no focus" snapshots never reach it -- this
+    -- closes that gap.  Uses snapshot.allWidget* (loaded-state) per the
+    -- dispatcher design statement.  No-op when the active handler's
+    -- widget is still loaded.
+    -- =================================================================
+    if not routeToWorld and not suppressSnapshots
+        and Menus.CheckLiveness and Menus.GetActiveHandler then
+        local wasActive = Menus.GetActiveHandler() ~= nil
+        Menus.CheckLiveness(snapshot)
+        local stillActive = Menus.GetActiveHandler() ~= nil
+        if wasActive and not stillActive then
+            routeToWorld = true
+            suppressNextWidgetScan = true
+            Log.Info("Routing back to WorldUI "
+                .. "(menu liveness check deactivated handler)")
+        end
+    end
+
+    -- =================================================================
+    -- Radial liveness check.  The radial closes whenever the player
+    -- picks a slot (potion, action, spell) -- the ActionRadials
+    -- widget unloads, but in many cases the closing tick has no
+    -- focusChanged we can hook (focus moves to nothing / combat
+    -- target / HUD, none of which produce a Noesis focused-element
+    -- transition we'd see in HandleSnapshot).  Without a hook, the
+    -- inRadial flag stays pinned true and GetRadialDetailHandler
+    -- keeps hijacking RS-Left from GPS / panel detail view.
+    --
+    -- Authoritative signal: the "ActionRadials" widget x:Name is
+    -- present in snapshot.allWidgetNames iff the radial is loaded.
+    -- This check runs every snapshot regardless of focus state,
+    -- closing the gap the focus-driven path leaves open.  No-op
+    -- when the radial is genuinely open OR was never opened.
+    -- =================================================================
+    do
+        local World = BG3Access.Client.WorldUI
+        if World and World.IsRadialOpen and World.IsRadialOpen()
+            and World.ClearRadialFocus
+            and snapshot.allWidgetNames then
+            local radialWidgetPresent = false
+            for _, liveWidgetName in ipairs(snapshot.allWidgetNames) do
+                if liveWidgetName == "ActionRadials" then
+                    radialWidgetPresent = true
+                    break
+                end
+            end
+            if not radialWidgetPresent then
+                Log.Info("Radial liveness check: ActionRadials gone --"
+                    .. " clearing radial focus")
+                World.ClearRadialFocus()
+            end
         end
     end
 
@@ -643,7 +806,9 @@ local function HandleTickSnapshot(snapshot)
 
     -- =================================================================
     -- focusedElement guard: everything below needs a valid focus target.
-    -- Widget-added events (above) are processed regardless.
+    -- Widget-added events (above) are processed regardless.  Radial
+    -- liveness handled in its own block above -- runs regardless of
+    -- focus state via snapshot.allWidgetNames.
     -- =================================================================
     if not focusedElement or not focusedElement.elemType then return end
 
@@ -830,6 +995,14 @@ local function HandleTickSnapshot(snapshot)
                 World.RoutePanelSnapshot(snapshot)
             end
         else
+            -- Same guard for the menu path: a dialog overlay that
+            -- spoke this tick (e.g. SaveLoad "delete?" confirmation)
+            -- must not be clobbered by the active menu handler's
+            -- item speech immediately after.
+            if menuDialogOverlayJustSpoke then
+                menuDialogOverlayJustSpoke = false
+                return
+            end
             Menus.RouteSnapshot(snapshot)
             -- Recovery: if Menus.RouteSnapshot finishes with no
             -- active handler, the menu we were routed for has
@@ -915,16 +1088,80 @@ if initOk and currentState then
         .. " suppress=" .. tostring(suppressSnapshots))
 end
 
+-- Forensic toggle: when on, every widgetEvent gets its identity
+-- logged in HandleTickSnapshot.  Use to identify which widget(s)
+-- accompany a cinematic / dialog / overlay: toggle on, trigger
+-- the UI condition in-game, read the log, toggle off.  Off by
+-- default to keep normal-play logs clean.
+-- One-shot dump of the latest snapshot's widget set.  Uses
+-- allWidgetNames + allWidgetDCTypes (loaded-state, the same data
+-- Dispatcher checks for handler liveness).  Run during whatever
+-- UI condition you're trying to identify -- the lists print
+-- in correlated order so name[i] matches dcType[i].
+Ext.RegisterConsoleCommand("bg3a_dump_widgets", function()
+    if not latestSnapshot then
+        Log.Info("WIDGET DUMP: no snapshot received yet")
+        return
+    end
+    local names = latestSnapshot.allWidgetNames or {}
+    local dcTypes = latestSnapshot.allWidgetDCTypes or {}
+    local addrs = latestSnapshot.allWidgetAddrs or {}
+    local count = math.max(#names, #dcTypes, #addrs)
+    Log.Info("WIDGET DUMP: " .. count
+        .. " widgets (loaded-state, not visibility-filtered):")
+    for i = 1, count do
+        Log.Info(string.format(
+            "  [%d] name='%s' dcType='%s' addr='%s'",
+            i,
+            tostring(names[i] or ""),
+            tostring(dcTypes[i] or ""),
+            tostring(addrs[i] or "")))
+    end
+end)
+
+Ext.RegisterConsoleCommand("bg3a_log_widgets", function(_, arg)
+    local newValue
+    if arg == "on" or arg == "true" or arg == "1" then
+        newValue = true
+    elseif arg == "off" or arg == "false" or arg == "0" then
+        newValue = false
+    else
+        newValue = not widgetIdentityLogging
+    end
+    widgetIdentityLogging = newValue
+    Log.Info("Widget identity logging: "
+        .. (widgetIdentityLogging and "ON" or "OFF"))
+end)
+
 Ext.Events.GameStateChanged:Subscribe(function(e)
     Log.Info("GameStateChanged: " .. tostring(e.FromState)
         .. " -> " .. tostring(e.ToState))
+
+    -- Opening-cinematic handshake.  CharacterCreationStarted fires
+    -- server-side during the SwapLevel load phase -- too early for
+    -- a server->client relay to land (client net pipe isn't up).
+    -- So once the client reaches PrepareRunning (net pipe confirmed
+    -- up -- the MovieFinished relay arrives fine at this state) we
+    -- ASK the server.  The server replies with the MovieStarted
+    -- relay iff CharacterCreationStarted fired this session (new
+    -- game).  Save loads never fire it, so they get no reply, no
+    -- AD.  See BootstrapServer.lua's BG3Access_QueryOpeningCinematic
+    -- listener for the both-orderings handshake logic.
+    if tostring(e.ToState) == "PrepareRunning" then
+        pcall(Ext.ClientNet.PostMessageToServer,
+            "BG3Access_QueryOpeningCinematic", "")
+    end
 
     -- Reset all handler modules.
     Menus.ResetAllHandlers()
     CC.ResetCCState()
     if CC.UnsubscribeCCYButton then CC.UnsubscribeCCYButton() end
     Cutscene.ResetDialogState()
-    Cutscene.HandleGameStateForAD(tostring(e.FromState), tostring(e.ToState))
+    -- Audio description is fully event-driven now: the server
+    -- relays MovieStarted (from the opening-cinematic handshake
+    -- above, or other cinematic signals) and MovieFinished,
+    -- dispatched via Combat.lua's EVENT_HANDLERS to
+    -- Cutscene.HandleMovieStarted / HandleMovieFinished.
     local World = BG3Access.Client.WorldUI
     if World then World.ResetState() end
     local Nav = BG3Access.Client.WorldNav
@@ -943,6 +1180,7 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     lastWidgetRootStr = nil
     spokenLoadingTips = {}
     worldDialogOverlayJustSpoke = false
+    menuDialogOverlayJustSpoke  = false
     suppressWorldEntryVisualText = false
     suppressNextWidgetScan = false
 
@@ -969,9 +1207,56 @@ Ext.Events.GameStateChanged:Subscribe(function(e)
     SetupGlobalFocusMonitor()
 end)
 
--- Dev-only log-level cycler (L3+R3 chord) lives in Client/DevConfig.lua,
+-- Dev-only log-level cycler (L3 click) lives in Client/DevConfig.lua,
 -- which is excluded from release packaging.  End users never see the
 -- binding or the speech feedback it produces.
+
+-- ============================================================================
+-- Right-stick accessibility-layer toggle (R3 click)
+-- ============================================================================
+--
+-- A sighted person playing alongside the blind user (or testing /
+-- co-op) may want the right stick to behave normally -- rotate the
+-- camera as BG3 intends -- rather than being intercepted by the
+-- accessibility layer (HUD reader on RS-Up / RS-Right, detail view
+-- on RS-Left, settings menu on RS-Down, etc.).  Clicking R3 (right
+-- stick) toggles between the two modes.
+--
+-- When OFF (pass-through):
+--   * OnRSAxisInput returns immediately -- no PreventAction, no
+--     direction dispatch.  The game receives raw axis events and
+--     rotates the camera normally.
+--   * Right-stick click (R3 itself) STILL toggles the mode back on
+--     -- it's the only way back.
+--
+-- When ON (default):
+--   * Accessibility layer active -- existing behavior.
+--
+-- Default: ON, because the mod's primary user is blind.  Sighted
+-- users explicitly opt-out via R3.
+local rsAccessibilityEnabled = true
+
+Ext.Events.ControllerButtonInput:Subscribe(function(event)
+    if not event.Pressed then return end
+    local buttonName = tostring(event.Button)
+    if buttonName ~= "RightStick" then return end
+
+    local SettingsMenu = BG3Access.Client.SettingsMenu
+    if SettingsMenu and SettingsMenu.IsOpen
+        and SettingsMenu.IsOpen() then
+        return
+    end
+
+    rsAccessibilityEnabled = not rsAccessibilityEnabled
+    local SpeechData = BG3Access.Client.SpeechData
+    if SpeechData and SpeechData.Alert then
+        if rsAccessibilityEnabled then
+            SpeechData.Alert("Accessibility", "interrupt")
+        else
+            SpeechData.Alert("Camera movement", "interrupt")
+        end
+    end
+end)
 
 -- ---------------------------------------------------------------------------
 -- Startup
@@ -1243,6 +1528,18 @@ local function FindActiveDetailHandler()
 end
 
 local function HandleRSDirection(direction)
+    -- Top-level gate: while the BG3Access settings menu is open, the
+    -- ONLY RS direction we honor is Down (close + save, handled
+    -- below).  Everything else (Left/Right/Up -- detail view,
+    -- compare view, GPS cycle, HUD reader) stays off so the menu's
+    -- speech doesn't compete with other mod chatter while the user
+    -- is configuring.
+    local SettingsMenu = BG3Access.Client.SettingsMenu
+    if SettingsMenu and SettingsMenu.IsOpen and SettingsMenu.IsOpen()
+        and direction ~= RS_DIRECTION_DOWN then
+        return
+    end
+
     -- No top-level WorldNav dependency.  RS handling fans out to
     -- branches that have nothing to do with navigation: detail view,
     -- compare view, verbosity cycle, HUD reader.  Only the
@@ -1319,19 +1616,35 @@ local function HandleRSDirection(direction)
         -- Routing -> Off transition closes the list as part of the
         -- mode change -- no separate close needed.
         local Nav = BG3Access.Client.WorldNav
-        if not Nav then return end
+        if not Nav then
+            -- WorldNav module is missing.  Most common cause is a
+            -- parse error at module load (e.g. the Lua 200-locals
+            -- limit being exceeded).  Surface the diagnostic so
+            -- "RS-Left does nothing" doesn't go unnoticed.
+            Log.Warn("RS LEFT: WorldNav module is nil"
+                .. " -- check earlier log for parse errors")
+            return
+        end
         if Nav.CycleGPSMode then Nav.CycleGPSMode() end
         return
     end
 
-    -- RS Down: cycle speech verbosity (verbose -> normal -> brief
-    -- -> verbose).  Fires in ANY context, not gated on IsUIActiveForRS
-    -- -- users may want to tune verbosity while navigating menus,
-    -- tooltips, dialogues, or anything else.  Announced via
-    -- SpeechData.Alert, so it interrupts whatever's currently
-    -- speaking and replies with the new level.
+    -- RS Down: open/close the BG3Access settings menu.  Fires in ANY
+    -- context, not gated on IsUIActiveForRS -- the menu lives above
+    -- the game's own UI, intercepts D-pad/B while open, and returns
+    -- the user to wherever they were on close.  Inside the menu,
+    -- D-pad cycles settings (Up/Down for selection, Left/Right for
+    -- values) and B (or RS Down again) closes + saves.
     if direction == RS_DIRECTION_DOWN then
-        BG3Access.Client.CycleVerbosity()
+        local SettingsMenu = BG3Access.Client.SettingsMenu
+        if SettingsMenu and SettingsMenu.Toggle then
+            SettingsMenu.Toggle()
+        elseif BG3Access.Client.CycleVerbosity then
+            -- Fallback: if SettingsMenu hasn't loaded for some
+            -- reason, preserve the historical verbosity-cycle
+            -- behavior so RS Down doesn't go silent.
+            BG3Access.Client.CycleVerbosity()
+        end
         return
     end
 
@@ -1390,6 +1703,13 @@ local function HandleRSDirection(direction)
 end
 
 local function OnRSAxisInput(event)
+    -- Pass-through mode: a sighted user toggled the accessibility
+    -- layer off via R3.  Return without PreventAction so the game
+    -- gets raw axis values for camera rotation, AND without dispatching
+    -- to GPS / HUD reader / detail view / settings menu so those
+    -- accessibility features stay dormant until R3 toggles back.
+    if not rsAccessibilityEnabled then return end
+
     local axisName = tostring(event.Axis)
     local value = event.Value or 0
 
@@ -1465,6 +1785,20 @@ BG3Access.Client.EventRouter = {
     end,
 
     GetActiveDetailHandler = FindActiveDetailHandler,
+
+    --- FlushPendingLoadingTips: speak any loading tips that were
+    --- queued during the welcome flow.  Called by Welcome.FinishWelcome
+    --- after the user A-presses past the final page.  Empties the
+    --- pending queue.  Safe to call when the queue is empty.
+    FlushPendingLoadingTips = function()
+        if #pendingTipsDuringWelcome == 0 then return end
+        Log.Info("Flushing " .. #pendingTipsDuringWelcome
+            .. " loading tips queued during welcome")
+        for _, textValue in ipairs(pendingTipsDuringWelcome) do
+            SpeechData.Alert(textValue, "queue")
+        end
+        pendingTipsDuringWelcome = {}
+    end,
 }
 
 Log.Info("Accessibility ready (GlobalFocusMonitor).")

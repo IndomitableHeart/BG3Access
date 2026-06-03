@@ -230,13 +230,6 @@ local POWER_CANVAS_POSITIONS = {
 -- bearings.  A power whose bearing rounds to 12 o'clock but is
 -- 120 px off the pure-up axis won't be announced under 12, because
 -- the cursor's pure-up trajectory wouldn't actually cross it.
---
--- Distance bands let the player tell how much push is needed:
---   close  -- under 300 canvas pixels
---   medium -- 300 to 700 canvas pixels
---   far    -- over 700 canvas pixels
-local DIST_CLOSE_MAX = 300
-local DIST_MEDIUM_MAX = 700
 
 -- Perpendicular hit tolerance.  Power icons render at 163 px
 -- (PowerIconSize) inside a 236 px container (PowerIconContainer).
@@ -244,14 +237,6 @@ local DIST_MEDIUM_MAX = 700
 -- half-width -- a power whose center is within 100 px of the ray
 -- will be touched by the cursor's path.
 local CLOCK_HIT_RADIUS = 100
-
--- DistanceBand: return "close", "medium", or "far" for a canvas
--- pixel distance.
-local function DistanceBand(distance)
-    if distance < DIST_CLOSE_MAX then return "close" end
-    if distance < DIST_MEDIUM_MAX then return "medium" end
-    return "far"
-end
 
 -- 12 unit-vectors for each clock hour.  Canvas Y increases downward
 -- so "up" (12 o'clock) is dy = -1.  Bearing = hour * 30 degrees
@@ -323,15 +308,19 @@ local function FormatNearbyPowers(
                         dx * dir.dy - dy * dir.dx)
 
                     if perp <= CLOCK_HIT_RADIUS then
+                        -- Comma included in the prefix so TTS pauses
+                        -- between the name and "padlocked".  Without
+                        -- it the format string concatenates directly
+                        -- ("Awakened padlocked") and the words run
+                        -- together as a single phrase.
                         local stateNote = ""
                         if power.state == "Hidden"
                             or (power.state or "") == "" then
-                            stateNote = " padlocked"
+                            stateNote = ", padlocked"
                         end
                         local entry = {
                             name      = power.displayName,
                             distance  = distance,
-                            distLabel = DistanceBand(distance),
                             stateNote = stateNote,
                         }
                         -- Multiple powers may round to the same
@@ -354,9 +343,8 @@ local function FormatNearbyPowers(
         local entry = entriesByHour[hour]
         if entry then
             parts[#parts + 1] = string.format(
-                "%d o'clock to %s, %s%s",
-                hour, entry.name,
-                entry.distLabel, entry.stateNote)
+                "%d o'clock to %s%s",
+                hour, entry.name, entry.stateNote)
         end
     end
     if #parts == 0 then return nil end
@@ -1389,6 +1377,12 @@ end
 --                              to interpret it for some default
 --                              behavior.
 local function OnTadpoleControllerInput(event)
+    -- BG3Access settings menu owns input while open.
+    local SettingsMenu = BG3Access.Client.SettingsMenu
+    if SettingsMenu and SettingsMenu.IsOpen
+        and SettingsMenu.IsOpen() then
+        return
+    end
     if not event or not event.Pressed then return end
     local buttonName = tostring(event.Button)
 
@@ -1443,6 +1437,12 @@ end
 -- on whatever it's hitting.  Throttled to ~1 read per 5 frames while
 -- the stick is held via stickReadPending.
 local function OnTadpoleAxisInput(event)
+    -- BG3Access settings menu owns input while open.
+    local SettingsMenu = BG3Access.Client.SettingsMenu
+    if SettingsMenu and SettingsMenu.IsOpen
+        and SettingsMenu.IsOpen() then
+        return
+    end
     if not event then return end
     local axisName = tostring(event.Axis)
     if not TADPOLE_STICK_AXES[axisName] then return end

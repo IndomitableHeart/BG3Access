@@ -54,6 +54,22 @@ BG3Access.Client = BG3Access.Client or {}
 local Log        = BG3Access.Client.Log
 local SpeechData = BG3Access.Client.SpeechData
 
+-- User-facing setting: HUD notification toasts (recipe learned, spell
+-- unlocked, region entered, journal updated, lockpick progress) can
+-- be silenced.  Stays at root (no category) because it doesn't
+-- naturally fit under Verbosity or GPS.
+if BG3Access.Client.Settings then
+    BG3Access.Client.Settings.RegisterDefault(
+        "notificationsEnabled", true, { true, false },
+        "Notification toasts")
+    -- Tier preset for the Global verbosity dial.  Notifications are
+    -- one-shot game-state changes (quest updated, recipe learned) --
+    -- important info, not chatter -- so they stay on at every tier.
+    BG3Access.Client.Settings.RegisterTierPresets(
+        "notificationsEnabled",
+        { brief = true, normal = true, verbose = true })
+end
+
 local NOTIFICATION_WIDGET_NAME = "Notification_c"
 
 --- ReadActiveTexts: BFS the Notification_c widget for currently
@@ -116,6 +132,13 @@ local spokenTexts = {}
 --- of the same notification announce again.
 --- @param snapshot table|nil  Unused -- driver is Ext.Events.Tick.
 local function HandleSnapshot(snapshot)
+    -- User setting: notification toasts can be silenced entirely.
+    -- We still run ReadActiveTexts implicitly to keep dedup state in
+    -- sync, but skip the speak path.  Cheap and avoids stale spoken-
+    -- text bookkeeping if the user re-enables mid-session.
+    local Settings = BG3Access.Client.Settings
+    local notificationsEnabled = not Settings or not Settings.Get
+        or Settings.Get("notificationsEnabled") ~= false
     local rawTexts = ReadActiveTexts()
     if not rawTexts or #rawTexts == 0 then
         spokenTexts = {}
@@ -135,11 +158,44 @@ local function HandleSnapshot(snapshot)
     -- as one phrase.  Queue mode preserves order without interrupting.
     -- Texts seen last tick AND still on screen this tick stay in the
     -- spoken set and don't re-announce.
+    --
+    -- Tutorial dedup: BG3Access.Client.TutorialClaimedTexts is
+    -- populated by the Tutorial handler in WorldUI.lua when it
+    -- extracts title/body/action from a Tutorial modal.  Both the
+    -- modal (ModalTutorial_c) and the toast (Notification_c) often
+    -- render the same text.  The Tutorial handler's screen-entry
+    -- speech is interrupt-tier (which would flush any queued toasts
+    -- anyway), so the toast version is redundant.  Skip claimed
+    -- texts here so the Tutorial handler's screen entry is the
+    -- single source for those.  Tutorial-only modals (no toast)
+    -- and toast-only notifications (no modal) are unaffected --
+    -- claims are scoped to whichever surface actually rendered.
+    local claimedTexts = BG3Access.Client.TutorialClaimedTexts or {}
     for _, text in ipairs(texts) do
         if not spokenTexts[text] then
             spokenTexts[text] = true
-            Log.Info("NOTIFICATION: " .. text)
-            SpeechData.Alert(text, "queue")
+            if claimedTexts[text] then
+                Log.Info("NOTIFICATION (suppressed, "
+                    .. "Tutorial claimed): " .. text)
+            elseif not notificationsEnabled then
+                Log.Info("NOTIFICATION (suppressed, "
+                    .. "setting disabled): " .. text)
+            else
+                Log.Info("NOTIFICATION: " .. text)
+                SpeechData.Alert(text, "queue")
+                -- Arm the speech-protection window so the next
+                -- widget-mount screen entry (Trade, Container, etc.)
+                -- doesn't interrupt the queued tutorial speech.  The
+                -- window is per-call refreshed so multi-part
+                -- announcements (title + body + dismiss) keep
+                -- extending the protection across the batch.  8s is
+                -- comfortably above the longest tutorial body length
+                -- in BG3 and well under any reasonable post-tutorial
+                -- gameplay flow.
+                if SpeechData.SetProtectionWindow then
+                    SpeechData.SetProtectionWindow(8000)
+                end
+            end
         end
     end
 end

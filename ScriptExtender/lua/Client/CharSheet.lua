@@ -77,6 +77,23 @@ local ABILITY_INDEX_TO_NAME = {
     [5] = "Charisma",
 }
 
+-- Expansion map for ability abbreviations rendered by the ability
+-- tab TextBlocks ("STR", "DEX", ...).  Used by the FormatAbilityFromAPI
+-- fallback path to emit the FULL ability name as the focused element's
+-- "name" core field -- both for consistency with the canonical API
+-- path AND so the ability tooltip's later "Strength" / "Dexterity"
+-- title gets value-deduped against the focus speech instead of
+-- double-announcing the same ability ("STR: 8" focus, then
+-- "Strength. ..." tooltip).
+local ABILITY_ABBREV_TO_NAME = {
+    STR = "Strength",
+    DEX = "Dexterity",
+    CON = "Constitution",
+    INT = "Intelligence",
+    WIS = "Wisdom",
+    CHA = "Charisma",
+}
+
 -- Component names used to find the active player character entity.
 local PLAYER_COMPONENTS = {"ClientControl", "IsPlayer", "PlayerController"}
 
@@ -393,7 +410,20 @@ local function FormatAbilityFromAPI(elemId, dcProps)
             local label = labels[pairIndex]
             local value = values[pairIndex]
             if label and value then
-                fallbackSpeech:AddProperty(label, value, "brief")
+                -- Recognize ability abbreviations and emit the full
+                -- name as core fields (name + value) instead of a
+                -- property.  This matches the API path's shape and
+                -- lets the subsequent ability tooltip's "Strength" /
+                -- "Dexterity" / etc. title get value-deduped against
+                -- "name" in spokenRoles.  Non-ability rows keep the
+                -- previous property-based "Label: Value" shape.
+                local fullAbilityName = ABILITY_ABBREV_TO_NAME[label]
+                if fullAbilityName then
+                    fallbackSpeech:Add("name", fullAbilityName, "brief")
+                    fallbackSpeech:Add("value", value, "brief")
+                else
+                    fallbackSpeech:AddProperty(label, value, "brief")
+                end
             elseif label then
                 -- Standalone label (no matching value) goes as a
                 -- "name" core field so it speaks as a bare word.
@@ -1435,12 +1465,25 @@ local function FormatVMAbilityTooltip(tooltipTexts, spokenRoles)
 
     speechData:RelabelProperty("Property", "Effect")
 
-    -- (3) Strip "Saving throws:" and "Modifier:" labels by
-    -- removing then re-adding with empty label (bare render per
-    -- SpeechData.lua:494-503).  Empty label loses PROPERTY_ORDER
-    -- slot, so insertion order rules among bare entries: re-add
-    -- saving-throws first, modifier second.  Breakdown stays at
-    -- priority 100 and sorts before both regardless.
+    -- (3) Replace the two bonus properties with clean-labelled
+    -- versions whose values are just the signed bonus.  The
+    -- original Larian shape was:
+    --   * "Saving throws" label, value "+5 to Saving Throws"
+    --   * "Modifier" label, value "+3 to Dexterity Checks"
+    -- Both values bake the descriptive context into the text,
+    -- making the original labels read as duplicated when the
+    -- value gets concatenated ("Saving throws: +5 to Saving
+    -- Throws").  Strip the trailing "to <context>" clause and
+    -- relabel to "Save bonus" / "Check bonus" so the value is
+    -- terse ("+5") and the label carries the context naturally
+    -- without duplication.  This also makes the speakBonus
+    -- toggle work via the standard label-based gate in
+    -- PROPERTY_TOGGLE_SETTINGS (no source-level handler check
+    -- needed).
+    local function StripBonusSuffix(value)
+        if not value then return nil end
+        return value:gsub("%s+to%s+.+$", "")
+    end
     local savingThrowsValue = nil
     local modifierValue = nil
     for _, prop in ipairs(speechData.properties) do
@@ -1453,16 +1496,45 @@ local function FormatVMAbilityTooltip(tooltipTexts, spokenRoles)
     speechData:RemoveProperty("Saving throws")
     speechData:RemoveProperty("Modifier")
     if savingThrowsValue then
-        speechData:AddProperty("", savingThrowsValue, "normal")
+        speechData:AddProperty("Save bonus",
+            StripBonusSuffix(savingThrowsValue), "normal")
     end
     if modifierValue then
-        speechData:AddProperty("", modifierValue, "normal")
+        speechData:AddProperty("Check bonus",
+            StripBonusSuffix(modifierValue), "normal")
     end
 
     -- (1) Drop AbilityModifiersLabel header.  Only set on
     -- VMAbility tooltips (see TOOLTIP_ROLE_MAP), so this is safe
     -- in the shared formatter.
     speechData:RemoveCoreField("sectionLabel")
+
+    -- (4) Drop the tooltip's "name" core field.  Two ways it can
+    -- arrive here:
+    --   (a) TitleName x:Name TextBlock holding the ability /
+    --       skill / proficiency name -- value-aware cross-off
+    --       against the focus speech's "name" usually suppresses
+    --       this, but the tooltip wave can fire BEFORE the focus
+    --       Speak finishes recording roles (race condition on
+    --       focus-arrival ticks) and slip through.
+    --   (b) The ability tooltip template (Tooltips.xaml line 5661)
+    --       has an UNNAMED subtitle TextBlock inside the TitleArea
+    --       StackPanel with translated text "Ability" (or
+    --       similar generic label).  CollectTooltipEntries
+    --       promotes the nearest named ancestor as the role, so
+    --       it gets role="TitleArea" -- which TOOLTIP_ROLE_MAP
+    --       maps to the "name" core field.  The text "Ability"
+    --       doesn't equal any prior spoken name, so cross-off
+    --       lets it through, producing a tooltip output of just
+    --       "Ability" at brief tier.
+    -- For all three DC types the focus speech ALWAYS names the
+    -- element (FormatAbilityFromAPI for VMAbility,
+    -- FormatStatFromTextBlocks for VMSkill / VMEquipmentProficiency
+    -- via the panel handler's Add("name", ...) at line ~1509),
+    -- so the tooltip's name is redundant either way.  Removing
+    -- it unconditionally cleans up both the race-condition case
+    -- and the subtitle-promotion case with one rule.
+    speechData:RemoveCoreField("name")
 
     SpeechData.ParseValueDescriptionBreakdown(
         speechData, tooltipTexts)
@@ -1474,6 +1546,31 @@ end
 --- with no special handling beyond the universal role mapping.
 local function FormatGenericTooltip(tooltipTexts, spokenRoles)
     return SpeechData.FromTooltip(tooltipTexts, spokenRoles)
+end
+
+--- VMInterrupt (Reactions tab entries): generic mapping plus drop
+--- the redundant "Category" property.  The interrupt tooltip's
+--- TitleArea contains a subtitleText TextBlock bound to a translated
+--- string that always renders as "Reaction" (the localized name for
+--- the interrupt action category).  TOOLTIP_ROLE_MAP maps subtitleText
+--- to a Category property -- useful for items where "Light Armour" /
+--- "Two-Handed" disambiguate the item type, but pure noise for
+--- interrupts because:
+---   (1) Every entry in the Reactions tab is a reaction.  The tab
+---       itself announces "Reactions" on entry, so per-row repetition
+---       restates what the user already knows.
+---   (2) Costs is its own footer ("Cost: Reaction") which carries
+---       the same information when costs aren't trivial.
+---   (3) Per CORE_FIELD_LIST, properties slot between
+---       technicalDescription and description / additionalDescription
+---       -- so "Category: Reaction" literally cuts the description
+---       in half for interrupts that have a continuation paragraph
+---       (Sneak Attack's "You can also Sneak Attack targets...").
+--- Removing the property cleans up all three issues with one rule.
+local function FormatVMInterruptTooltip(tooltipTexts, spokenRoles)
+    local speechData = SpeechData.FromTooltip(tooltipTexts, spokenRoles)
+    speechData:RemoveProperty("Category")
+    return speechData
 end
 
 --- Dispatch table: focused DC type -> formatter function.  Adding
@@ -1495,11 +1592,10 @@ local TOOLTIP_FORMATTERS = {
     -- VMInterrupt (Reactions tab entries): the focused widget shows
     -- state via image swaps, not text -- the tri-state mode lives
     -- in the tooltip's ReactionStatusText (mapped to the state
-    -- core field via TOOLTIP_ROLE_MAP).  FromTooltip's spokenRoles
-    -- cross-off suppresses the duplicate name / description that
-    -- the item read already spoke; only the state (and any new
-    -- info) survives the delta when the user toggles A or X.
-    ["ls.VMInterrupt"]             = FormatGenericTooltip,
+    -- core field via TOOLTIP_ROLE_MAP).  The interrupt formatter
+    -- adds: drop the "Category: Reaction" property that is universally
+    -- redundant in this tab.  See FormatVMInterruptTooltip docstring.
+    ["ls.VMInterrupt"]             = FormatVMInterruptTooltip,
 }
 
 -- ============================================================================
@@ -1531,16 +1627,9 @@ local function CreateCharacterPanelHandler(createPanelHandler)
 
             local isOptionButton = elemId:match("Button::(%w+Option)")
 
-            -- Widget navigation fake elements are actually empty
-            -- equipment/inventory slots.  A sighted check confirmed
-            -- these are gaps in the slot grid, not pure navigation
-            -- scaffolding.  Announce them so blind users know they've
-            -- landed on a real (but empty) slot rather than thinking
-            -- the mod has gone silent.
-            if elemId:find("WidgetNavigationPrimaryFakeElement")
-                or elemId:find("WidgetNavigationSecondaryFakeElement") then
-                return "Empty slot", nil, nil
-            end
+            -- (LSGrid empty-cell phantoms now handled universally by
+            -- Helpers.CleanElementName -- the factory's generic path
+            -- speaks "Empty slot" before reaching here.)
 
             -- Tab ListBoxItem: suppress as item.
             if elemId:find("^ListBoxItem::Tab") then
@@ -1710,19 +1799,37 @@ local function CreateCharacterPanelHandler(createPanelHandler)
 
             -- Reactions tab entries (Opportunity Attack, Sneak Attack,
             -- Hellish Rebuke, etc.) -- VMInterrupt focused elements.
+            -- Focus speech reads ONLY the name; description, state
+            -- (toggle mode), and properties (Category, Cost) all
+            -- arrive in the tooltip wave.  Avoids the field-mismatch
+            -- between focus's "description" and tooltip's
+            -- "technicalDescription" (the interrupt tooltip's
+            -- SpellDescriptionTemplate puts its description text in
+            -- a TextBlock x:Name="TechnicalDescription", which maps
+            -- to the technicalDescription core field -- a separate
+            -- slot kept distinct from description so items' flavor
+            -- + tech text don't collide).  When the focus speech put
+            -- the description into "description", value-aware
+            -- cross-off couldn't catch the tooltip's technicalDescription
+            -- copy of the same sentence, and the user heard it twice.
             -- State (Will not trigger / Trigger automatically / Ask)
-            -- lives in the tooltip's ReactionStatusText, NOT in the
-            -- focused widget itself: per Reactions_c.xaml the entry
-            -- shows state via image swaps (IconReactionOn / Off /
-            -- Ask), and there is no state TextBlock inside the
-            -- ContentControl::FocusableContent subtree.  So a
-            -- customItemFn read from focused-element data alone
-            -- can't surface state.  The proper hook is the tooltip
-            -- pipeline -- see customTooltipFn below.  Fall through
-            -- here so the default item read still produces name +
-            -- description; tooltip handler enriches with state.
+            -- still has no representation in the focused widget --
+            -- per Reactions_c.xaml the entry shows it via image swaps
+            -- (IconReactionOn / Off / Ask).  The tooltip wave delivers
+            -- it via ReactionStatusText -> "state" core field.
             if dcType == "ls.VMInterrupt" then
-                return nil
+                local interruptName = nil
+                if dcProps and dcProps.Name then
+                    interruptName = ResolveTranslatedStringValue(dcProps.Name)
+                end
+                if not interruptName or interruptName == "" then
+                    -- Name didn't resolve; fall back to default
+                    -- extraction so the row isn't silent.
+                    return nil
+                end
+                local interruptSpeech = SpeechData.Create()
+                interruptSpeech:Add("name", interruptName, "brief")
+                return interruptSpeech
             end
 
             -- Expander buttons: section headers.
@@ -1835,6 +1942,33 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                         return charSpeech
                     end
                 end
+                -- Entity object cell.  Picked up when a creature corpse
+                -- has been collected into inventory (the slot is rendered
+                -- as ls.LSEntityObject wrapping the entity's visual cell,
+                -- with dcType "ls.Character" because the underlying entity
+                -- IS a character).  dcProps.Name is readable via direct
+                -- indexed access even though it doesn't appear in pairs()
+                -- enumeration -- same Noesis DC pattern documented in the
+                -- JournalMap investigation.  Return the name as focus
+                -- speech; the tooltip pipeline appends the creature stats
+                -- (Level / Status: Dead / HP / Movement) right after.
+                -- Without this branch the focus falls through to the
+                -- catch-all below, returns "", and never calls :Speak --
+                -- so neither the name nor the interrupt of the previous
+                -- announcement fires.
+                if elemType:find("LSEntityObject") and dcProps then
+                    local entityName = nil
+                    pcall(function()
+                        entityName = dcProps.Name or dcProps.DisplayName
+                            or dcProps.CharacterName
+                    end)
+                    if entityName and entityName ~= "" then
+                        local entitySpeech = SpeechData.Create()
+                        entitySpeech:Add("name", entityName, "brief")
+                        return entitySpeech
+                    end
+                end
+
                 -- Other ls.Character elements.
                 local charStatSpeech = FormatStatFromTextBlocks()
                 if charStatSpeech then
@@ -1864,6 +1998,38 @@ local function CreateCharacterPanelHandler(createPanelHandler)
                                    handlerState)
             if not tooltipTexts or #tooltipTexts == 0 then return nil end
             if not focusedDCType then return nil end
+
+            -- LSEntityObject creature/corpse tooltip: the entity name
+            -- TextBlock comes through with role="root" (a generic role
+            -- the C++ extractor assigns when the top-level TextBlock
+            -- has no x:Name).  But "root" is ALREADY claimed in
+            -- TOOLTIP_ROLE_MAP for the description case on inspect-side
+            -- tooltips (StatusTooltip, VMActionResourceTooltip, etc.)
+            -- -- can't remap globally without breaking those.  So
+            -- strip the conflicting root-name entry HERE, only when
+            -- focused DC is ls.Character (the corpse case) and only
+            -- when the text matches what we already spoke as the name.
+            -- After strip, FromTooltip processes the remaining entries
+            -- normally and the trailing duplicate name disappears.
+            if focusedDCType == "ls.Character"
+                and handlerState
+                and handlerState.spokenRoles
+                and handlerState.spokenRoles.name then
+                local spokenName = Helpers.NormalizeForCompare(
+                    handlerState.spokenRoles.name)
+                local filtered = {}
+                for _, entry in ipairs(tooltipTexts) do
+                    local entryRole = entry.role or ""
+                    local entryText = entry.text or ""
+                    local shouldStrip = entryRole == "root"
+                        and Helpers.NormalizeForCompare(entryText)
+                            == spokenName
+                    if not shouldStrip then
+                        filtered[#filtered + 1] = entry
+                    end
+                end
+                tooltipTexts = filtered
+            end
 
             -- Empty equipment slot: handler already spoke "slot:
             -- Empty", no tooltip content to append.

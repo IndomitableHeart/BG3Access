@@ -29,6 +29,7 @@ local Cutscene   = BG3Access.Client.Cutscene
 local CharSheet  = BG3Access.Client.CharSheet
 local SpellBook  = BG3Access.Client.SpellBook
 
+
 -- ============================================================================
 -- Constants
 -- ============================================================================
@@ -446,18 +447,23 @@ local function SpeakRadialSlot(slotData)
     -- Track title for inspect panel filtering (separate pipeline).
     lastSpokenRadialTitle = cleanTitle
 
-    -- Description: speak when slotData carries one.  The earlier
-    -- design skipped it under the assumption "the tooltip popup
-    -- carries it, so adding it here would duplicate."  That holds
-    -- ONLY for the action radial (RB / VMHotBar) where Larian shows
-    -- a separate Tooltip popup with the spell/item description.
-    -- The shortcuts menu (RT) renders its description inline in the
-    -- radial widget itself -- there's no follow-up tooltip popup --
-    -- so without this, shortcut descriptions never speak.  Speak
-    -- the description; on the action radial, spokenRoles dedup
-    -- (seeded by this :Speak) blocks the tooltip wave from re-
-    -- speaking the same description text.
-    if slotData.description and slotData.description ~= "" then
+    -- Description is slot-type specific:
+    --
+    --   * HotBar (action radial -- RB) -- the action's tooltip
+    --     popup carries the description.  The tooltip pipeline
+    --     (DispatchTooltip -> FromTooltip below) is the
+    --     canonical place that detail reaches the user.  Adding
+    --     it here would duplicate (and the duplication was
+    --     awkward because the slot speech labels it under
+    --     "description" while the tooltip labels it under
+    --     "technicalDescription", defeating the value-based
+    --     dedup).
+    --   * Shortcuts menu (RT) and other non-HotBar slot types
+    --     render the description inline in the radial widget --
+    --     no tooltip popup follows.  Slot speech is the ONLY
+    --     place this text can come through.
+    if slotData.slotType ~= "HotBar"
+        and slotData.description and slotData.description ~= "" then
         local cleanDesc = Helpers.StripMarkupTags(slotData.description)
         if cleanDesc and cleanDesc ~= "" then
             speechData:Add("description", cleanDesc, "normal")
@@ -1104,6 +1110,29 @@ local function CreatePanelHandler(config)
         local isValueOnly = not isScreenEntry and not isItemNav
             and not isCarouselOnly and snapshot.valueChanged
 
+        -- When the FIRST item-nav after a screen entry fires, pass
+        -- userInitiated=false so its speech APPENDS to the screen
+        -- entry text instead of cutting it off.  Screen entry is
+        -- often triggered by a widget event one tick before the
+        -- auto-focus on the first item arrives (Camp grid is the
+        -- canonical case: panel loads -> screen entry speaks hint
+        -- -> next tick LSGrid auto-focuses Supply Pack -> item nav
+        -- would interrupt the hint mid-sentence).  Flag is one-shot:
+        -- set after screen-entry-only speech, consumed by the very
+        -- next item-nav / value-only / carousel snapshot, then
+        -- cleared.  Subsequent navigation interrupts normally so
+        -- the user gets responsive feedback as they actively browse.
+        local appendForScreenEntryFollow = false
+        if (isItemNav or isCarouselOnly or isValueOnly)
+            and handlerState.screenEntryJustSpoke then
+            appendForScreenEntryFollow = true
+            handlerState.screenEntryJustSpoke = false
+        end
+        local effectiveUserInitiated = userInitiated
+        if appendForScreenEntryFollow then
+            effectiveUserInitiated = false
+        end
+
         -- Widget text update: DC property changed (e.g., status text
         -- update) or dialog appeared without focus change.
         if not isScreenEntry and not isItemNav and widgetEvent then
@@ -1141,7 +1170,8 @@ local function CreatePanelHandler(config)
             local carouselValue = snapshot.inlineCarouselValue
             local carouselSpeech = SpeechData.Create()
             carouselSpeech:Add("name", carouselValue, "brief")
-            carouselSpeech:Speak(handlerState, false, nil, userInitiated)
+            carouselSpeech:Speak(handlerState, false, nil,
+                effectiveUserInitiated)
             return
         end
 
@@ -1164,7 +1194,7 @@ local function CreatePanelHandler(config)
                     handlerState.previousSpeechData = customName
                     customName:SpeakDelta(handlerState,
                         previousSpeechData,
-                        false, nil, true,
+                        false, nil, effectiveUserInitiated,
                         "VALUE [" .. config.name .. "]")
                     return
                 end
@@ -1174,7 +1204,7 @@ local function CreatePanelHandler(config)
                         local valueSpeech = SpeechData.Create()
                         valueSpeech:Add("value", customName, "brief")
                         valueSpeech:Speak(handlerState, false, nil,
-                            userInitiated)
+                            effectiveUserInitiated)
                     end
                     return
                 end
@@ -1186,7 +1216,8 @@ local function CreatePanelHandler(config)
                 and valueText ~= handlerState.lastSpokenFullText then
                 local valueSpeech = SpeechData.Create()
                 valueSpeech:Add("value", valueText, "brief")
-                valueSpeech:Speak(handlerState, false, nil, userInitiated)
+                valueSpeech:Speak(handlerState, false, nil,
+                    effectiveUserInitiated)
             end
             return
         end
@@ -1443,7 +1474,7 @@ local function CreatePanelHandler(config)
                 handlerState.previousSpeechData = customSpeechData
                 RecordSpokenRoles(customSpeechData)
                 customSpeechData:Speak(handlerState, isScreenEntry, nil,
-                    userInitiated)
+                    effectiveUserInitiated)
             end
             return
         end
@@ -1511,7 +1542,17 @@ local function CreatePanelHandler(config)
         handlerState.previousSpeechData = speechData
         -- Record which fields we spoke (for tooltip cross-off).
         RecordSpokenRoles(speechData)
-        speechData:Speak(handlerState, isScreenEntry, nil, userInitiated)
+        speechData:Speak(handlerState, isScreenEntry, nil,
+            effectiveUserInitiated)
+
+        -- If this was a screen entry that didn't include the focused
+        -- item (no name set), set screenEntryJustSpoke so the next
+        -- item-nav tick (auto-focus on the first item) appends
+        -- instead of cutting the hint off mid-sentence.  See the
+        -- block at HandleSnapshot top for the consumption side.
+        if isScreenEntry and not itemName then
+            handlerState.screenEntryJustSpoke = true
+        end
     end
 
     -- -----------------------------------------------------------------
@@ -1555,13 +1596,21 @@ local function CreatePanelHandler(config)
     --- ResetNavigation: partial reset for widget root change within
     --- the same handler (e.g., switching tabs in inventory).
     --- Preserves tabHintSpoken so the hint doesn't re-speak.
+    ---
+    --- Does NOT clear screenEntryOverrides OR screenEntryJustSpoke.
+    --- Both are forward-looking state set during screen entry that
+    --- the very next snapshot (item-nav or screen entry) needs to
+    --- consume.  ResetNavigation runs between screen entry and
+    --- first focus when the new widget root is detected --
+    --- clearing either would wipe state set milliseconds earlier
+    --- and defeat the design.  HandleSnapshot owns the one-shot
+    --- consumption of both.  ResetState (full reset on handler
+    --- deactivation) clears them properly.
     local function ResetNavigation()
         handlerState.currentTabContext = nil
         handlerState.lastSpokenTitle = nil
         handlerState.lastSpokenName = nil
         handlerState.previousSpeechData = nil
-        handlerState.screenEntryJustSpoke = false
-        handlerState.screenEntryOverrides = SpeechData.Create()
     end
 
     --- ResetHint: reset tabHintSpoken so the hint speaks on next visit.
@@ -1746,11 +1795,56 @@ local CharacterPanelHandler = CharSheet.CreateCharacterPanelHandler(
 local SpellBookHandler = SpellBook.CreateSpellBookHandler(
     CreatePanelHandler)
 
--- Trading / bartering dual inventory.
+-- Trading / bartering dual inventory.  Each party member's inventory
+-- is wrapped in an Expander whose header is an LSToggleButton named
+-- "ExpanderButton".  The header renders a CharacterName TextBlock + a
+-- WeightDisplayControl ("22/240").  The factory's default extraction
+-- yields just the bare elemName ("Expander"), which tells the user
+-- nothing -- they can't tell whose section they're on.  Same fix
+-- pattern as CharSheet's inventory expanders: when focus lands on an
+-- ExpanderButton, ReadFocusedTextBlocks to recover the rendered
+-- header text (name + weight) that the bound TranslatedString
+-- can't be read directly through dcProps.
 local TradeHandler = CreatePanelHandler({
     name = "Trade",
     hint = "Use bumpers to switch between inventories."
         .. " Up and down to navigate items.",
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local elemId = focusedElement.elemId or ""
+        if not elemId:find("ExpanderButton") then return nil end
+        local readOk, headerTexts = pcall(
+            Ext.UI.ReadFocusedTextBlocks)
+        if not readOk or not headerTexts or #headerTexts == 0 then
+            return nil
+        end
+        -- headerTexts[1] = "Tav" / "Shadowheart" (CharacterName)
+        -- headerTexts[2..] = weight components ("22", "/", "240")
+        local headerName = Helpers.StripMarkupTags(headerTexts[1])
+        if not headerName or headerName == "" then return nil end
+        local speechData = SpeechData.Create()
+        speechData:Add("name", headerName, "brief")
+        -- Reassemble the weight pieces into a single "N of M"
+        -- phrase so it reads as a unit rather than three
+        -- disconnected tokens.  Skip the bare "/" separator
+        -- TextBlock and any blanks.
+        local weightParts = {}
+        for textIndex = 2, #headerTexts do
+            local cleaned = Helpers.StripMarkupTags(
+                headerTexts[textIndex])
+            if cleaned and cleaned ~= "" and cleaned ~= "/" then
+                weightParts[#weightParts + 1] = cleaned
+            end
+        end
+        if #weightParts >= 2 then
+            speechData:AddProperty("Weight",
+                weightParts[1] .. " of " .. weightParts[2],
+                "brief")
+        elseif #weightParts == 1 then
+            speechData:AddProperty("Weight",
+                weightParts[1], "brief")
+        end
+        return speechData
+    end,
 })
 
 -- Inspect character or item details.
@@ -2124,21 +2218,10 @@ local ContainerHandler = CreatePanelHandler({
             end
         end
     end,
-    customItemFn = function(focusedElement, handlerState, snapshot)
-        -- Widget navigation fake elements are empty slots in the grid
-        -- (same pattern as CharSheet inventory).  Announce them so the
-        -- user knows they landed on a real slot that happens to be
-        -- empty, rather than thinking the mod has gone silent.
-        local elemId = focusedElement.elemId or ""
-        if elemId:find("WidgetNavigationPrimaryFakeElement")
-            or elemId:find("WidgetNavigationSecondaryFakeElement") then
-            return "Empty slot", nil, nil
-        end
-        -- Real item: fall through to the generic pipeline.  On screen
-        -- entry (selectionChanged), this means the initial focused
-        -- item is spoken right after the container title and hint.
-        return nil
-    end,
+    -- (No customItemFn needed -- LSGrid focus phantoms are now
+    -- handled universally by Helpers.CleanElementName which speaks
+    -- "Empty slot" for any "WidgetNavigation*FakeElement" border.
+    -- Real items fall through to the factory's generic pipeline.)
 })
 
 -- Dice roll UI for skill checks and saving throws.
@@ -2174,33 +2257,31 @@ local function DumpActiveRollDcProps(dcProps, rollState)
             .. "]: dcProps is nil")
         return
     end
-    local candidateFields = {
-        "FinalResult", "NaturalRoll", "ResultNumber",
-        "RolledNumber", "DiceResult", "Result",
-        "RollTotal", "Natural",
-    }
-    for _, fieldName in ipairs(candidateFields) do
-        local fieldValue = dcProps[fieldName]
-        if fieldValue ~= nil then
-            Log.Info("ACTIVE ROLL DC dump [" .. tostring(rollState)
-                .. "]: " .. fieldName
-                .. "=" .. tostring(fieldValue))
-        end
+    -- Iterate EVERY scalar field on dcProps so we catch fields whose
+    -- names we don't know yet (e.g., reroll-state signals, total/bonus
+    -- splits).  We log strings, numbers, and booleans; sub-tables get
+    -- recursed one level (enough to expose Roll / Boost / similar
+    -- nested fields).
+    local function isScalar(value)
+        local valueType = type(value)
+        return valueType == "string"
+            or valueType == "number"
+            or valueType == "boolean"
     end
-    -- Also inspect Roll sub-table if present.
-    local rollSub = dcProps.Roll
-    if rollSub and type(rollSub) == "table" then
-        local subFields = {
-            "RolledNumber", "NaturalRoll", "ResultNumber",
-            "FinalResult", "DifficultyCheck",
-        }
-        for _, fieldName in ipairs(subFields) do
-            local fieldValue = rollSub[fieldName]
-            if fieldValue ~= nil then
-                Log.Info("ACTIVE ROLL DC dump ["
-                    .. tostring(rollState) .. "]: Roll."
-                    .. fieldName .. "="
-                    .. tostring(fieldValue))
+    for fieldName, fieldValue in pairs(dcProps) do
+        if isScalar(fieldValue) then
+            Log.Info("ACTIVE ROLL DC dump [" .. tostring(rollState)
+                .. "]: " .. tostring(fieldName)
+                .. "=" .. tostring(fieldValue))
+        elseif type(fieldValue) == "table" then
+            for subFieldName, subFieldValue in pairs(fieldValue) do
+                if isScalar(subFieldValue) then
+                    Log.Info("ACTIVE ROLL DC dump ["
+                        .. tostring(rollState) .. "]: "
+                        .. tostring(fieldName) .. "."
+                        .. tostring(subFieldName) .. "="
+                        .. tostring(subFieldValue))
+                end
             end
         end
     end
@@ -3019,10 +3100,348 @@ local AlchemyHandler = CreatePanelHandler({
     end,
 })
 
--- Item combination crafting.
+-- Item combination crafting (DCCombine).  BG3 stages the combine in
+-- ONE slot only: dcProps.BaseItem holds the source item (a dye, a
+-- quest fragment, etc.).  The card-slot view at the top of the panel
+-- previews "if you picked the currently focused inventory item, this
+-- would be the pair" -- it's not a separate selection.  Pressing A on
+-- an inventory item directly initiates the combine.
+--
+-- Driving fields on the DCCombine DataContext:
+--   BaseItem.Name       -- source item being combined
+--   ResultItem.Name     -- preview of the combination result, populated
+--                          when ResultItem.Count > 0 (valid recipe)
+--   CurrentState        -- "Preparing" / "Working" / "Ready" / "Success" / "Fail"
+--   FailReason          -- "None" when valid, otherwise one of:
+--                          Invalid, TooFar, NotAllFilled, Duplicate,
+--                          BaseNotFound, IngredientNotFound,
+--                          Interrupted, NotEmptySlot,
+--                          IngredientAlreadyAdded
+--   Slots               -- how many slots are filled
+--
+-- onWidgetAdded fires:
+--   1. On initial panel open (first event): screen-entry overrides
+--      (title + base item + result preview + action hint).
+--   2. On subsequent INPC mutations (state transitions, result
+--      changes): incremental announcements via SpeechData.Alert so
+--      the player hears state shifts without re-announcing the
+--      whole panel.
+
+-- LocaString handles pulled from Combine_c.xaml.  Resolving these at
+-- runtime via Helpers.GetTranslatedStringIfHandle gives us Larian's
+-- official translated text (matches the on-screen FeedbackLabel) and
+-- means the speech tracks the player's chosen language rather than
+-- being stuck in our hardcoded English.
+local COMBINE_LOCA_HANDLES = {
+    -- XAML line 95: containerName TextBlock "Combine Items"
+    panelTitle      = "h02ae15ceg643fg41cagadc2g6a4d624daaa2",
+    -- XAML line 431: CurrentState=Working feedback ("Combining...")
+    stateWorking    = "h3ce43cb2gfecdg4a73g88feg68817006cd8d",
+    -- XAML line 421: CurrentState=Success feedback (parameterized with
+    -- ResultItem.Name -- template uses [1] placeholder; we substitute
+    -- it ourselves at speech time).
+    stateSuccess    = "h95958a84g3e7dg4615ga30cg345d06df7cb9",
+}
+
+-- FailReason -> LocaString handle.  Each maps to a different on-screen
+-- feedback message per XAML lines 445-480.
+local COMBINE_FAIL_LOCA_HANDLES = {
+    Invalid                = "h47f58fa7g6e37g42fag8408gd89ae7856b9d",
+    TooFar                 = "h1371c0f2g99ccg47a3g8012g9c240aec2b50",
+    NotAllFilled           = "h2a223e63g1953g4a41gb631gfe287b044889",
+    Duplicate              = "h85a8d808g354ag4709g8dbfg39437b3403e7",
+    BaseNotFound           = "h84799792gde2eg4c66g8a6bgc6ae05feaa02",
+    IngredientNotFound     = "h90ce0538g95a1g4d73gb5c5g54a4dae1c4e9",
+    Interrupted            = "he3d62e55g4ed3g49fagb679ge4d9ef4a50b8",
+    NotEmptySlot           = "he1c084aag96c0g4716gb47cge9f7e6e5b69d",
+    IngredientAlreadyAdded = "h5a6c11e8gf30eg4543g8cb4ge288199d523d",
+}
+
+--- Resolve a Combine LocaString handle to Larian's translated text,
+--- with optional [1] parameter substitution (used by the Success
+--- template which interpolates ResultItem.Name).  Returns nil if the
+--- handle doesn't resolve (e.g., Loca API unavailable) OR if the
+--- template requires a parameter we don't have, so callers can fall
+--- back to their hardcoded English rather than speaking a raw
+--- handle or a literal "[1]" to the user.
+local function ResolveCombineLoca(handle, paramValue)
+    if not handle or handle == "" then return nil end
+    if not BG3Access.Client.Helpers
+        or not BG3Access.Client.Helpers.GetTranslatedStringIfHandle then
+        return nil
+    end
+    local resolved = BG3Access.Client.Helpers
+        .GetTranslatedStringIfHandle(handle)
+    if not resolved or resolved == handle then return nil end
+    -- Strip Larian's inline markup (e.g., <hl>...</hl> highlight
+    -- spans on parameter substitutions).  TTS doesn't render
+    -- markup and would speak it literally as "less than h l
+    -- greater than" without this.
+    resolved = resolved:gsub("</?[%w_]+>", "")
+    -- Substitute [1] with paramValue when we have one.  Larian's
+    -- parameterized templates use [1], [2], ... for placeholders.
+    if paramValue and paramValue ~= "" then
+        resolved = resolved:gsub("%[1%]", paramValue)
+    end
+    -- If the template still contains an unsubstituted placeholder,
+    -- the caller's data is missing -- bail so they fall back to a
+    -- hardcoded message rather than speaking "[1]" to the user.
+    if resolved:find("%[%d+%]") then return nil end
+    return resolved
+end
+
 local CombineHandler = CreatePanelHandler({
     name = "Combine",
     hint = false,
+    onWidgetAdded = function(widgetData, handlerState)
+        -- TWO sources to read:
+        --
+        --   widgetData.dcProps -- C++ side pre-resolves TranslatedString
+        --     handles to their localized text, so BaseItem.Name comes
+        --     through as "Cobalt Dye" rather than the raw handle
+        --     "h3108c778...".  But it's only populated on the INITIAL
+        --     widgetAdded fire; subsequent fires arrive with an empty
+        --     snapshot.  Cache the resolved item identities here on
+        --     fires that have them.
+        --
+        --   liveDc (via FindNameInWidget) -- always fresh, but
+        --     TranslatedString.Name comes back as the raw handle.
+        --     Used for scalar state fields (CurrentState, FailReason)
+        --     where translation doesn't apply.
+        local snapshotProps = widgetData and widgetData.dcProps
+        if snapshotProps and type(snapshotProps.BaseItem) == "table" then
+            local snapshotBase = snapshotProps.BaseItem
+            if snapshotBase.Name and snapshotBase.Name ~= ""
+                and not snapshotBase.Name:match("^h%x+g") then
+                handlerState.cachedBaseItemName = snapshotBase.Name
+            end
+            if snapshotBase.EntityUUID then
+                handlerState.baseItemEntityUUID = snapshotBase.EntityUUID
+            end
+        end
+        if snapshotProps and type(snapshotProps.ResultItem) == "table" then
+            local snapshotResult = snapshotProps.ResultItem
+            if snapshotResult.Name and snapshotResult.Name ~= ""
+                and not snapshotResult.Name:match("^h%x+g") then
+                handlerState.cachedResultItemName = snapshotResult.Name
+            end
+        end
+
+        local findOk, combineElem = pcall(
+            Ext.UI.FindNameInWidget, "Combine_c")
+        if not findOk or not combineElem then return end
+
+        local resultCount = 0
+        local currentState = ""
+        local failReason = "None"
+        pcall(function()
+            local liveDc = combineElem.DataContext
+            if not liveDc then return end
+            local resultItem = liveDc.ResultItem
+            if resultItem then
+                resultCount = tonumber(resultItem.Count) or 0
+            end
+            local liveState = liveDc.CurrentState
+            if liveState ~= nil then
+                currentState = tostring(liveState)
+            end
+            local liveFail = liveDc.FailReason
+            if liveFail ~= nil then
+                failReason = tostring(liveFail)
+            end
+        end)
+
+        local baseItemName = handlerState.cachedBaseItemName
+        local resultItemName = handlerState.cachedResultItemName
+        local hasValidResult = resultCount > 0
+            and resultItemName and resultItemName ~= ""
+
+        if not handlerState.entrySpoken then
+            -- First fire: stash screen-entry overrides for the
+            -- factory's screen-entry pipeline.
+            handlerState.entrySpoken = true
+            handlerState.lastBaseItemName = baseItemName
+            handlerState.lastResultItemName = resultItemName
+            handlerState.lastCurrentState = currentState
+            handlerState.lastFailReason = failReason
+            -- Resolved Larian text for the panel title -- matches
+            -- the on-screen containerName TextBlock instead of our
+            -- own hardcoded English.
+            local panelTitle = ResolveCombineLoca(
+                COMBINE_LOCA_HANDLES.panelTitle) or "Combine Items"
+            local entryParts = { panelTitle }
+            if baseItemName and baseItemName ~= "" then
+                entryParts[#entryParts + 1] =
+                    "Combining " .. baseItemName
+            end
+            if hasValidResult then
+                entryParts[#entryParts + 1] =
+                    "Result: " .. resultItemName
+            end
+            handlerState.screenEntryOverrides:Add("title",
+                table.concat(entryParts, ". "), "brief")
+            handlerState.screenEntryOverrides:Add("navigationHint",
+                "Y to combine. A to add item. B to close.", "brief")
+            return
+        end
+
+        -- Subsequent fires: announce diffs via Alert.  Use queue mode
+        -- so state announcements don't cut off the focused-item
+        -- speech from the factory's item-nav pipeline.
+        local diffParts = {}
+        if baseItemName ~= handlerState.lastBaseItemName then
+            handlerState.lastBaseItemName = baseItemName
+            if baseItemName and baseItemName ~= "" then
+                diffParts[#diffParts + 1] =
+                    "Now combining " .. baseItemName
+            end
+        end
+        if resultItemName ~= handlerState.lastResultItemName then
+            handlerState.lastResultItemName = resultItemName
+            if hasValidResult then
+                diffParts[#diffParts + 1] =
+                    "Result: " .. resultItemName
+            end
+        end
+        if currentState ~= handlerState.lastCurrentState then
+            local previous = handlerState.lastCurrentState
+            handlerState.lastCurrentState = currentState
+            -- CurrentState progression per Combine_c.xaml triggers:
+            --   "Preparing" -- mid-edit, Y button disabled (silent)
+            --   "Ready"     -- valid combination loaded, Y enabled
+            --                  (sighted players see Y light up here)
+            --   "Working"   -- combination animation playing
+            --   "Success"   -- combination committed
+            --   "Fail"      -- check FailReason for cause
+            -- "Ready" and "No longer ready" stay hardcoded -- they're
+            -- our derived "Y just lit up / dimmed" cues, not text
+            -- Larian renders anywhere on screen.
+            if currentState == "Ready" and previous ~= "Ready" then
+                if hasValidResult then
+                    diffParts[#diffParts + 1] =
+                        "Ready to combine. Result: " .. resultItemName
+                else
+                    diffParts[#diffParts + 1] = "Ready to combine"
+                end
+            elseif currentState == "Preparing"
+                and previous == "Ready" then
+                diffParts[#diffParts + 1] = "No longer ready"
+            elseif currentState == "Working"
+                and previous ~= "Working" then
+                -- Larian's localized FeedbackLabel text for Working.
+                local workingText = ResolveCombineLoca(
+                    COMBINE_LOCA_HANDLES.stateWorking)
+                diffParts[#diffParts + 1] = workingText or "Combining..."
+            elseif currentState == "Success" then
+                -- Larian's parameterized template; substitute the
+                -- result item name into [1] if available.
+                local successText = ResolveCombineLoca(
+                    COMBINE_LOCA_HANDLES.stateSuccess,
+                    resultItemName)
+                diffParts[#diffParts + 1] = successText
+                    or "Combination complete"
+            end
+        end
+        if failReason ~= handlerState.lastFailReason then
+            handlerState.lastFailReason = failReason
+            -- Resolve the FailReason to Larian's on-screen
+            -- FeedbackLabel text (XAML lines 445-480, one LocaString
+            -- per reason).  Matches what sighted players read.
+            local failHandle = COMBINE_FAIL_LOCA_HANDLES[failReason]
+            local mapped = nil
+            if failHandle then
+                mapped = ResolveCombineLoca(failHandle)
+            end
+            if mapped then
+                diffParts[#diffParts + 1] = mapped
+            elseif failReason ~= "None" and failReason ~= "" then
+                -- Unknown FailReason value (BG3 might add new ones in
+                -- patches we haven't mapped).  Speak the enum verbatim
+                -- so we don't go silent.
+                diffParts[#diffParts + 1] =
+                    "Cannot combine: " .. failReason
+            end
+        end
+        if #diffParts > 0 then
+            SpeechData.Alert(table.concat(diffParts, ". "), "queue")
+        end
+    end,
+    onReset = function(handlerState)
+        handlerState.entrySpoken = false
+        handlerState.lastBaseItemName = nil
+        handlerState.lastResultItemName = nil
+        handlerState.lastCurrentState = nil
+        handlerState.lastFailReason = nil
+        handlerState.baseItemEntityUUID = nil
+        handlerState.cachedBaseItemName = nil
+        handlerState.cachedResultItemName = nil
+    end,
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local elemId = focusedElement.elemId or ""
+
+        -- Slot-2 detection: BG3 doesn't expose a top-level slot-2
+        -- field on the DCCombine DataContext.  Instead, when the
+        -- player presses A on an inventory item, that item's own
+        -- IsSelected flag flips to On, and the XAML slot-2 view
+        -- renders whichever inventory item has IsSelected=On (other
+        -- than BaseItem, which is always IsSelected=On as the source).
+        --
+        -- We detect this by reading focusedElement.dcProps.IsSelected
+        -- and comparing the item identity against BaseItem's EntityUUID.
+        -- A focused item that's IsSelected=On AND has a different
+        -- EntityUUID from BaseItem is the slot-2 selection -- announce
+        -- it as such so the user knows "this item is currently queued
+        -- to combine with the source."
+        local dcProps = focusedElement.dcProps
+        if not dcProps then return nil end
+        local isSelected = dcProps.IsSelected
+        local entityUUID = dcProps.EntityUUID
+        local itemName = dcProps.Name
+        local baseUUID = handlerState.baseItemEntityUUID
+        if isSelected == "On" or isSelected == true then
+            if entityUUID and baseUUID and entityUUID ~= baseUUID
+                and itemName and itemName ~= "" then
+                -- Slot-2 selected item: build a combined speech that
+                -- includes the slot-2 tag AND the current combine-state
+                -- status.  Embedding state here (rather than firing a
+                -- separate alert) prevents the focus refire from
+                -- cutting the state announcement, which was the
+                -- "Ready to combine" alert getting swallowed by the
+                -- selected-item speech in the prior version.
+                local itemDesc = dcProps.Description
+                if type(itemDesc) ~= "string"
+                    or itemDesc:match("^h%x+g") then
+                    itemDesc = nil
+                end
+                local combinedName = itemName .. ", selected for combine"
+                local liveState = handlerState.lastCurrentState
+                if liveState == "Ready" then
+                    local resultName = handlerState.lastResultItemName
+                    if resultName and resultName ~= "" then
+                        combinedName = combinedName
+                            .. ". Ready to combine. Result: "
+                            .. resultName
+                    else
+                        combinedName = combinedName .. ". Ready to combine"
+                    end
+                elseif liveState == "Preparing" then
+                    -- The pair didn't make a valid combination.
+                    -- BG3 doesn't transition to "Fail" until Y is
+                    -- pressed, so "Preparing" with an IsSelected
+                    -- slot-2 item means "invalid as-loaded."
+                    -- Use Larian's localized "Invalid" feedback text
+                    -- so we match what the user would see on-screen
+                    -- after a Y press in any supported language.
+                    local invalidText = ResolveCombineLoca(
+                        COMBINE_FAIL_LOCA_HANDLES.Invalid)
+                        or "Not a valid combination"
+                    combinedName = combinedName .. ". " .. invalidText
+                end
+                return combinedName, nil, itemDesc
+            end
+        end
+        return nil
+    end,
 })
 
 -- Give items to NPC.
@@ -3031,10 +3450,326 @@ local DonateHandler = CreatePanelHandler({
     hint = false,
 })
 
+-- SchedulePickpocketRollRead: defer a live Roll read by ~20 frames
+-- and speak DC + Chance as a queued Alert.  Cancels any pending
+-- read on entry so rapid d-pad navigation only speaks the Roll for
+-- the item the user actually settles on (settle pattern).
+--
+-- Why deferred + live: the Pickpocket panel's Roll values come from
+-- Noesis bindings that update per focused item.  The dcProps Lua
+-- table captured at widget-add / focus-change time is a snapshot
+-- with stale Roll values (0 / 0 cold-open, or the previous item's
+-- values during navigation).  Reading the LIVE widget via
+-- FindNameInWidget("Pickpocket_c").DataContext after the binding
+-- chain settles is the only reliable way to get the current item's
+-- DC and Chance.  Same canonical pattern as TadpolePowers'
+-- tadpole count read.
+local function SchedulePickpocketRollRead(handlerState)
+    if handlerState.cancelPendingRollRead then
+        handlerState.cancelPendingRollRead()
+        handlerState.cancelPendingRollRead = nil
+    end
+    handlerState.cancelPendingRollRead =
+        BG3Access.Client.Scheduler.RunAfterFrames(20, function()
+            handlerState.cancelPendingRollRead = nil
+            local widget = Ext.UI.FindNameInWidget("Pickpocket_c")
+            if not widget then return end
+            local liveDc = nil
+            pcall(function() liveDc = widget.DataContext end)
+            if not liveDc then return end
+            local liveProps = nil
+            pcall(function()
+                liveProps = liveDc:GetAllProperties()
+            end)
+            if not liveProps or not liveProps.Roll then return end
+            local rollDc = nil
+            local rollChance = nil
+            pcall(function()
+                local rollProps = liveProps.Roll:GetAllProperties()
+                if rollProps then
+                    rollDc = tonumber(rollProps.DifficultyCheck)
+                    rollChance = tonumber(rollProps.Chance)
+                end
+            end)
+            if not rollDc or rollDc <= 0 then return end
+
+            -- The threshold number is NOT the D&D-style DC that
+            -- Combat.lua announces after the roll resolves.
+            -- Combat says e.g. "DC 15" -- the full target the
+            -- (roll + roller modifier) must meet.  The panel
+            -- here shows e.g. "8" -- the threshold on the die
+            -- alone (= DC minus the roller's modifier).  Both
+            -- numbers are correct in their own framing; the
+            -- discrepancy LOOKED like a bug when both got labeled
+            -- "DC".  Resolve the actual in-game label for this
+            -- number so the speech matches the on-screen UI.
+            --
+            -- The XAML at line 312 binds the TextBlock next to
+            -- the TargetRing image to TranslatedString handle
+            -- "hea70fbd3g7598g424egb3bfg7cbe03bbdc09".  Ext.Loca
+            -- resolves that to the live English label.  Fallback
+            -- "Pickpocket roll" only fires if Ext.Loca isn't
+            -- available -- chosen because it can't collide with
+            -- our sectionLabel "Target: <name>" the way the
+            -- likely in-game label "Target" would, and it's
+            -- unambiguous about what number it's describing.
+            -- Fallback "Roll target": kept close to the sighted
+            -- player's mental model (the threshold ring is
+            -- visually labeled "Target") while avoiding collision
+            -- with the sectionLabel "Victim: <name>" -- adding
+            -- the word "Roll" disambiguates between the d20
+            -- threshold number and the person being robbed.
+            local rollLabel = "Roll target"
+            if Ext.Loca and Ext.Loca.GetTranslatedString then
+                local resolvedLabel = Ext.Loca.GetTranslatedString(
+                    "hea70fbd3g7598g424egb3bfg7cbe03bbdc09")
+                if resolvedLabel and resolvedLabel ~= ""
+                    and resolvedLabel
+                        ~= "hea70fbd3g7598g424egb3bfg7cbe03bbdc09"
+                    -- Sighted players see exactly "Target" on
+                    -- screen, but speaking "Target: 10" right
+                    -- after "Victim: Shadowheart" would have the
+                    -- word "Target" mean two unrelated things in
+                    -- back-to-back fields.  Stick with the
+                    -- disambiguated "Roll target" when the live
+                    -- Loca label is the bare word "Target".  Any
+                    -- other resolved label (game patch, mod) wins
+                    -- since it implies the in-game UI itself
+                    -- changed the label and we should mirror it.
+                    and resolvedLabel ~= "Target" then
+                    rollLabel = resolvedLabel
+                end
+            end
+
+            local rollParts = {
+                rollLabel .. ": " .. tostring(rollDc),
+            }
+            if rollChance then
+                -- Roll.Chance is a 0..1 float (it's bound to an
+                -- LSPie.Value property in the XAML at line 449,
+                -- where pie charts use 0..1 for the sweep-angle
+                -- ratio).  Multiply by 100 to convert to the
+                -- 0..100 percent the user expects.
+                rollParts[#rollParts + 1] = "Chance: "
+                    .. tostring(math.floor(rollChance * 100))
+                    .. " percent"
+            end
+            local rollText = table.concat(rollParts, ". ")
+            Log.Info("PICKPOCKET ROLL: " .. rollText)
+            SpeechData.Alert(rollText, "queue")
+        end)
+end
+
 -- Pickpocket item selection.
+--
+-- XAML: Pickpocket_c.xaml.  DataContext: gui::DCPickpocket.
+-- Each grid cell focuses as elemType=Grid, elemName="Slot Root" with
+-- a DataContext that's either ls.VMInventorySlot (an item in the
+-- victim's container -- what we'd steal) or ls.VMItem (an item in
+-- the player's own inventory -- could plant, but we don't surface
+-- that distinction in speech).  See the XAML DataTrigger at line 646
+-- for the canonical victim-slot type check.
+--
+-- Speech model:
+--   * Screen entry -> container name + DC + chance + hint.  Target
+--     character name comes from widgetData.dcProps.Container.Owner
+--     when available.
+--   * Item focus -> item name + selected count where relevant.
+--   * Grid phantoms -> "Empty slot" (same as Camp).
 local PickpocketHandler = CreatePanelHandler({
     name = "Pickpocket",
     hint = false,
+    -- ListBoxItems in the grid are flagged isTab by C++; without
+    -- this, d-pad cell-to-cell navigation gets routed as screen-
+    -- entry events and dedup'd to silence.  Same fix Camp /
+    -- ActiveRoll use.
+    treatTabsAsItems = true,
+    onWidgetAdded = function(widgetData, handlerState)
+        local widgetProps = widgetData and widgetData.dcProps
+        if not widgetProps then return end
+
+        -- Target / container name resolution.  BG3's data model:
+        --
+        --   * Top-level character inventory: Container.Name IS the
+        --     character's name ("Shadowheart").  Container.Owner is
+        --     not populated -- the character IS the container.
+        --   * Sub-container (e.g. Camp Supply Sack inside someone's
+        --     inventory): Container.Name = "Camp Supply Sack",
+        --     Container.Owner.Name = the holder ("Shadowheart").
+        --
+        -- Try Owner.Name first (specific -- "who owns this sub-bag"),
+        -- fall back to Container.Name (top-level character name OR
+        -- sub-container name when no Owner is set, e.g. a chest in
+        -- the world).  Either way the speech ends up with the most
+        -- specific person / object label available.
+        local targetName = nil
+        if widgetProps.Container
+            and type(widgetProps.Container) == "table" then
+            if widgetProps.Container.Owner
+                and type(widgetProps.Container.Owner) == "table" then
+                targetName = Helpers.ResolveTranslatedString(
+                    widgetProps.Container.Owner.Name)
+            end
+            if not targetName or targetName == "" then
+                targetName = Helpers.ResolveTranslatedString(
+                    widgetProps.Container.Name)
+            end
+        end
+
+        -- Fields stay distinct -- no comma-concatenation.
+        -- Format() handles joining via the field-order walk.
+        --   title         -> "Pickpocket" (the action)
+        --   sectionLabel  -> "Target: <name>" -- the PERSON being
+        --                    pickpocketed.  sectionLabel is the
+        --                    slot for subtitle / state info that
+        --                    sits under the title; Format() emits
+        --                    it second (right after title), so the
+        --                    user hears WHO they're pickpocketing
+        --                    early instead of buried at the end of
+        --                    the speech after the item list.
+        --                    Properties (DC / Chance) come much
+        --                    later in Format()'s order (between
+        --                    technicalDescription and description),
+        --                    which is the wrong slot for
+        --                    contextual "who am I pickpocketing"
+        --                    info.
+        --   DC            -> property: difficulty class number.
+        --                    The in-game UI labels this "Target N"
+        --                    in a small ring; we call it "DC" to
+        --                    avoid the word "Target" doubling up
+        --                    with the person above.
+        --   Chance        -> property: success percent (visualized
+        --                    as the pie-fill on the d20 icon).
+        --
+        -- We deliberately do NOT emit a separate Container property:
+        -- when pickpocketing a person, BG3's data model exposes
+        -- Container.Name and Container.Owner.Name as the SAME
+        -- string (the target's name), so the property would just
+        -- duplicate the sectionLabel as "Container: Shadowheart".
+        --
+        -- DC + Chance values reflect whichever item happens to be
+        -- initially focused when the panel opens -- the same info
+        -- sighted players see at that same moment.
+        handlerState.screenEntryOverrides:Add(
+            "title", "Pickpocket", "brief")
+
+        if targetName and targetName ~= "" then
+            -- "Victim: <name>" -- not "Target: <name>" -- because
+            -- the threshold-ring label resolved via Ext.Loca in
+            -- SchedulePickpocketRollRead is "Target", so "Target:
+            -- Shadowheart" + "Target: 10" would collide on screen
+            -- entry.  "Victim" is unambiguous and matches the
+            -- crime-flavored framing of the pickpocket action.
+            handlerState.screenEntryOverrides:Add(
+                "sectionLabel",
+                "Victim: " .. targetName,
+                "brief")
+        end
+
+        -- Initial Roll read (for the auto-focused first item).
+        -- See SchedulePickpocketRollRead helper above for the why.
+        -- Subsequent reads fire from customItemFn on each focus
+        -- change so the user hears updated DC / Chance per item.
+        SchedulePickpocketRollRead(handlerState)
+
+        -- Button mapping per the in-game footer:
+        --   D-pad: navigate items in the grid
+        --   LB:    open Dice Roll Details popup
+        --   RB:    switch between target's inventory and yours
+        --   X:     per-item actions menu
+        --   Y:     attempt the steal
+        --   B:     close panel
+        handlerState.screenEntryOverrides:Add(
+            "navigationHint",
+            "D-pad to browse items. "
+                .. "LB for dice roll details. "
+                .. "RB to switch between target and your inventory. "
+                .. "X for item actions. "
+                .. "Y to steal. "
+                .. "B to cancel.",
+            "normal")
+    end,
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local dcType = focusedElement.dcType
+        local dcProps = focusedElement.dcProps
+        local elemId = focusedElement.elemId or ""
+
+        -- Empty grid cell phantom borders.  Raw elemId from C++ is
+        -- "Border::WidgetNavigationPrimaryFakeElement" /
+        -- "...Secondary..." -- CamelCase, no spaces.  The pretty
+        -- "Widget Navigation Primary Fake Element" form only exists
+        -- post-CleanElementName at log time.  Same pattern as
+        -- ContainerHandler line ~2181.
+        --
+        -- Speak via Alert with "queue" priority, NOT via the
+        -- factory's default interrupt path.  Reason: on a
+        -- successful steal, the game removes the stolen item and
+        -- auto-shifts focus to the now-empty cell milliseconds
+        -- later.  If "Empty slot" went out as interrupt, it would
+        -- purge Combat.lua's pending roll-outcome alert ("Tav
+        -- passed") that's still in the speech queue waiting its
+        -- turn, and the user would never hear the steal result.
+        -- Queue puts "Empty slot" behind the roll outcome so the
+        -- outcome plays first.  Normal d-pad navigation onto a
+        -- real item still uses interrupt (factory default), which
+        -- correctly clobbers a queued "Empty slot" when the user
+        -- moves on -- so navigation feel doesn't change.
+        if elemId:find("WidgetNavigationPrimaryFakeElement")
+            or elemId:find("WidgetNavigationSecondaryFakeElement") then
+            SpeechData.Alert("Empty slot", "queue")
+            return SpeechData.Create()
+        end
+
+        if not dcProps then return nil end
+
+        -- Victim's inventory cell: ls.VMInventorySlot wraps an item
+        -- in .Object (per the XAML DataTrigger at line 646).
+        -- Player's own inventory cell: ls.VMItem directly.
+        local objectData = nil
+        if dcType == "ls.VMInventorySlot"
+            or dcType == "gui::VMInventorySlot" then
+            objectData = dcProps.Object
+        elseif dcType == "ls.VMItem" or dcType == "gui::VMItem" then
+            objectData = dcProps
+        else
+            return nil
+        end
+
+        if not objectData or type(objectData) ~= "table" then
+            return nil
+        end
+
+        local itemName = Helpers.ResolveTranslatedString(
+            objectData.Name or objectData.DisplayName)
+        if not itemName or itemName == "" then
+            return nil
+        end
+
+        local speechData = SpeechData.Create()
+        speechData:Add("name", itemName, "brief")
+
+        -- Per-item Roll read.  The panel's Roll binding updates per
+        -- focused item: cheap / light items (tankards, keys) have
+        -- low DCs and high success chance; valuable items (rare
+        -- scrolls, magic gear) have high DCs and low chance.
+        -- Schedule a deferred live read so the user hears the DC
+        -- and Chance for whichever item they've just focused on.
+        -- The settle delay also serves as a debounce: rapid d-pad
+        -- navigation only speaks the Roll for the item the user
+        -- actually pauses on, not every transient focus.
+        SchedulePickpocketRollRead(handlerState)
+
+        return speechData
+    end,
+    onReset = function(handlerState)
+        -- Cancel any in-flight deferred Roll read so a value from
+        -- a previous Pickpocket session doesn't surface after the
+        -- panel has closed.
+        if handlerState.cancelPendingRollRead then
+            handlerState.cancelPendingRollRead()
+            handlerState.cancelPendingRollRead = nil
+        end
+    end,
 })
 
 -- Spell scroll learning.
@@ -3044,9 +3779,120 @@ local LearnSpellsHandler = CreatePanelHandler({
 })
 
 -- Camp supplies / long rest.
+--
+-- XAML: MakeCamp_c.xaml.  DataContext: gui::DCMakeCamp.
+-- Layout:
+--   Title at top:   "Choose Camp Supplies for the Long Rest"
+--   Centre ring:    SelectedSuppliesAmount / CurrentPlayer.RequiredPartySupplies
+--   5x5 grid:       PartyCampSupplies.Slots (each a VMCampInventorySlot
+--                   with .SelectedAmount and .Object.Name / .Object.Count)
+--   Footer button:  "Long Rest" (or "Start Resting" / "Long Rest" once
+--                   the required supply count is met).
+--   Button hints:   A select, ContextMenu auto-select, X split stack,
+--                   Y toggle item tooltip, B cancel.
+--
+-- Speech model:
+--   * Screen entry  -> title + current/required supply tally + hint that
+--                      describes the controls the player needs.
+--   * Item focus    -> "<item name>. <selected> of <available> selected".
+local function FormatCampSupplyAmount(selected, available)
+    local selectedNumber = tonumber(selected) or 0
+    local availableNumber = tonumber(available) or 0
+    return tostring(selectedNumber)
+        .. " of " .. tostring(availableNumber) .. " selected"
+end
+
 local CampHandler = CreatePanelHandler({
     name = "Camp",
     hint = false,
+    -- The 5x5 supply grid items are ListBoxItems, which C++
+    -- flags as isTab=true.  Without this, d-pad navigation
+    -- between cells hits the panel factory's screen-entry path,
+    -- which dedups on tabName (every cell resolves to the same
+    -- "ListBoxItem:" broken tab name) and silently returns --
+    -- the user hears nothing when moving between supplies.
+    -- treatTabsAsItems flips tab-typed focus changes into item-
+    -- navigation events so customItemFn fires per cell.  Same
+    -- setting ActiveRollHandler uses for its bonus row list.
+    treatTabsAsItems = true,
+    onWidgetAdded = function(widgetData, handlerState)
+        -- Stash the camp DC props so the screen-entry pipeline can
+        -- read SelectedSuppliesAmount + RequiredPartySupplies even
+        -- when the binding hasn't propagated to the focused item yet.
+        local widgetProps = widgetData and widgetData.dcProps
+        if not widgetProps then return end
+
+        local selectedAmount = widgetProps.SelectedSuppliesAmount
+        local requiredAmount = nil
+        if widgetProps.CurrentPlayer
+            and type(widgetProps.CurrentPlayer) == "table" then
+            requiredAmount = widgetProps.CurrentPlayer.RequiredPartySupplies
+        end
+
+        handlerState.screenEntryOverrides:Add(
+            "title", "Long Rest", "brief")
+
+        if requiredAmount then
+            local selectedNumber = tonumber(selectedAmount) or 0
+            local requiredNumber = tonumber(requiredAmount) or 0
+            local tallyText = tostring(selectedNumber)
+                .. " of " .. tostring(requiredNumber)
+                .. " camp supplies selected"
+            handlerState.screenEntryOverrides:Add(
+                "sectionLabel", tallyText, "brief")
+        end
+
+        -- Button layout per the in-game footer (controller).  The
+        -- StartRestBtn (Y / UITakeAll) flips its label between
+        -- "Partial Rest" (when supplies are insufficient) and "Long
+        -- Rest" (when supplies meet the required amount) -- describe
+        -- it as "start the rest" to cover both cases.
+        handlerState.screenEntryOverrides:Add(
+            "navigationHint",
+            "D-pad to browse supplies. "
+                .. "A to select or deselect. "
+                .. "X to auto-select. "
+                .. "Y to start the rest. "
+                .. "B to cancel.",
+            "normal")
+    end,
+    customItemFn = function(focusedElement, handlerState, snapshot)
+        local dcType = focusedElement.dcType
+        local dcProps = focusedElement.dcProps
+
+        -- (LSGrid empty-cell phantoms now handled universally by
+        -- Helpers.CleanElementName -- the factory's generic path
+        -- speaks "Empty slot" before reaching this customItemFn.)
+
+        if not dcProps then return nil end
+
+        -- The focused element is a VMCampInventorySlot.  Its .Object
+        -- is the actual item (name + count come from there); the
+        -- slot itself carries .SelectedAmount.
+        if dcType ~= "ls.VMCampInventorySlot"
+            and dcType ~= "gui::VMCampInventorySlot" then
+            return nil
+        end
+
+        local objectData = dcProps.Object
+        if not objectData or type(objectData) ~= "table" then
+            return nil
+        end
+
+        local itemName = Helpers.ResolveTranslatedString(
+            objectData.Name or objectData.DisplayName)
+        if not itemName or itemName == "" then
+            return nil
+        end
+
+        local speechData = SpeechData.Create()
+        speechData:Add("name", itemName, "brief")
+        speechData:Add("value",
+            FormatCampSupplyAmount(
+                dcProps.SelectedAmount, objectData.Count),
+            "brief")
+        return speechData
+    end,
 })
 
 -- Quest log with categories (tabbed).
@@ -4295,93 +5141,185 @@ local LobbyHandler = CreatePanelHandler({
 -- The description uses CtxTransStringRunGeneratorBehavior which means the
 -- rendered text includes controller button placeholders -- we extract what
 -- we can from dcProps and namedTexts.
+-- Tutorial / Notification de-dup claim set.  Populated by the Tutorial
+-- handler when it extracts title/body from a Tutorial modal; consulted
+-- by Notifications.lua before speaking a toast text.  Notification_c
+-- and ModalTutorial_c both render the same tutorial title/body for
+-- some popups (camp transitions etc.); without dedup the Tutorial
+-- handler interrupts the queued notification toasts AND the
+-- notification text would have already been queued.  With dedup,
+-- Notifications skips toasts that the Tutorial handler is already
+-- about to speak via screen entry.
+--
+-- Modal-only tutorials (no matching toast) speak normally via the
+-- handler.  Toast-only notifications (no matching modal) speak
+-- normally via Notifications.lua.
+BG3Access.Client.TutorialClaimedTexts = BG3Access.Client.TutorialClaimedTexts or {}
+
+local function ClaimTutorialText(text)
+    if type(text) == "string" and text ~= "" then
+        BG3Access.Client.TutorialClaimedTexts[text] = true
+    end
+end
+
+local function ClearTutorialClaims()
+    BG3Access.Client.TutorialClaimedTexts = {}
+    BG3Access.Client.TutorialClaimedTexts =
+        BG3Access.Client.TutorialClaimedTexts
+end
+
+-- ExtractTutorialContent: pull title and description out of widget
+-- data or live widget DC.  Returns (title, description) with
+-- unresolved-binding sentinels stripped, or nils if not yet ready.
+-- Same logic regardless of which source we pulled from -- factored
+-- out so both the synchronous onWidgetAdded path and the deferred
+-- retry path use the same extraction rules.
+local function ExtractTutorialContent(dcProps, namedTexts)
+    if not dcProps then return nil, nil end
+    local title, description = nil, nil
+    local tutorial = dcProps.Tutorial
+    if tutorial and type(tutorial) == "table" then
+        local rawTitle = tutorial.Title
+        if rawTitle and rawTitle ~= ""
+            and not rawTitle:match("^h%x+g")
+            and not rawTitle:find("%[ForceUpdate%]") then
+            title = rawTitle
+        end
+        local rawDesc = tutorial.DescriptionController
+            or tutorial.Description
+        if rawDesc and rawDesc ~= ""
+            and not rawDesc:match("^h%x+g")
+            and not rawDesc:find("%[ForceUpdate%]") then
+            description = rawDesc
+        end
+    end
+    if not title then
+        local rawTitle = dcProps.Title or dcProps.Text
+        if rawTitle and rawTitle ~= ""
+            and not rawTitle:match("^h%x+g") then
+            title = rawTitle
+        end
+    end
+    -- namedTexts fallback when neither dcProps nor sub-object yielded.
+    if not title and not description and namedTexts then
+        local parts = {}
+        for _, elementText in pairs(namedTexts) do
+            if elementText and elementText ~= ""
+                and not elementText:match("^h%x+g")
+                and not elementText:find("%[ForceUpdate%]") then
+                parts[#parts + 1] = elementText
+            end
+        end
+        if #parts > 0 then
+            title = "Tutorial"
+            description = table.concat(parts, ". ")
+        end
+    end
+    return title, description
+end
+
+-- ReadLiveTutorialDcProps: re-read Tutorial widget's DataContext
+-- props in the late-arrival case (deferred retry after Larian's
+-- binding propagation completes).  Returns dcProps or nil.
+local function ReadLiveTutorialDcProps()
+    local widget = Ext.UI.FindNameInWidget("ModalTutorial_c")
+    if not widget then return nil end
+    local liveDc = nil
+    pcall(function() liveDc = widget.DataContext end)
+    if not liveDc then return nil end
+    local liveProps = nil
+    pcall(function() liveProps = liveDc:GetAllProperties() end)
+    return liveProps
+end
+
 local TutorialHandler = CreatePanelHandler({
     name = "Tutorial",
     hint = "A to dismiss.",
     onWidgetAdded = function(widgetData, handlerState)
         local overrides = handlerState.screenEntryOverrides
-        -- Title from Tutorial sub-object in dcProps.
-        local dcProps = widgetData and widgetData.dcProps
-        if dcProps then
-            local tutorial = dcProps.Tutorial
-            if tutorial and type(tutorial) == "table" then
-                local title = tutorial.Title
-                if title and title ~= ""
-                    and not title:match("^h%x+g")
-                    and not title:find("%[ForceUpdate%]") then
-                    overrides:Add("title",
-                        "Tutorial: " .. title, "brief")
-                end
-                local description = tutorial.DescriptionController
-                    or tutorial.Description
-                if description and description ~= ""
-                    and not description:match("^h%x+g")
-                    and not description:find("%[ForceUpdate%]") then
-                    overrides:Add("description", description, "normal")
-                end
+
+        -- Sync extraction: if Larian's binding propagated before
+        -- this event fired (the common case for tutorials that
+        -- aren't immediately following a state transition), we can
+        -- populate screenEntryOverrides right now and let the
+        -- factory's screen entry pipeline speak it.  Single source.
+        local title, description = ExtractTutorialContent(
+            widgetData and widgetData.dcProps,
+            widgetData and widgetData.namedTexts)
+
+        if title or description then
+            if title then
+                overrides:Add("title", "Tutorial: " .. title, "brief")
+                ClaimTutorialText(title)
             end
-            -- Fallback: top-level Title/Text from dcProps.
-            if not overrides:HasField("title") then
-                local title = dcProps.Title or dcProps.Text
-                if title and title ~= ""
-                    and not title:match("^h%x+g") then
-                    overrides:Add("title",
-                        "Tutorial: " .. title, "brief")
-                end
+            if description then
+                overrides:Add("description", description, "normal")
+                ClaimTutorialText(description)
             end
+            ClaimTutorialText("Dismiss")
+            ClaimTutorialText("Finish")
+            Log.Info("TUTORIAL (sync): title="
+                .. tostring(title or "(none)")
+                .. " body=" .. tostring(description or ""):sub(1, 60))
+            -- Sync worked, no deferred retry needed.  Cancel any
+            -- prior pending retry from a previous widget event.
+            if handlerState.cancelPendingTutorialRead then
+                handlerState.cancelPendingTutorialRead()
+                handlerState.cancelPendingTutorialRead = nil
+            end
+            return
         end
 
-        -- Also try namedTexts for rendered TextBlock content.
-        if widgetData and widgetData.namedTexts
-            and not overrides:HasField("title")
-            and not overrides:HasField("description") then
-            local parts = {}
-            for elementName, elementText in pairs(widgetData.namedTexts) do
-                if elementText and elementText ~= ""
-                    and not elementText:match("^h%x+g")
-                    and not elementText:find("%[ForceUpdate%]") then
-                    parts[#parts + 1] = elementText
-                end
-            end
-            if #parts > 0 then
-                overrides:Add("title", "Tutorial", "brief")
-                overrides:Add("description",
-                    table.concat(parts, ". "), "normal")
-            end
+        -- Sync extraction failed: Larian's dcProps.Tutorial binding
+        -- hasn't propagated yet.  Defer via Scheduler -- canonical
+        -- pattern for binding-propagation lag (matches the Tadpole
+        -- count read).  When the retry fires, the binding will
+        -- have settled; we read the live widget DC and speak as a
+        -- queued Alert.  The factory's screen entry will already
+        -- have spoken just the hint by that point, so the queued
+        -- Alert plays AFTER it in order.
+        --
+        -- Cancel any prior pending read before scheduling a new
+        -- one, so re-fires of onWidgetAdded (same widget event
+        -- arriving multiple times during binding flux) collapse
+        -- into a single deferred read at the final state.
+        if handlerState.cancelPendingTutorialRead then
+            handlerState.cancelPendingTutorialRead()
         end
+        handlerState.cancelPendingTutorialRead =
+            BG3Access.Client.Scheduler.RunAfterFrames(30, function()
+                handlerState.cancelPendingTutorialRead = nil
+                local liveProps = ReadLiveTutorialDcProps()
+                if not liveProps then return end
+                local lateTitle, lateDescription = ExtractTutorialContent(
+                    liveProps, nil)
+                if not lateTitle and not lateDescription then return end
 
-        if overrides:HasField("title")
-            or overrides:HasField("description") then
-            local titleStr = overrides.coreFields["title"] or "(none)"
-            local bodyStr = overrides.coreFields["description"] or "(none)"
-            Log.Info("TUTORIAL: title=" .. titleStr
-                .. " body=" .. bodyStr:sub(1, 60))
-        end
+                local parts = {}
+                if lateTitle then
+                    parts[#parts + 1] = "Tutorial: " .. lateTitle
+                    ClaimTutorialText(lateTitle)
+                end
+                if lateDescription then
+                    parts[#parts + 1] =
+                        Helpers.StripMarkupTags(lateDescription)
+                    ClaimTutorialText(lateDescription)
+                end
+                ClaimTutorialText("Dismiss")
+                ClaimTutorialText("Finish")
+                if #parts == 0 then return end
+                local fullText = table.concat(parts, ". ")
+                Log.Info("TUTORIAL (deferred): "
+                    .. fullText:sub(1, 100))
+                SpeechData.Alert(fullText, "queue")
+            end)
     end,
-    customItemFn = function(focusedElement, handlerState, snapshot)
-        -- Tutorial body arrives on the tick AFTER screen entry
-        -- (dcProps not populated on the widget event tick).
-        -- Check dcProps each tick for the Tutorial sub-object.
-        local dcProps = focusedElement and focusedElement.dcProps
-        if not dcProps then return nil, nil, nil end
-        local tutorial = dcProps.Tutorial
-        if not tutorial or type(tutorial) ~= "table" then
-            return nil, nil, nil
+    onReset = function(handlerState)
+        if handlerState.cancelPendingTutorialRead then
+            handlerState.cancelPendingTutorialRead()
+            handlerState.cancelPendingTutorialRead = nil
         end
-        local title = tutorial.Title
-        if title and (title:match("^h%x+g")
-            or title:find("%[ForceUpdate%]")) then
-            title = nil
-        end
-        local body = tutorial.DescriptionController
-            or tutorial.Description
-        if body and (body:match("^h%x+g")
-            or body:find("%[ForceUpdate%]")) then
-            body = nil
-        end
-        if title then title = "Tutorial: " .. title end
-        if body then body = Helpers.StripMarkupTags(body) end
-        return title, nil, body
+        ClearTutorialClaims()
     end,
 })
 
@@ -4474,9 +5412,15 @@ local function OpenBookReader(handlerState)
     handlerState.bookLineIndex = 0
     local lineCount = #handlerState.bookLines
     Log.Info("BOOK: " .. lineCount .. " lines")
+    -- Title says where we are (unconditional, so the user always
+    -- gets feedback that the book viewer opened).  Navigation hint
+    -- explains line-by-line motion (hint-gated by hintsEnabled).
+    -- Line count is informational tier.  Instruction hint carries
+    -- the standard A/B controls (hint-gated).
     local speechData = SpeechData.Create()
-    speechData:Add("description", "Book viewer. Use d-pad up and down"
-        .. " to move line by line through the text.", "brief")
+    speechData:Add("title", "Book viewer", "brief")
+    speechData:Add("navigationHint", "Use d-pad up and down"
+        .. " to move line by line through the text.", "normal")
     speechData:AddProperty("Lines", lineCount .. " lines.", "normal")
     speechData:Add("instructionHint",
         "A to pick up. B to close.", "normal")
@@ -4486,6 +5430,11 @@ local function OpenBookReader(handlerState)
     if not handlerState.buttonSubscription then
         handlerState.buttonSubscription =
             Ext.Events.ControllerButtonInput:Subscribe(function(event)
+                local SettingsMenu = BG3Access.Client.SettingsMenu
+                if SettingsMenu and SettingsMenu.IsOpen
+                    and SettingsMenu.IsOpen() then
+                    return
+                end
                 if not event.Pressed then return end
                 local buttonName = tostring(event.Button)
 
@@ -4506,8 +5455,15 @@ local function OpenBookReader(handlerState)
                     Log.Info("BOOK [" .. currentIndex .. "/"
                         .. #bookLines .. "]: "
                         .. bookLines[currentIndex]:sub(1, 60))
+                    -- Book line text is the entire reason the book
+                    -- viewer exists.  sectionLabel is unconditional
+                    -- in SpeechData.Format(); description would be
+                    -- gated by the speakDescription toggle and would
+                    -- vanish whenever the user's normal preset turns
+                    -- descriptions off -- silencing the book they
+                    -- opened specifically to read.
                     local lineSpeech = SpeechData.Create()
-                    lineSpeech:Add("description",
+                    lineSpeech:Add("sectionLabel",
                         bookLines[currentIndex], "brief")
                     lineSpeech:Speak(handlerState, false, nil, true)
 
@@ -4528,8 +5484,9 @@ local function OpenBookReader(handlerState)
                     Log.Info("BOOK [" .. currentIndex .. "/"
                         .. #bookLines .. "]: "
                         .. bookLines[currentIndex]:sub(1, 60))
+                    -- See DPadDown case for sectionLabel rationale.
                     local lineSpeech = SpeechData.Create()
-                    lineSpeech:Add("description",
+                    lineSpeech:Add("sectionLabel",
                         bookLines[currentIndex], "brief")
                     lineSpeech:Speak(handlerState, false, nil, true)
 
@@ -5281,3 +6238,4 @@ BG3Access.Client.WorldUI = {
     -- Diagnostics (SE console: BG3Access.Client.WorldUI.DumpEquipmentStructure())
     DumpEquipmentStructure     = CharSheet.DumpEquipmentStructure,
 }
+

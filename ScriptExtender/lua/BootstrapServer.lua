@@ -316,7 +316,14 @@ _P("BG3Access: Server classify listener registered on '"
 --   AttackedBy      -- damage dealt (party member involved)
 -- ============================================================================
 
-local COMBAT_CHANNEL = "BG3Access_Combat"
+-- Single shared net channel for all server-relayed narration events:
+-- combat events (TurnStarted, CombatStarted, AttackedBy, ...) AND
+-- dice-roll events (RollPreview, RollFinished).  BG3 fires rolls
+-- during exploration / dialogue too, not just combat, so the channel
+-- isn't combat-specific.  Client-side, Combat.lua owns the listener
+-- registration and dispatches each event to either combat handlers
+-- or DiceRolls handlers based on the event type field.
+local EVENTS_CHANNEL = "BG3Access_Events"
 
 --- Resolve a character GUID to a translated display name.
 --- Returns the name string, or "Unknown" if resolution fails.
@@ -557,7 +564,7 @@ end
 local function RelayCombatEvent(eventData)
     local stringifyOk, payload = pcall(Ext.Json.Stringify, eventData)
     if stringifyOk and payload then
-        Ext.ServerNet.BroadcastMessage(COMBAT_CHANNEL, payload)
+        Ext.ServerNet.BroadcastMessage(EVENTS_CHANNEL, payload)
     end
 end
 
@@ -612,6 +619,211 @@ Ext.Osiris.RegisterListener("CombatRoundStarted", 2, "after",
             event = "RoundStarted",
             combatGuid = tostring(combatGuid),
             round = round,
+        })
+    end)
+
+-- Cinematic / movie start: cast a wide net.  BG3 plays cinematics
+-- via several distinct mechanisms and we don't know in advance
+-- which path the opening (or any given) cinematic uses.  Subscribe
+-- to ALL plausible signals so at least one fires; each one logs
+-- with the listener name + arguments so the actual firing path can
+-- be confirmed empirically.  All paths converge on the same
+-- "MovieStarted" relay event keyed by the cinematic identifier
+-- (movie short name for video CGI, timeline UUID for engine
+-- cinematics).
+--
+-- Signals (D:\extracted packs\Osi\debug.log line numbers):
+--   * MoviePlay              Call,  line 1160  args (CHARACTER, STRING, INTEGER)
+--   * PROC_StartMovie        Proc,  line 2734  args (STRING)
+--   * DB_MoviePlayed         DB,    line 1439  args (PLAYER, STRING)  fires on insert
+--   * TimelineScreenFadeStarted  Event, line 3661  args (INT, INT, DIALOGRESOURCE)
+--   * MovieFinished          Event, line 2034  args (STRING)  end-only signal
+--
+-- Each registration pcall'd so a missing/renamed primitive doesn't
+-- break server bootstrap; failures log but don't propagate.
+local function TryRegisterCinematicListener(name, arity, kind, handler)
+    local ok, err = pcall(
+        Ext.Osiris.RegisterListener, name, arity, kind, handler)
+    if ok then
+        _P("BG3Access: cinematic listener '" .. name
+            .. "' (" .. kind .. ", arity " .. arity
+            .. ") registered")
+    else
+        _P("BG3Access: cinematic listener '" .. name
+            .. "' FAILED to register: " .. tostring(err))
+    end
+end
+
+TryRegisterCinematicListener("MoviePlay", 3, "after",
+    function(characterGuid, movieName, unused)
+        _P("BG3Access: MoviePlay fired -- character="
+            .. tostring(characterGuid) .. " movie='"
+            .. tostring(movieName) .. "'")
+        RelayCombatEvent({
+            event = "MovieStarted",
+            movie = tostring(movieName or ""),
+            source = "MoviePlay",
+        })
+    end)
+
+-- Dialog-embedded CGI variant.  Larian uses this Call for all
+-- in-dialog cinematic playback throughout Acts 1-3 (the dialog
+-- system threads movies into conversation flow via this entry
+-- point).  Signature: (CHARACTER, DIALOGRESOURCE, STRING).  The
+-- third arg is the movie short name -- same identifier space as
+-- MoviePlay, so the AD_TRACKS lookup on the client just works.
+TryRegisterCinematicListener("PlayMovieForDialog", 3, "after",
+    function(characterGuid, dialogResource, movieName)
+        _P("BG3Access: PlayMovieForDialog fired -- character="
+            .. tostring(characterGuid) .. " dialog="
+            .. tostring(dialogResource) .. " movie='"
+            .. tostring(movieName) .. "'")
+        RelayCombatEvent({
+            event = "MovieStarted",
+            movie = tostring(movieName or ""),
+            source = "PlayMovieForDialog",
+        })
+    end)
+
+TryRegisterCinematicListener("PROC_StartMovie", 1, "after",
+    function(movieName)
+        _P("BG3Access: PROC_StartMovie fired -- movie='"
+            .. tostring(movieName) .. "'")
+        RelayCombatEvent({
+            event = "MovieStarted",
+            movie = tostring(movieName or ""),
+            source = "PROC_StartMovie",
+        })
+    end)
+
+TryRegisterCinematicListener("DB_MoviePlayed", 2, "after",
+    function(playerGuid, movieName)
+        _P("BG3Access: DB_MoviePlayed fired -- player="
+            .. tostring(playerGuid) .. " movie='"
+            .. tostring(movieName) .. "'")
+        RelayCombatEvent({
+            event = "MovieStarted",
+            movie = tostring(movieName or ""),
+            source = "DB_MoviePlayed",
+        })
+    end)
+
+TryRegisterCinematicListener("TimelineScreenFadeStarted", 3, "after",
+    function(userId, instanceId, timelineId)
+        _P("BG3Access: TimelineScreenFadeStarted fired -- timeline='"
+            .. tostring(timelineId) .. "'")
+        RelayCombatEvent({
+            event = "MovieStarted",
+            movie = tostring(timelineId or ""),
+            source = "TimelineScreenFadeStarted",
+        })
+    end)
+
+TryRegisterCinematicListener("MovieFinished", 1, "after",
+    function(movieName)
+        _P("BG3Access: MovieFinished fired -- movie='"
+            .. tostring(movieName) .. "'")
+        RelayCombatEvent({
+            event = "MovieFinished",
+            movie = tostring(movieName or ""),
+        })
+    end)
+
+-- Opening CGI start signal.  The opening cinematic (GUS_CGI01
+-- _Part1) plays via the engine's video player with NO Osiris
+-- start event of its own -- confirmed by production testing
+-- (only MovieFinished fires, at the end).  But character
+-- creation happens ONLY on a fresh new game, and CharacterCreation
+-- Started() is the Osiris event that marks it.  A save load never
+-- fires this event.  So it's a reliable, concrete "this is a new
+-- game" gate -- and it fires in the game-session server VM, so
+-- there's no menu-to-game VM-reset persistence problem.
+--
+-- TIMING PROBLEM (observed): CharacterCreationStarted fires very
+-- early (during the SwapLevel load phase).  A bare
+-- RelayCombatEvent broadcast at that point is LOST -- the client's
+-- net pipe isn't up yet, and BroadcastMessage doesn't buffer for
+-- not-yet-ready listeners.  Fix: a handshake.  The server REMEMBERS
+-- that CharacterCreationStarted fired (openingCinematicSeen flag --
+-- the server VM lives for the whole session, no further reset).
+-- The client, once it reaches a ready state (PrepareRunning),
+-- sends BG3Access_QueryOpeningCinematic.  Whichever of the two --
+-- the Osiris event or the client query -- happens SECOND fires
+-- the relay.  Both orderings are handled.
+--
+-- The relay is a MovieStarted for GUS_CGI01_Part1, so the client
+-- reuses the same AD_TRACKS lookup + HandleMovieStarted path as
+-- every other cinematic.
+local OPENING_CINEMATIC_QUERY_CHANNEL =
+    "BG3Access_QueryOpeningCinematic"
+local openingCinematicSeen     = false  -- CharacterCreationStarted fired
+local openingCinematicAsked    = false  -- client sent its readiness query
+local openingCinematicRelayed  = false  -- handshake already produced one relay
+
+local function RelayOpeningCinematic()
+    -- Idempotent: relay at most once per session.  The client
+    -- sends the handshake query on EVERY StopLoading -> PrepareRunning
+    -- transition (including the post-CC Nautiloid load), and the
+    -- server's openingCinematicSeen flag stays true for the whole
+    -- session.  Without this guard, every later level load would
+    -- replay the opening AD.
+    if openingCinematicRelayed then
+        _P("BG3Access: opening CGI relay suppressed"
+            .. " (already sent this session)")
+        return
+    end
+    openingCinematicRelayed = true
+    _P("BG3Access: relaying opening CGI (GUS_CGI01_Part1)"
+        .. " -- handshake complete")
+    RelayCombatEvent({
+        event = "MovieStarted",
+        movie = "GUS_CGI01_Part1",
+        source = "CharacterCreationStarted",
+    })
+end
+
+TryRegisterCinematicListener("CharacterCreationStarted", 0, "after",
+    function()
+        _P("BG3Access: CharacterCreationStarted fired"
+            .. " (openingCinematicAsked="
+            .. tostring(openingCinematicAsked) .. ")")
+        openingCinematicSeen = true
+        -- Fire the relay only if the client already asked (its
+        -- net pipe is confirmed up).  Otherwise wait for the query.
+        if openingCinematicAsked then
+            RelayOpeningCinematic()
+        end
+    end)
+
+Ext.RegisterNetListener(OPENING_CINEMATIC_QUERY_CHANNEL,
+    function()
+        _P("BG3Access: opening-cinematic query received"
+            .. " (openingCinematicSeen="
+            .. tostring(openingCinematicSeen) .. ")")
+        openingCinematicAsked = true
+        -- If CharacterCreationStarted already fired, relay now.
+        -- If not, this is a save load (or CC hasn't fired yet) --
+        -- the CharacterCreationStarted handler above will relay
+        -- when/if it fires, since openingCinematicAsked is now set.
+        if openingCinematicSeen then
+            RelayOpeningCinematic()
+        end
+    end)
+
+-- Part 2 of the opening CGI plays right after character creation
+-- completes.  CharacterCreationFinished fires server-side at that
+-- moment and ONLY on a new game.  Unlike Part 1's case, by this
+-- point the client is fully in Running state and the net pipe is
+-- live (MovieFinished relays land fine here) -- so a direct
+-- broadcast works without the handshake pattern.
+TryRegisterCinematicListener("CharacterCreationFinished", 0, "after",
+    function()
+        _P("BG3Access: CharacterCreationFinished fired"
+            .. " -- relaying GUS_CGI01_Part2")
+        RelayCombatEvent({
+            event = "MovieStarted",
+            movie = "GUS_CGI01_Part2",
+            source = "CharacterCreationFinished",
         })
     end)
 
@@ -740,7 +952,7 @@ Ext.Osiris.RegisterListener("MissedBy", 4, "after",
     end)
 
 _P("BG3Access: Combat event relay registered on '"
-    .. COMBAT_CHANNEL .. "'")
+    .. EVENTS_CHANNEL .. "'")
 
 -- ---------------------------------------------------------------------------
 -- Roll detail relay.
@@ -877,9 +1089,19 @@ end
 -- lives on the commit-time FinishedEvent and that we can't recover
 -- from the pre-commit RequestedRollComponent.
 --
--- Kept as a simple Lua table keyed by stringified UUID.  Rolls are
--- consumed at most once per playthrough; unbounded growth is a
--- non-issue in practice.
+-- TTL-based, because BG3 REUSES the same RollUuid across repeated
+-- attempts of the same logical roll (e.g., retrying a lockpick on the
+-- same door).  Without a TTL, the first attempt's entry sticks
+-- forever and every retry gets silently deduped.  TTL window only
+-- needs to span the gap between the two consecutive OnChange fires
+-- (~10s of milliseconds in practice) -- we go with 2 seconds to be
+-- comfortably above any plausible fire spacing while still being well
+-- under "user reopens the prompt" cadence.
+--
+-- Stored as uuid -> expiresAtMs.  Entries past their expiry are
+-- treated as absent; we lazily overwrite them on the next dedup
+-- check, so the table doesn't need explicit pruning.
+local LIVE_PREVIEW_DEDUP_TTL_MS = 2000
 local livePreviewSpokenUuids = {}
 
 --- Normalize a RollUuid-ish field to a string key.  BG3SE sometimes
@@ -1046,20 +1268,32 @@ local function RelayLiveRollComponent(rollComp)
     if naturalRoll == 0 then return end
 
     local uuidKey = NormalizeRollUuidKey(rollComp.RollUuid)
-    if uuidKey and livePreviewSpokenUuids[uuidKey] then return end
+    local nowMs = Ext.Utils.MonotonicTime()
+    if uuidKey then
+        local expiresAt = livePreviewSpokenUuids[uuidKey]
+        if expiresAt and nowMs < expiresAt then
+            return  -- dedup hit within TTL window
+        end
+    end
 
     local rollBucket = ClassifyRollType(rollComp.RollType)
     if rollBucket == "skip" then
         -- Mark so we also suppress the second OnChange fire for this
         -- roll (damage rolls, etc. that we intentionally ignore).
-        if uuidKey then livePreviewSpokenUuids[uuidKey] = true end
+        if uuidKey then
+            livePreviewSpokenUuids[uuidKey] =
+                nowMs + LIVE_PREVIEW_DEDUP_TTL_MS
+        end
         return
     end
 
     local rollerIsParty = IsPartyEntity(rollComp.Roller)
     local subjectIsParty = IsPartyEntity(rollComp.Subject)
     if not rollerIsParty and not subjectIsParty then
-        if uuidKey then livePreviewSpokenUuids[uuidKey] = true end
+        if uuidKey then
+            livePreviewSpokenUuids[uuidKey] =
+                nowMs + LIVE_PREVIEW_DEDUP_TTL_MS
+        end
         return
     end
 
@@ -1067,7 +1301,10 @@ local function RelayLiveRollComponent(rollComp)
         .. " uuid=" .. tostring(uuidKey)
         .. " bucket=" .. rollBucket
         .. " Natural=" .. naturalRoll)
-    if uuidKey then livePreviewSpokenUuids[uuidKey] = true end
+    if uuidKey then
+        livePreviewSpokenUuids[uuidKey] =
+            nowMs + LIVE_PREVIEW_DEDUP_TTL_MS
+    end
     RelayCombatEvent({
         event          = "RollPreview",
         rollUuid       = uuidKey or "",
@@ -2413,6 +2650,643 @@ _P("BG3Access: Subregion prime query registered on '"
     .. SUBREGION_QUERY_CHANNEL .. "'")
 
 -- ============================================================================
+-- Waypoint enumeration relay
+--
+-- Osiris owns two relevant databases:
+--   DB_WaypointInfo(group, waypointID, item, trigger)
+--     -- master list of every waypoint in the game (Act 1 + Act 2 + Act 3).
+--   DB_WaypointUnlocked(waypointID, character)
+--     -- per-player discovery state.  Shared across party members.
+--
+-- The client cannot read Osiris DBs directly.  This relay joins the two
+-- on waypointID, resolves each unlocked entry's trigger position via the
+-- Osiris GetPosition built-in, and broadcasts the result back as a JSON
+-- payload.  Trigger positions are only valid for triggers in the current
+-- level (BG3 streams others out of the server-side world); we still emit
+-- cross-level entries with position=nil so the client can offer them
+-- via TeleportToWaypoint even though they're not GPS-routable.
+--
+-- The client (Client/Locations.lua) requests a fresh snapshot on every
+-- transition to GameState=Running (save load, level warp).
+-- ============================================================================
+
+local WAYPOINTS_QUERY_CHANNEL    = "BG3Access_WaypointsQuery"
+local WAYPOINTS_RESPONSE_CHANNEL = "BG3Access_WaypointsResponse"
+
+--- TryGetTriggerPosition: wrap Osi.GetPosition in a pcall and convert
+--- the multi-return (x, y, z) into a 3-element array suitable for JSON.
+--- Returns nil for triggers in unloaded levels (GetPosition fails or
+--- returns nils for those).
+local function TryGetTriggerPosition(triggerGuid)
+    if not triggerGuid or triggerGuid == "" then return nil end
+    local ok, posX, posY, posZ = pcall(Osi.GetPosition, triggerGuid)
+    if not ok then return nil end
+    posX = tonumber(posX)
+    posY = tonumber(posY)
+    posZ = tonumber(posZ)
+    if not (posX and posY and posZ) then return nil end
+    return { posX, posY, posZ }
+end
+
+--- TryGetItemDisplayName: read the localized display string for an
+--- item entity (waypoint shrine, container, lootable, etc.) by chasing
+--- entity.DisplayName.NameKey.Handle.Handle through Ext.Loca.  Same
+--- pattern GetCharacterName uses for characters; broken out so the
+--- waypoint relay can include the user-facing label in its payload.
+---
+--- Why not Ext.Loca.GetTranslatedStringFromKey on the waypoint slug?
+--- The runtime TextToStringKey table doesn't seem to be populated
+--- with waypoint or subregion slugs at boot -- empirically, FromKey
+--- returns empty for "WAYP_CHA_Chapel" even though the slug appears
+--- in Waypointshrines.lsx.  The item entity's DisplayName, on the
+--- other hand, is always populated as long as the item is loaded in
+--- the server's ECS, which it is for waypoints in the current level
+--- (where we have a position for them).  Returns "" on miss; the
+--- client falls back to its slug-humanized name in that case.
+local function TryGetItemDisplayName(itemGuid)
+    if not itemGuid or itemGuid == "" then return "" end
+    local resolveOk, resolved = pcall(function()
+        local entity = Ext.Entity.Get(itemGuid)
+        if not entity or not entity.DisplayName then return nil end
+        local nameKey = entity.DisplayName.NameKey
+        if not nameKey or not nameKey.Handle
+            or not nameKey.Handle.Handle then
+            -- Try the alternative Name field too -- some items
+            -- populate Name instead of NameKey or both.
+            local nameField = entity.DisplayName.Name
+            if nameField and nameField.Handle
+                and nameField.Handle.Handle then
+                local altTranslated = Ext.Loca.GetTranslatedString(
+                    tostring(nameField.Handle.Handle))
+                if altTranslated and altTranslated ~= "" then
+                    return altTranslated
+                end
+            end
+            return nil
+        end
+        local translated = Ext.Loca.GetTranslatedString(
+            tostring(nameKey.Handle.Handle))
+        if translated and translated ~= "" then return translated end
+        return nil
+    end)
+    if resolveOk and resolved then return resolved end
+    return ""
+end
+
+--- TryGetTriggerLevel: returns the level/region slug the trigger
+--- lives in.  Used to populate levelSlug on each waypoint entry so
+--- the client knows which level a non-current-level waypoint is in
+--- (for "fast-travel to Act 2 waypoint while standing in Act 1"
+--- presentations).  Returns "" on miss; the client treats empty
+--- string the same as nil.
+local function TryGetTriggerLevel(triggerGuid)
+    if not triggerGuid or triggerGuid == "" then return "" end
+    local ok, level = pcall(Osi.GetRegion, triggerGuid)
+    if not ok or not level then return "" end
+    return tostring(level)
+end
+
+--- BroadcastUnlockedWaypoints: server query + relay.  Called in
+--- response to BG3Access_WaypointsQuery.  Joins DB_WaypointInfo and
+--- DB_WaypointUnlocked on the host's PlayerID, packs each unlocked
+--- row with its slug / item / trigger / position / level, and emits
+--- a single JSON broadcast.
+local function BroadcastUnlockedWaypoints()
+    local hostOk, host = pcall(Osi.GetHostCharacter)
+    if not hostOk or not host then
+        _P("BG3Access: waypoints query -- no host character, skipping")
+        return
+    end
+
+    -- Pull the unlocked list for the host.  DB_WaypointUnlocked has
+    -- one row per (waypointID, character) and is shared across the
+    -- party, so querying for the host is sufficient.
+    local unlockedRowsOk, unlockedRows = pcall(function()
+        return Osi.DB_WaypointUnlocked:Get(nil, tostring(host))
+    end)
+    if not unlockedRowsOk or not unlockedRows then unlockedRows = {} end
+
+    -- Build a set of unlocked waypoint IDs for fast lookup.
+    local unlockedSet = {}
+    for _, row in ipairs(unlockedRows) do
+        unlockedSet[tostring(row[1])] = true
+    end
+
+    -- Join against DB_WaypointInfo to recover the trigger and item
+    -- for each unlocked ID.
+    local infoRowsOk, infoRows = pcall(function()
+        return Osi.DB_WaypointInfo:Get(nil, nil, nil, nil)
+    end)
+    if not infoRowsOk or not infoRows then infoRows = {} end
+
+    local hostLevelOk, hostLevel = pcall(Osi.GetRegion, tostring(host))
+    if not hostLevelOk then hostLevel = "" end
+    hostLevel = tostring(hostLevel or "")
+
+    local payloadWaypoints = {}
+    for _, row in ipairs(infoRows) do
+        local groupId       = tostring(row[1] or "")
+        local waypointId    = tostring(row[2] or "")
+        local itemGuid      = tostring(row[3] or "")
+        local triggerGuid   = tostring(row[4] or "")
+        if waypointId ~= "" and unlockedSet[waypointId] then
+            local levelSlug      = TryGetTriggerLevel(triggerGuid)
+            local inCurrentLevel = (levelSlug ~= ""
+                and levelSlug == hostLevel)
+            local position       = inCurrentLevel
+                and TryGetTriggerPosition(triggerGuid)
+                or nil
+            -- displayName: try the item entity's DisplayName when the
+            -- item is loaded in our ECS (which is the case for any
+            -- waypoint shrine in the host's current level).  Empty
+            -- string when the lookup fails (item streamed out,
+            -- DisplayName missing, etc.); the client substitutes its
+            -- own slug-humanized fallback in that case.
+            local displayName = TryGetItemDisplayName(itemGuid)
+            payloadWaypoints[#payloadWaypoints + 1] = {
+                slug           = waypointId,
+                displayName    = displayName,
+                groupId        = groupId,
+                itemGuid       = itemGuid,
+                triggerGuid    = triggerGuid,
+                levelSlug      = levelSlug,
+                position       = position,
+                inCurrentLevel = inCurrentLevel,
+            }
+        end
+    end
+
+    local payload = {
+        waypoints = payloadWaypoints,
+    }
+    local encodeOk, encoded = pcall(Ext.Json.Stringify, payload)
+    if not encodeOk then
+        _P("BG3Access: waypoints query -- JSON encode failed")
+        return
+    end
+    pcall(Ext.ServerNet.BroadcastMessage,
+        WAYPOINTS_RESPONSE_CHANNEL, encoded)
+    _P(string.format(
+        "BG3Access: waypoints relay -- %d unlocked, %d in current level",
+        #payloadWaypoints,
+        (function()
+            local n = 0
+            for _, entry in ipairs(payloadWaypoints) do
+                if entry.inCurrentLevel then n = n + 1 end
+            end
+            return n
+        end)()))
+end
+
+Ext.RegisterNetListener(WAYPOINTS_QUERY_CHANNEL,
+    function(channel, payload, userId)
+        BroadcastUnlockedWaypoints()
+    end)
+
+_P("BG3Access: Waypoints relay registered on '"
+    .. WAYPOINTS_QUERY_CHANNEL .. "'")
+
+-- ============================================================================
+-- Hostile-on-route check relay
+--
+-- Auto-walking through hostile territory can trigger combat mid-route.  When
+-- combat initiates with a move order in flight, BG3 frequently fast-resolves
+-- the queued move during combat lock-in -- the auto-walking character ends
+-- up at the destination, the rest of the party stays where they were, and
+-- combat starts with the party split (sometimes catastrophically, with the
+-- auto-walker dropped into the middle of an enemy group alone).
+--
+-- We can't surgically cancel a queued move from Osiris (no CharacterStopMoving
+-- primitive; FlushOsirisQueue is too coarse).  So instead we PRE-CHECK the
+-- route for hostiles before dispatching auto-walk, and show the player a
+-- warning prompt with the option to walk anyway, switch to guided mode, or
+-- cancel.
+--
+-- IMPORTANT: the check enumerates entities SERVER-SIDE rather than asking the
+-- client which NPCs are near the path.  Reason: BG3 streams entities to the
+-- client lazily.  In practice the client-side scanner often returns 0 NPCs
+-- even when hostile creatures sit a few meters away (intellect devourers in
+-- the Ravaged Beach wreckage are a documented case -- they aggro within
+-- seconds of player approach yet don't appear in the client's IsCharacter /
+-- ClientCharacter component query).  The server-side simulation always has
+-- the full picture; doing the check there sidesteps the streaming horizon
+-- entirely.
+--
+-- Client sends: { queryId, proximityM, path = [{x,y,z}, ...] }.
+-- Server iterates all live characters, filters by:
+--   1. coarse distance to first path node (60m); rejects far-flung NPCs
+--      without an expensive PointToSegment call.
+--   2. distance to nearest path segment (PROXIMITY_M).
+--   3. hostility via Osi.IsEnemy.
+-- Returns: { queryId, hostile = [uuid, ...] }.
+-- ============================================================================
+
+local HOSTILE_CHECK_CHANNEL  = "BG3Access_HostileCheck"
+local HOSTILE_RESULT_CHANNEL = "BG3Access_HostileCheckResult"
+local HOSTILE_COARSE_FILTER_M = 60  -- skip server-side proximity math for entities outside this radius.
+
+--- DistanceSquaredXZ: 2D (X, Z) squared distance.  Avoids sqrt for
+--- the proximity checks where we only care about the comparison.
+local function DistanceSquaredXZ(a, b)
+    local dx = a[1] - b[1]
+    local dz = a[3] - b[3]
+    return dx * dx + dz * dz
+end
+
+--- PointToSegmentDistanceSquaredXZ: closest 2D distance from a point to a
+--- finite line segment, squared.  Parameter-clamped: the foot of the
+--- perpendicular is bounded to the segment's [0, 1] parameter range so
+--- segment-endpoint cases stay numerically stable.
+local function PointToSegmentDistanceSquaredXZ(point, segStart, segEnd)
+    local dx = segEnd[1] - segStart[1]
+    local dz = segEnd[3] - segStart[3]
+    local lengthSquared = dx * dx + dz * dz
+    if lengthSquared == 0 then
+        return DistanceSquaredXZ(point, segStart)
+    end
+    local t = ((point[1] - segStart[1]) * dx
+             + (point[3] - segStart[3]) * dz) / lengthSquared
+    if t < 0 then t = 0 end
+    if t > 1 then t = 1 end
+    local projX = segStart[1] + t * dx
+    local projZ = segStart[3] + t * dz
+    local edx = point[1] - projX
+    local edz = point[3] - projZ
+    return edx * edx + edz * edz
+end
+
+--- TryReadEntityPosition: read a character entity's world position
+--- defensively.  Layout varies by component shape; pcall every
+--- access so a stripped-down entity (loading state, dead-but-still-
+--- ECS-resident, etc.) can't take down the scan loop.
+local function TryReadEntityPosition(entity)
+    if not entity then return nil end
+    local result = nil
+    pcall(function()
+        if not entity.Transform then return end
+        local t = entity.Transform.Transform
+        if not t then return end
+        local translate = t.Translate
+        if not translate then return end
+        -- Translate is a vec3 userdata; index by [1]/[2]/[3] OR
+        -- access .x/.y/.z depending on bindings shape.
+        local x = tonumber(translate[1] or translate.x)
+        local y = tonumber(translate[2] or translate.y)
+        local z = tonumber(translate[3] or translate.z)
+        if x and y and z then
+            result = { x, y, z }
+        end
+    end)
+    return result
+end
+
+--- TryReadEntityUuid: defensive UUID extraction.
+local function TryReadEntityUuid(entity)
+    if not entity then return "" end
+    local uuid = ""
+    pcall(function()
+        if entity.Uuid and entity.Uuid.EntityUuid then
+            uuid = tostring(entity.Uuid.EntityUuid)
+        end
+    end)
+    return uuid
+end
+
+Ext.RegisterNetListener(HOSTILE_CHECK_CHANNEL,
+    function(channel, payload, userId)
+        local parseOk, request = pcall(Ext.Json.Parse, payload)
+        if not parseOk or type(request) ~= "table" then
+            return
+        end
+
+        local queryId    = request.queryId
+        local proximityM = tonumber(request.proximityM) or 25
+        local pathNodes  = request.path
+
+        local function RespondEmpty(reason)
+            local emptyOk, emptyPayload = pcall(Ext.Json.Stringify, {
+                queryId = queryId,
+                hostile = {},
+            })
+            if emptyOk then
+                pcall(Ext.ServerNet.BroadcastMessage,
+                    HOSTILE_RESULT_CHANNEL, emptyPayload)
+            end
+            _P("BG3Access: hostile-check responded empty ("
+                .. tostring(reason) .. ")")
+        end
+
+        if type(pathNodes) ~= "table" or #pathNodes == 0 then
+            RespondEmpty("no path nodes")
+            return
+        end
+
+        local hostOk, host = pcall(Osi.GetHostCharacter)
+        if not hostOk or not host then
+            RespondEmpty("no host character")
+            return
+        end
+        local hostString = tostring(host)
+
+        -- Filter approach (after Osi.IsEnemy returns 1):
+        --   Phantom-vs-real:  OR of three signals --
+        --     IsOnStage              (live in scene)
+        --     CanJoinCombat == 0     (ambush system tagged it)
+        --     HasActiveStatus
+        --         ("AMBUSHING")      (pre-aggro ambusher status)
+        --   Osi.IsDead == 0           (no corpses)
+        --   Osi.HasLineOfSight == 1   (geometrically visible)
+        --
+        -- IsOnStage alone was tried and rejected: BG3 off-stages
+        -- pre-aggro encounter enemies (Intellect Devourers waiting
+        -- to ambush you at the dirt mound) so they look identical
+        -- to phantom templates at the IsOnStage level.  The ambush
+        -- system's own bookkeeping (CanJoinCombat flip + AMBUSHING
+        -- status) gives us the missing signal.  Reference:
+        -- D:\extracted packs\Osi\_Global_Ambush.txt:52 (CanJoinCombat
+        -- flip at story init), :59 (AMBUSHING apply), :235 (flip back
+        -- to 1 when trigger fires).
+        --
+        -- Region-equality (Osi.GetRegion) was tried and rejected:
+        -- Act 1 camp collapses to "WLD_Main_A" same as wilderness.
+        -- Osi.IsActive was tried and rejected: means "in active
+        -- combat," rejects pre-aggro real enemies.
+
+        -- Server-side entity enumeration.  Pulls EVERY live character
+        -- in the simulation -- not just whatever's streamed to the
+        -- client.  Per-creature cost is bounded by the coarse pre-
+        -- filter below; we only run the expensive Osi.IsEnemy call
+        -- for characters whose position is even potentially near the
+        -- path.
+        local componentName = "IsCharacter"
+        local entitiesOk, entities = pcall(
+            Ext.Entity.GetAllEntitiesWithComponent, componentName)
+        if not entitiesOk or not entities then
+            entities = {}
+        end
+
+        local proximitySquared    = proximityM * proximityM
+        local coarseMaxSquared    = HOSTILE_COARSE_FILTER_M
+                                  * HOSTILE_COARSE_FILTER_M
+        local firstNode           = pathNodes[1]
+        local hostile             = {}
+        local examined            = 0
+        local nearPathCandidates  = 0
+        local enemyHits           = 0   -- IsEnemy returned 1 (pre-LoS filter)
+        local skippedOffLevel     = 0   -- Region-filter rejections
+
+        for _, entity in ipairs(entities) do
+            local pos = TryReadEntityPosition(entity)
+            if pos then
+                examined = examined + 1
+                -- Coarse pre-filter: distance to path origin.  If
+                -- even this is way out, the character can't be
+                -- within proximityM of any path segment unless the
+                -- path bends crazily -- worth the cost-cut.
+                local coarseSquared =
+                    DistanceSquaredXZ(pos, firstNode)
+                if coarseSquared <= coarseMaxSquared then
+                    -- Fine filter: nearest point on path.
+                    local minSquared = nil
+                    if #pathNodes == 1 then
+                        minSquared = coarseSquared
+                    else
+                        for i = 1, #pathNodes - 1 do
+                            local d = PointToSegmentDistanceSquaredXZ(
+                                pos, pathNodes[i], pathNodes[i + 1])
+                            if minSquared == nil or d < minSquared then
+                                minSquared = d
+                            end
+                        end
+                    end
+                    if minSquared and minSquared <= proximitySquared then
+                        nearPathCandidates = nearPathCandidates + 1
+                        local uuid = TryReadEntityUuid(entity)
+                        if uuid ~= "" then
+                            -- Skip self.  Osi.IsEnemy(self, self)
+                            -- should return 0 anyway, but short-
+                            -- circuiting is cheaper than calling out.
+                            if uuid ~= hostString then
+                                local enemyOk, enemyResult = pcall(
+                                    Osi.IsEnemy, hostString, uuid)
+                                if enemyOk
+                                    and tonumber(enemyResult) == 1 then
+                                    enemyHits = enemyHits + 1
+                                    -- Phantom-vs-real discriminator.
+                                    -- Both phantoms (Y=0 unstaged
+                                    -- templates at camp) AND pre-
+                                    -- aggro encounter enemies look
+                                    -- identical to IsOnStage / IsActive
+                                    -- / GetRegion (BG3 off-stages
+                                    -- encounter enemies until their
+                                    -- trigger fires).  Three signals
+                                    -- distinguish a real threat from
+                                    -- a phantom:
+                                    --
+                                    --   1. IsOnStage == 1
+                                    --      Live in-scene enemy (open
+                                    --      combat or roaming hostile).
+                                    --
+                                    --   2. CanJoinCombat == 0
+                                    --      Larian's ambush system at
+                                    --      _Global_Ambush.txt:52 calls
+                                    --      SetCanJoinCombat(uuid, 0)
+                                    --      on every pre-aggro ambusher
+                                    --      and SetCanJoinCombat(uuid,
+                                    --      1) when the trigger fires.
+                                    --      Phantoms retain the default
+                                    --      CanJoinCombat = 1.
+                                    --
+                                    --   3. HasActiveStatus("AMBUSHING")
+                                    --      Pre-aggro ambushers carry
+                                    --      the AMBUSHING status (some
+                                    --      use a custom variant -- the
+                                    --      script applies the status
+                                    --      at _Global_Ambush.txt:59).
+                                    --      Phantoms don't.
+                                    --
+                                    -- Include if ANY of the three
+                                    -- fire; drop only if all three
+                                    -- say "not a threat."
+                                    local stageOk, stageResult = pcall(
+                                        Osi.IsOnStage, uuid)
+                                    local isOnStage = stageOk
+                                        and tonumber(stageResult) == 1
+
+                                    local joinOk, joinResult = pcall(
+                                        Osi.CanJoinCombat, uuid)
+                                    local cannotJoinCombat = joinOk
+                                        and tonumber(joinResult) == 0
+
+                                    local statusOk, statusResult = pcall(
+                                        Osi.HasActiveStatus, uuid,
+                                        "AMBUSHING")
+                                    local isAmbushing = statusOk
+                                        and tonumber(statusResult) == 1
+
+                                    if not (isOnStage
+                                        or cannotJoinCombat
+                                        or isAmbushing) then
+                                        skippedOffLevel =
+                                            skippedOffLevel + 1
+                                        goto continue_entity
+                                    end
+                                    -- Alive gate: corpses tagged
+                                    -- enemy aren't a real threat.
+                                    local deadOk, deadResult =
+                                        pcall(Osi.IsDead, uuid)
+                                    if deadOk
+                                        and tonumber(deadResult)
+                                            == 1 then
+                                        skippedOffLevel =
+                                            skippedOffLevel + 1
+                                        goto continue_entity
+                                    end
+                                    -- Line-of-sight filter.  IsEnemy
+                                    -- returns 1 for every faction-
+                                    -- hostile character globally,
+                                    -- including ones occluded by
+                                    -- walls / wards / floors that the
+                                    -- player physically cannot fight
+                                    -- right now (e.g. shadow-cursed
+                                    -- creatures outside Last Light
+                                    -- Inn's barrier, monsters on
+                                    -- another floor of the building).
+                                    -- HasLineOfSight respects the
+                                    -- engine's geometry occlusion --
+                                    -- if the host can't see the
+                                    -- candidate, the candidate isn't
+                                    -- an immediate threat to a route
+                                    -- that starts from the host's
+                                    -- current position.  Anything
+                                    -- LoS-visible is included; LoS-
+                                    -- occluded is dropped silently.
+                                    -- One extra Osi call per
+                                    -- candidate that already passed
+                                    -- IsEnemy (typically <20 entities
+                                    -- per check), not per scanned
+                                    -- character (which can be 13k+).
+                                    local losOk, losResult = pcall(
+                                        Osi.HasLineOfSight,
+                                        hostString, uuid)
+                                    if losOk
+                                        and tonumber(losResult) == 1 then
+                                        hostile[#hostile + 1] = uuid
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            ::continue_entity::
+        end
+
+        -- Trigger-volume path check.  Catches pre-aggro encounter
+        -- enemies that the entity-based filter misses because they
+        -- aren't IsEnemy=1 yet (Intellect Devourers via SpotPlayers
+        -- pattern, hidden ambushers that flip faction only when the
+        -- trigger fires).  Enumerates encounter trigger UUIDs from
+        -- the Osiris databases that the engine itself uses to define
+        -- encounters, then checks whether any path node falls inside
+        -- any of those trigger volumes.  Authoritative: catches the
+        -- encounter as the level designer set it up, regardless of
+        -- the entity-state guesswork the IsEnemy filter requires.
+        --
+        -- References (D:\extracted packs\Osi\):
+        --   _GLO_SpotPlayers.txt -- SpotPlayers DB definitions
+        --   _Global_Ambush.txt   -- AmbushTrigger DB definitions
+        --   debug.log:5434       -- PositionIsInTrigger signature
+        --
+        -- Self-cleaning: rows are deleted from the DBs when the
+        -- encounter triggers, so we automatically stop warning
+        -- about already-fired encounters.
+        local encounterTriggers = {}
+        local spotRowsOk, spotRows = pcall(function()
+            return Osi.DB_SpotPlayers_SpotTrigger:Get(nil, nil, nil)
+        end)
+        if spotRowsOk and spotRows then
+            for _, row in ipairs(spotRows) do
+                local triggerUuid = tostring(row[3] or "")
+                if triggerUuid ~= "" then
+                    encounterTriggers[triggerUuid] = "spot"
+                end
+            end
+        end
+        local ambushRowsOk, ambushRows = pcall(function()
+            return Osi.DB_AmbushTrigger_Ambusher:Get(nil, nil, nil)
+        end)
+        if ambushRowsOk and ambushRows then
+            for _, row in ipairs(ambushRows) do
+                local triggerUuid = tostring(row[1] or "")
+                if triggerUuid ~= "" then
+                    encounterTriggers[triggerUuid] = "ambush"
+                end
+            end
+        end
+
+        local triggerHit       = nil
+        local triggersChecked  = 0
+        for triggerUuid, kind in pairs(encounterTriggers) do
+            triggersChecked = triggersChecked + 1
+            for _, node in ipairs(pathNodes) do
+                local x = tonumber(node[1])
+                local y = tonumber(node[2])
+                local z = tonumber(node[3])
+                if x and y and z then
+                    local hitOk, hitResult = pcall(
+                        Osi.PositionIsInTrigger,
+                        x, y, z, triggerUuid)
+                    if hitOk
+                        and tonumber(hitResult) == 1 then
+                        triggerHit = {
+                            uuid = triggerUuid,
+                            kind = kind,
+                        }
+                        break
+                    end
+                end
+            end
+            if triggerHit then break end
+        end
+
+        -- If the path enters an encounter trigger, append a
+        -- sentinel to the hostile list so the client's existing
+        -- "if #hostile > 0 then prompt" logic fires.  Sentinel
+        -- prefix lets future client code distinguish trigger-
+        -- driven warnings from entity-driven ones if we ever want
+        -- different prompt text per source.
+        if triggerHit then
+            hostile[#hostile + 1] = "ENCOUNTER_TRIGGER:"
+                .. triggerHit.uuid
+        end
+
+        local responsePayload = {
+            queryId = queryId,
+            hostile = hostile,
+        }
+        local encodeOk, encoded = pcall(Ext.Json.Stringify,
+            responsePayload)
+        if not encodeOk then return end
+        pcall(Ext.ServerNet.BroadcastMessage,
+            HOSTILE_RESULT_CHANNEL, encoded)
+        _P(string.format(
+            "BG3Access: hostile-check -- %d examined, "
+                .. "%d within %.0fm of path, %d enemy-tagged, "
+                .. "%d off-stage/dead skipped, %d visible (hostile),"
+                .. " %d encounter triggers checked, trigger hit: %s",
+            examined, nearPathCandidates, proximityM,
+            enemyHits, skippedOffLevel, #hostile - (triggerHit
+                and 1 or 0),
+            triggersChecked,
+            (triggerHit and (triggerHit.kind .. " "
+                .. triggerHit.uuid)) or "none"))
+    end)
+
+_P("BG3Access: Hostile-check relay registered on '"
+    .. HOSTILE_CHECK_CHANNEL .. "'")
+
+-- ============================================================================
 -- Auto-walk relay (Osiris CharacterMoveToPosition / CharacterMoveTo)
 --
 -- Replaces clock-face guidance for routing-list selections.  When the
@@ -2452,6 +3326,16 @@ local function RelayAutoWalkResult(eventKind, characterUuid, targetName)
     pcall(Ext.ServerNet.BroadcastMessage,
         AUTOWALK_RESULT_CHANNEL, jsonStr)
 end
+
+-- Track in-flight walks by character UUID -> {targetName, targetUuid}
+-- so the arrival event handler can name the destination on the client
+-- AND rotate the character to face the target.  MUST be declared
+-- BEFORE the AUTOWALK_CHANNEL listener registration below, because
+-- that listener captures it as an upvalue at definition time -- if
+-- the local hadn't been declared yet, the reference resolves as a
+-- global and reads as nil at call time ("attempt to index a nil
+-- value (global 'pendingAutoWalkTargets')").
+local pendingAutoWalkTargets = {}
 
 Ext.RegisterNetListener(AUTOWALK_CHANNEL,
     function(channel, payload, userId)
@@ -2504,6 +3388,13 @@ Ext.RegisterNetListener(AUTOWALK_CHANNEL,
         end
 
         if invokeOk then
+            -- Record the target UUID (if any) so the arrival listener
+            -- can rotate the character to face the target on arrival.
+            -- Position-only moves get targetUuid=nil and skip facing.
+            pendingAutoWalkTargets[characterUuid] = {
+                targetName = targetName,
+                targetUuid = (targetUuid ~= "" and targetUuid) or nil,
+            }
             RelayAutoWalkResult("started", characterUuid, targetName)
         else
             _P("BG3Access: AutoWalk Osi call error: " .. tostring(invokeErr))
@@ -2511,9 +3402,10 @@ Ext.RegisterNetListener(AUTOWALK_CHANNEL,
         end
     end)
 
--- Track in-flight walks by character UUID -> target name so the
--- arrival event handler can name the destination on the client.
-local pendingAutoWalkTargets = {}
+-- (pendingAutoWalkTargets is declared above the AUTOWALK_CHANNEL
+-- listener registration -- both this _TrackTarget listener and the
+-- main listener use it, and forward-declaration is required to keep
+-- Lua's upvalue resolution from making it global.)
 
 Ext.RegisterNetListener(AUTOWALK_CHANNEL .. "_TrackTarget",
     function(channel, payload, userId)
@@ -2521,25 +3413,88 @@ Ext.RegisterNetListener(AUTOWALK_CHANNEL .. "_TrackTarget",
         if not parseOk or type(request) ~= "table" then return end
         local characterUuid = tostring(request.characterUuid or "")
         if characterUuid == "" then return end
-        pendingAutoWalkTargets[characterUuid] =
-            tostring(request.targetName or "")
+        -- Don't overwrite a struct the dispatch handler already
+        -- stored -- that would drop the targetUuid and prevent the
+        -- arrival handler from rotating the character to face the
+        -- target.  Update the name field only when a struct exists;
+        -- only fall back to bare-string storage when neither handler
+        -- has set anything yet.
+        local existing = pendingAutoWalkTargets[characterUuid]
+        local incomingName = tostring(request.targetName or "")
+        if type(existing) == "table" then
+            existing.targetName = incomingName
+        else
+            pendingAutoWalkTargets[characterUuid] = {
+                targetName = incomingName,
+                targetUuid = nil,
+            }
+        end
     end)
+
+-- Note: a CombatStarted-triggered PROC_CharacterMoveTo_ClearAll
+-- was tried here and removed.  ClearAll returned ok=true but the
+-- engine still teleported the character to the destination during
+-- the combat-lock window -- Osiris listeners fire AFTER the engine
+-- has already committed to resolving the queued move.  The correct
+-- fix is to make the pre-walk hostile-check warning reliable
+-- enough that the user never auto-walks into an unintended combat
+-- in the first place; the trigger-volume path intersection below
+-- in the HOSTILE_CHECK_CHANNEL listener catches encounter-staged
+-- enemies (e.g. SpotPlayers-pattern Intellect Devourers) that
+-- previously slipped past the IsEnemy filter.
 
 -- Listen for the arrival event we instructed the engine to fire.
 -- Osi.RegisterListener pattern (used elsewhere in this file for
 -- combat events).  Engine fires this as EntityEvent(character,
 -- AUTOWALK_EVENT_NAME) when the auto-walk completes.
+--
+-- On arrival we also rotate the character to face the target if we
+-- have a target UUID -- LookAtEntity is the canonical Osiris primitive
+-- (Larian uses it in __PROC.txt with a 3-second duration; we match
+-- that).  Position-only moves (waypoints, discovered places) skip
+-- facing because no entity reference is available.
 local autoWalkArrivalSubOk, autoWalkArrivalErr = pcall(
     Ext.Osiris.RegisterListener,
     "EntityEvent", 2, "before", function(characterRef, eventName)
         if tostring(eventName) ~= AUTOWALK_EVENT_NAME then return end
         local characterUuid = EntityRefToUuid(characterRef)
         if not characterUuid then return end
-        local targetName = pendingAutoWalkTargets[characterUuid] or ""
+        local trackInfo = pendingAutoWalkTargets[characterUuid]
         pendingAutoWalkTargets[characterUuid] = nil
+
+        -- Read both old (bare string) and new (table) tracking shapes.
+        -- The two coexist because the legacy AUTOWALK_TRACK_CHANNEL
+        -- still sets bare strings; whichever message arrived last wins.
+        local targetName = ""
+        local targetUuid = nil
+        if type(trackInfo) == "table" then
+            targetName = trackInfo.targetName or ""
+            targetUuid = trackInfo.targetUuid
+        elseif type(trackInfo) == "string" then
+            targetName = trackInfo
+        end
+
         _P("BG3Access: AutoWalk arrived char=" .. characterUuid
-            .. " target=" .. targetName)
+            .. " target=" .. targetName
+            .. " uuid=" .. tostring(targetUuid or "(none)"))
         RelayAutoWalkResult("arrived", characterUuid, targetName)
+
+        -- Face the target if we have an entity reference.  3 seconds
+        -- = Larian's default duration (see __PROC.txt:2487).  Wrapped
+        -- in pcall so a bad UUID can't take down the relay; failure
+        -- just means the character keeps facing its walk direction,
+        -- which is harmless.
+        if targetUuid and targetUuid ~= "" then
+            local lookOk, lookErr = pcall(Osi.LookAtEntity,
+                characterUuid, targetUuid, 3)
+            if lookOk then
+                _P("BG3Access: AutoWalk facing target "
+                    .. tostring(targetUuid))
+            else
+                _P("BG3Access: AutoWalk LookAtEntity failed: "
+                    .. tostring(lookErr))
+            end
+        end
     end)
 if not autoWalkArrivalSubOk then
     _P("BG3Access: AutoWalk arrival listener FAILED: "
@@ -2548,3 +3503,69 @@ end
 
 _P("BG3Access: AutoWalk relay registered on '"
     .. AUTOWALK_CHANNEL .. "'")
+
+
+-- ============================================================================
+-- GPS navigation beacon -- PRODUCTION channels.
+--
+-- Client-side gpsBeacon table in WorldNav.lua drives this; the server
+-- is a thin shell that spawns / moves / despawns an invisible
+-- Helper_Invisible_A item at the requested position on each call.
+-- The actual audio (PostEvent on the item entity at metronome cadence)
+-- runs entirely client-side via Ext.Audio.PostEvent.
+--
+-- See memory/project_navigation_beacon.md for the full architecture
+-- writeup, including why this template + why this Wwise event + why
+-- the entity-handle routing was the only working spatialization path.
+-- ============================================================================
+
+-- Generic invisible-helper item template.  Has SoundComponent (which
+-- the Ext.Audio.PostEvent entity-handle path needs) plus no visual,
+-- no collision, no pickup interaction -- so the beacon item is
+-- functionally invisible to the player but acts as a positioned
+-- Wwise emitter that we can move arbitrarily.
+local BEACON_DUMMY_TEMPLATE = "4cc75168-a81e-4a5c-85cd-1bab8d7bb641"
+
+Ext.RegisterNetListener("BG3Access_GPSBeaconSpawn",
+    function(channel, payload, userId)
+        local parseOk, request = pcall(Ext.Json.Parse, payload)
+        if not parseOk or type(request) ~= "table" then return end
+        local x = tonumber(request.x)
+        local y = tonumber(request.y)
+        local z = tonumber(request.z)
+        if not (x and y and z) then return end
+        local createOk, item = pcall(Osi.CreateAt,
+            BEACON_DUMMY_TEMPLATE, x, y, z, 0, 0, "")
+        if not createOk or not item or item == "" then
+            _P("BG3Access: GPS beacon spawn FAILED: " .. tostring(item))
+            return
+        end
+        local payload2 = Ext.Json.Stringify({ itemGuid = tostring(item) })
+        pcall(Ext.ServerNet.PostMessageToUser, userId,
+            "BG3Access_GPSBeaconReady", payload2)
+    end)
+
+Ext.RegisterNetListener("BG3Access_GPSBeaconMove",
+    function(channel, payload, userId)
+        local parseOk, request = pcall(Ext.Json.Parse, payload)
+        if not parseOk or type(request) ~= "table" then return end
+        if not request.itemGuid then return end
+        local x = tonumber(request.x)
+        local y = tonumber(request.y)
+        local z = tonumber(request.z)
+        if not (x and y and z) then return end
+        -- Snap teleport speed -- the beacon needs to be at the new
+        -- node position immediately for navigation cues to be useful.
+        pcall(Osi.ItemMoveToPosition,
+            tostring(request.itemGuid), x, y, z, 999.0, 999.0, "")
+    end)
+
+Ext.RegisterNetListener("BG3Access_GPSBeaconDespawn",
+    function(channel, payload, userId)
+        local parseOk, request = pcall(Ext.Json.Parse, payload)
+        if not parseOk or type(request) ~= "table" then return end
+        if not request.itemGuid then return end
+        pcall(Osi.RequestDelete, tostring(request.itemGuid))
+    end)
+
+_P("BG3Access: GPS beacon channels registered")

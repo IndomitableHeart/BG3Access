@@ -144,6 +144,14 @@ local function Toggle(handler, tooltipTexts)
     -- Subscribe d-pad input for navigation.
     detailViewButtonSubscription =
         Ext.Events.ControllerButtonInput:Subscribe(function(event)
+            -- BG3Access settings menu owns D-pad while open.  Bow
+            -- out so the user can configure without also navigating
+            -- the detail view in parallel.
+            local SettingsMenu = BG3Access.Client.SettingsMenu
+            if SettingsMenu and SettingsMenu.IsOpen
+                and SettingsMenu.IsOpen() then
+                return
+            end
             if not event.Pressed then return end
             local buttonName = tostring(event.Button)
             if buttonName == "DPadDown" then

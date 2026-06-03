@@ -541,11 +541,9 @@ local function CreateSpellBookHandler(createPanelHandler)
             local dcProps = focusedElement.dcProps
             local elemId = focusedElement.elemId or ""
 
-            -- Widget navigation fake elements: suppress or say "Empty slot".
-            if elemId:find("WidgetNavigationPrimaryFakeElement")
-                or elemId:find("WidgetNavigationSecondaryFakeElement") then
-                return "Empty slot", nil, nil
-            end
+            -- (LSGrid empty-cell phantoms now handled universally by
+            -- Helpers.CleanElementName -- the factory's generic path
+            -- speaks "Empty slot" before reaching here.)
 
             -- Tab ListBoxItem: suppress as item (screen entry speaks it).
             -- Spellbook tabs use "ListBoxItem::ListBoxItem:" not
@@ -885,7 +883,19 @@ local function CreateSpellBookHandler(createPanelHandler)
                         goto nextTT
                     end
 
-                    -- Frequency.
+                    -- Use limits split into two semantic categories
+                    -- with their own toggles:
+                    --
+                    --   * Frequency (gated by speakFrequency):
+                    --     per-turn caps.  Speech: "Frequency: Once
+                    --     per turn".
+                    --   * Recharges (gated by speakRecharge):
+                    --     rest-cycle reset triggers.  Speech:
+                    --     "Recharges: on Short Rest" -- the screen
+                    --     reader treats the colon as a brief pause,
+                    --     so this reads close to "Recharges on
+                    --     Short Rest" without needing empty-label
+                    --     gymnastics.
                     if cleaned == "Per turn" then
                         speechData:AddProperty("Frequency",
                             "Once per turn", "verbose")
@@ -893,8 +903,8 @@ local function CreateSpellBookHandler(createPanelHandler)
                     end
                     if cleaned == "Short Rest"
                         or cleaned == "Long Rest" then
-                        speechData:AddProperty("Frequency",
-                            "Recharges on " .. cleaned, "verbose")
+                        speechData:AddProperty("Recharges",
+                            "on " .. cleaned, "verbose")
                         goto nextTT
                     end
 

@@ -245,6 +245,12 @@ local function Open(focusedSpeech, compareSpeech)
     -- tab-switching underneath the open view.
     compareButtonSubscription =
         Ext.Events.ControllerButtonInput:Subscribe(function(event)
+            -- BG3Access settings menu owns D-pad while open.
+            local SettingsMenu = BG3Access.Client.SettingsMenu
+            if SettingsMenu and SettingsMenu.IsOpen
+                and SettingsMenu.IsOpen() then
+                return
+            end
             if not event.Pressed then return end
             local buttonName = tostring(event.Button)
             if buttonName == "DPadDown" then
