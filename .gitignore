@@ -1,1 +1,5 @@
 .claude/
+
+# Runtime marker written by the auto-update loader; not source code.
+.bg3access_version.txt
+

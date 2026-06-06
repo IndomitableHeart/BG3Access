@@ -1136,6 +1136,42 @@ ReadTurnOrder = function()
         if #turnEntries > 0 then break end
     end
 
+    -- Filter out non-combatants.  BG3 puts environment objects
+    -- (illithid bulbs in the Nautiloid prologue, chests, barrels,
+    -- crates, etc.) into the TurnOrder array with a sentinel
+    -- InitiativeRoll of -20 so they sit at the bottom of the order
+    -- and never actually act.  Announcing them as "Initiative: ...,
+    -- Bulb, Bulb, Bulb, Chest, Tav..." is just noise that pushes the
+    -- real combatants down the spoken list.
+    --
+    -- Threshold note: legitimate initiative rolls are 1d20 + DEX
+    -- modifier.  Worst-case legitimate value is 1 + (-5) = -4 for a
+    -- DEX 1 creature rolling a natural 1.  -20 is well below that,
+    -- so the threshold cleanly separates sentinels from real rolls.
+    -- We also keep entries with unknown initiative (nil) since
+    -- failing to read the component shouldn't silently drop a
+    -- combatant -- better to over-announce than under-announce when
+    -- the data is missing.
+    local NON_COMBATANT_INITIATIVE_THRESHOLD = -20
+    local filteredEntries = {}
+    local droppedCount = 0
+    for _, entry in ipairs(turnEntries) do
+        if not entry.initiative
+            or entry.initiative > NON_COMBATANT_INITIATIVE_THRESHOLD then
+            filteredEntries[#filteredEntries + 1] = entry
+        else
+            droppedCount = droppedCount + 1
+        end
+    end
+    if droppedCount > 0 and Log then
+        Log.Info("Combat.ReadTurnOrder: filtered "
+            .. droppedCount
+            .. " non-combatant entries (initiative <= "
+            .. NON_COMBATANT_INITIATIVE_THRESHOLD
+            .. ")")
+    end
+    turnEntries = filteredEntries
+
     return #turnEntries > 0 and turnEntries or nil
 end
 

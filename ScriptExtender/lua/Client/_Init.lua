@@ -2,7 +2,6 @@
 -- Release packaging strips this line (see marker below) and excludes
 -- DevConfig.lua from the distributed zip.  Must load BEFORE any
 -- module that checks BG3Access.DevMode.
-pcall(Ext.Require, "Client/DevConfig.lua")  -- DEV-ONLY: strip on release
 
 -- Load order notes:
 --   - Logger first so every other module can Log.Info/Warn on load.
@@ -43,5 +42,6 @@ BG3Access.Shared.RequireFiles("Client/", {
 "HUDReader",
 "SettingsMenu",
 "EventRouter",
+"UpdateNotice",
 "Welcome",
 })
