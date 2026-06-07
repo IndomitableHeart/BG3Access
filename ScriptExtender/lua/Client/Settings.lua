@@ -495,6 +495,62 @@ end
 Settings.RegisterCategory("verbositySettings", "Verbosity settings")
 Settings.RegisterCategory("gpsSettings", "GPS settings")
 
+
+--- TrimTrailingZeroComponents: turn "0.1.3.0" into "0.1.3" by
+--- dropping trailing ".0" segments.  Never trims below 2 components,
+--- so "1.0.0.0" becomes "1.0" not just "1".  Matches the version
+--- format users see in the auto-update announcement (UpdateNotice.lua
+--- uses the same logic) so the two stay consistent.
+local function TrimTrailingZeroComponents(versionString)
+    if not versionString or versionString == "" then
+        return versionString
+    end
+    local parts = {}
+    for segment in string.gmatch(versionString, "[^.]+") do
+        parts[#parts + 1] = segment
+    end
+    while #parts > 2 and parts[#parts] == "0" do
+        parts[#parts] = nil
+    end
+    return table.concat(parts, ".")
+end
+
+
+--- GetModVersion: read the auto-generated _Version.lua module that
+--- build_release.py writes into the mod folder during release staging.
+--- Returns the version string ("0.1.3.0") or "(dev build)" if the
+--- file is absent -- the latter signals a dev workspace where no
+--- release has been built.
+local function GetModVersion()
+    local ok, version = pcall(Ext.Require, "Client/_Version.lua")
+    if not ok or type(version) ~= "string" or version == "" then
+        return "(dev build)"
+    end
+    return TrimTrailingZeroComponents(version)
+end
+
+
+-- About entry.  Sits at the root of the Settings menu (no category).
+-- The "value" of the setting is the version string itself, so when the
+-- user navigates to it the menu reads "About: 0.1.3" (DescribeEntry's
+-- standard "Label: value" formatting).
+--
+-- valueOptions is a single-item list containing only the current
+-- version so the entry registers as user-facing (the menu skips
+-- entries whose valueOptions is nil) but D-pad Left/Right have only
+-- one option to cycle to -- effectively read-only.
+--
+-- Settings.Set after RegisterDefault forces the stored value to the
+-- current version, overriding any stale value persisted from a
+-- previous release.  Without this, a user who installed v0.1.3 then
+-- updated to v0.1.4 would still see "About: 0.1.3" until they cleared
+-- their settings file -- RegisterDefault prefers a persisted value
+-- over the default we pass in.
+local modVersionString = GetModVersion()
+Settings.RegisterDefault("about", modVersionString,
+    { modVersionString }, "About")
+Settings.Set("about", modVersionString)
+
 BG3Access.Client.Settings = Settings
 
 return Settings

@@ -104,6 +104,13 @@ local function DescribeEntry(entryKey)
         and Settings.IsCustomized() then
         return entry.label .. ": Custom"
     end
+    -- Custom phrasing for the About entry: read as "BG3Access version
+    -- X.Y.Z" rather than the standard "About: X.Y.Z" formatting.  The
+    -- label "About" is still used by HINTS lookup (X-button help) and
+    -- any future generic UI; just the spoken form on navigation differs.
+    if entryKey == "about" then
+        return "BG3Access version " .. FormatValue(entry.currentValue)
+    end
     return entry.label .. ": " .. FormatValue(entry.currentValue)
 end
 
@@ -163,6 +170,13 @@ end
 -- available for this setting." -- distinguishes a silent button
 -- (broken binding) from a deliberately undocumented case.
 local HINTS = {
+    -- ============================================================
+    -- Root-level info entries
+    -- ============================================================
+    about = "Shows the installed version of BG3Access.  Updates "
+        .. "automatically on each release; in a development build "
+        .. "the version reads 'dev build' instead of a number.",
+
     -- ============================================================
     -- Categories (submenu nodes)
     -- ============================================================

@@ -8,6 +8,16 @@ Versions follow [Semantic Versioning](https://semver.org/): MAJOR.MINOR.PATCH.
 
 ---
 
+## 0.1.3 - 2026-06-07
+
+### Added
+
+- An "About" entry at the top of the settings menu (right-stick
+  down to open) that reads the installed BG3Access version when
+  you navigate to it.
+
+---
+
 ## 0.1.2 - 2026-06-07
 
 ### Fixed
