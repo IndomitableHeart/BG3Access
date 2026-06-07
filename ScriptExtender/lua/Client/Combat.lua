@@ -70,6 +70,19 @@ local currentTurnCharacterGuid = nil
 local currentRound = 0
 local pendingRoundAnnouncement = nil
 
+-- Initiative threshold below which a participant is treated as a
+-- non-combatant -- environment objects (illithid bulbs, chests,
+-- barrels, etc.) that BG3 puts in the turn order with sentinel
+-- InitiativeRoll = -20 so they sit at the bottom and never act.
+-- Worst-case legitimate roll is 1 + (-5) = -4 (DEX 1 creature
+-- rolling a natural 1), so -20 cleanly separates sentinels from
+-- real combatants.  Used in BOTH ReadTurnOrder (for the "Initiative:
+-- X, Y, Z" announcement and the RS-Right HUD reader) AND
+-- HandleTurnStarted (so the user doesn't hear "Bulb's turn",
+-- "Chest's turn" cycling through every non-combatant between
+-- real turns).
+local NON_COMBATANT_INITIATIVE_THRESHOLD = -20
+
 -- Rapid-fire status events (applied/removed on the same character
 -- within this window) are suppressed.  BG3 re-applies surface
 -- statuses on every tick the character remains on the surface, so
@@ -235,6 +248,38 @@ end
 
 local function HandleTurnStarted(eventData)
     local characterName = eventData.characterName or "Unknown"
+
+    -- Skip non-combatants.  BG3 fires TurnStarted for every entity
+    -- in the turn order, including environment objects (bulbs, chests,
+    -- barrels) with sentinel InitiativeRoll = -20.  Without this
+    -- filter the user hears "Chest's turn", "Bulb's turn" cycling
+    -- through every non-combatant between real turns -- pure noise.
+    -- Same threshold ReadTurnOrder uses to filter the spoken
+    -- initiative announcement.
+    if eventData.characterGuid then
+        local entityOk, entity = pcall(Ext.Entity.Get, eventData.characterGuid)
+        if entityOk and entity then
+            local initOk, initiative = pcall(function()
+                if not entity.CombatParticipant then return nil end
+                return tonumber(entity.CombatParticipant.InitiativeRoll)
+            end)
+            if initOk and initiative
+                and initiative <= NON_COMBATANT_INITIATIVE_THRESHOLD then
+                Log.Debug("Combat.HandleTurnStarted: skipping non-combatant '"
+                    .. characterName .. "' (initiative "
+                    .. initiative .. ")")
+                -- IMPORTANT: do NOT update currentTurnCharacterName /
+                -- currentTurnCharacterGuid for non-combatants.  Other
+                -- modules query those to know whose turn it actually
+                -- is for damage attribution, status filtering, etc.
+                -- Letting a chest set itself as "current turn" would
+                -- confuse downstream callers.
+                return
+            end
+        end
+    end
+
+    -- Real combatant: update state and announce.
     currentTurnCharacterName = characterName
     currentTurnCharacterGuid = eventData.characterGuid
 
@@ -1136,23 +1181,14 @@ ReadTurnOrder = function()
         if #turnEntries > 0 then break end
     end
 
-    -- Filter out non-combatants.  BG3 puts environment objects
-    -- (illithid bulbs in the Nautiloid prologue, chests, barrels,
-    -- crates, etc.) into the TurnOrder array with a sentinel
-    -- InitiativeRoll of -20 so they sit at the bottom of the order
-    -- and never actually act.  Announcing them as "Initiative: ...,
-    -- Bulb, Bulb, Bulb, Chest, Tav..." is just noise that pushes the
-    -- real combatants down the spoken list.
+    -- Filter out non-combatants.  Threshold is the module-level
+    -- NON_COMBATANT_INITIATIVE_THRESHOLD constant (shared with
+    -- HandleTurnStarted -- same rule applied in both code paths).
+    -- See its declaration near the top of this file for rationale.
     --
-    -- Threshold note: legitimate initiative rolls are 1d20 + DEX
-    -- modifier.  Worst-case legitimate value is 1 + (-5) = -4 for a
-    -- DEX 1 creature rolling a natural 1.  -20 is well below that,
-    -- so the threshold cleanly separates sentinels from real rolls.
-    -- We also keep entries with unknown initiative (nil) since
-    -- failing to read the component shouldn't silently drop a
-    -- combatant -- better to over-announce than under-announce when
-    -- the data is missing.
-    local NON_COMBATANT_INITIATIVE_THRESHOLD = -20
+    -- Keep entries with unknown initiative (nil) -- failing to read
+    -- the component shouldn't silently drop a combatant.  Better to
+    -- over-announce than under-announce when data is missing.
     local filteredEntries = {}
     local droppedCount = 0
     for _, entry in ipairs(turnEntries) do
@@ -1164,7 +1200,7 @@ ReadTurnOrder = function()
         end
     end
     if droppedCount > 0 and Log then
-        Log.Info("Combat.ReadTurnOrder: filtered "
+        Log.Debug("Combat.ReadTurnOrder: filtered "
             .. droppedCount
             .. " non-combatant entries (initiative <= "
             .. NON_COMBATANT_INITIATIVE_THRESHOLD

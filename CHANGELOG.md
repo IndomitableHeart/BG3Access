@@ -8,6 +8,24 @@ Versions follow [Semantic Versioning](https://semver.org/): MAJOR.MINOR.PATCH.
 
 ---
 
+## 0.1.4 - 2026-06-07
+
+### Fixed
+
+- Per-turn announcements in combat ("X's turn") no longer fire for
+  non-combatant environment objects (illithid bulbs, chests, barrels
+  with sentinel -20 initiative).  Previously the user would hear
+  "Chest's turn", "Bulb's turn", etc. cycling between every real
+  combatant's turn.  Now the announcement is suppressed for these
+  entries and only real combatants are announced.
+- Reduced log volume.  Several per-tick / per-call internal traces
+  that were logged at Info level (visible whenever LogRuntime is on)
+  are now Debug level (only logged when log verbosity is explicitly
+  raised).  Single-event logs like spoken phrases, target reads, and
+  combat transitions remain at Info.
+
+---
+
 ## 0.1.3 - 2026-06-07
 
 ### Added

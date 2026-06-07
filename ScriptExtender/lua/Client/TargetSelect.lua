@@ -1571,13 +1571,20 @@ local function PerformTargetRead(forceSpeak)
     -- rather than blocking forever.
     if targetInfo._noesisIdentityMatches == false then
         if not forceSpeak then
-            Log.Info("TARGET READ: Noesis identity stale (camera='"
+            -- This branch fires every game tick (60fps) while we wait
+            -- for Noesis to settle.  A 900ms read = ~54 of these
+            -- per single target press.  Moved from Info to Debug so
+            -- normal LogRuntime captures don't drown in retry trace.
+            Log.Debug("TARGET READ: Noesis identity stale (camera='"
                 .. tostring(targetInfo.name) .. "' "
                 .. tostring(targetInfo.hpCurrent) .. "/"
                 .. tostring(targetInfo.hpMax)
                 .. "'); next tick will retry")
             return false
         end
+        -- Retry-budget-exhausted branch fires AT MOST ONCE per target
+        -- read (the read either lands or gives up).  Worth keeping at
+        -- Info so users / devs can see when fallback kicked in.
         Log.Info("TARGET READ: Noesis identity stale (camera='"
             .. tostring(targetInfo.name) .. "' "
             .. tostring(targetInfo.hpCurrent) .. "/"
