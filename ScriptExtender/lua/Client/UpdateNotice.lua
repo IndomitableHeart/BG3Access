@@ -126,7 +126,7 @@ local function BuildAnnouncement(data)
 
     return "BG3Access successfully updated to version "
         .. TrimTrailingZeroComponents(toVer)
-        .. ". See the changelog for further details."
+        .. ". See the changelog in the mod's settings menu for details."
 end
 
 

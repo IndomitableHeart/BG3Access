@@ -495,6 +495,14 @@ end
 Settings.RegisterCategory("verbositySettings", "Verbosity settings")
 Settings.RegisterCategory("gpsSettings", "GPS settings")
 
+-- Changelog browser.  Registered as a category so navigating to it
+-- in the menu reads ", submenu" (signaling that A drills in), but
+-- SettingsMenu.lua special-cases the drill: pressing A on this entry
+-- doesn't enumerate child settings, it enters the changelog browser
+-- mode (version list -> line reader).  See HandleButton / EnterSubmenu
+-- in SettingsMenu.lua for the dispatch.
+Settings.RegisterCategory("changelog", "Changelog")
+
 
 --- TrimTrailingZeroComponents: turn "0.1.3.0" into "0.1.3" by
 --- dropping trailing ".0" segments.  Never trims below 2 components,

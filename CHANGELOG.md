@@ -8,6 +8,19 @@ Versions follow [Semantic Versioning](https://semver.org/): MAJOR.MINOR.PATCH.
 
 ---
 
+## 0.1.5 - 2026-06-07
+
+### Added
+
+- "Changelog" entry in the settings menu (right-stick down to open).
+  Press A on Changelog to enter the version list, D-pad up and down
+  to cycle versions, A on a version to read its notes line by line,
+  B to back out one level at a time.
+- Update announcement now points users at the in-game changelog
+  browser instead of suggesting they find a separate file.
+
+---
+
 ## 0.1.4 - 2026-06-07
 
 ### Fixed
